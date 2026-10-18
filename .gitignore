@@ -1,0 +1,32 @@
+# Private input and outputs belong outside the checkout.
+/private/
+/imports/
+/subscriptions/
+/state/
+/results/
+/logs/
+/work/
+/.codex-task-state.md
+.env
+.env.*
+*.secret
+*.subscription
+*.vpn.json
+happ.json
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.tmp
+/bin/
+/build/
+/dist/
+/coverage/
+*.test
+*.out
+__pycache__/
+/vpn-sweep
+# Clean JSON fixtures/examples are intentionally versioned.

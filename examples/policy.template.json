@@ -1,0 +1,16 @@
+{
+  "version":"web-basic-v1",
+  "rounds":2,
+  "min_operators":3,
+  "downloads":2,
+  "min_download_bytes":1048576,
+  "require_udp":false,
+  "require_quic":false,
+  "probes":[
+    {"id":"page-a","operator":"operator-a","url":"https://a.invalid/page","kind":"page","contains":"REPLACE_WITH_REVIEWED_SEMANTIC_MARKER_A","status":200,"timeout_seconds":45},
+    {"id":"page-b","operator":"operator-b","url":"https://b.invalid/page","kind":"page","contains":"REPLACE_WITH_REVIEWED_SEMANTIC_MARKER_B","status":200,"timeout_seconds":45},
+    {"id":"page-c","operator":"operator-c","url":"https://c.invalid/page","kind":"page","contains":"REPLACE_WITH_REVIEWED_SEMANTIC_MARKER_C","status":200,"timeout_seconds":45},
+    {"id":"data-a","operator":"operator-a","url":"https://a.invalid/data","kind":"download","bytes":1048576,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","status":200,"timeout_seconds":90},
+    {"id":"data-b","operator":"operator-b","url":"https://b.invalid/data","kind":"download","bytes":1048576,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","status":200,"timeout_seconds":90}
+  ]
+}

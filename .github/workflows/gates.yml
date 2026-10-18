@@ -1,0 +1,19 @@
+name: local-gates
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version: '1.27.2'
+          cache: false
+      - name: offline local gates
+        run: GO=go sh scripts/check.sh

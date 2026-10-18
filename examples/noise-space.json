@@ -1,0 +1,12 @@
+{
+  "version":1,
+  "strategy":"broad",
+  "seed":42,
+  "parameters":[
+    {"name":"noise","values":[false,true]},
+    {"name":"noises","values":[
+      [{"type":"rand","packet":"50-150","delay":"10-16","applyTo":"ip"}],
+      [{"type":"hex","packet":"1a2b3c","delay":"10-16","applyTo":"ip"}]
+    ]}
+  ]
+}

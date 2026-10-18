@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "strategy": "broad",
+  "seed": 42,
+  "parameters": [
+    {"name":"fragment","values":[false,true]},
+    {"name":"mux","values":[false,true]},
+    {"name":"packets","values":["tlshello","1-1","1-3"]},
+    {"name":"length","min":1,"max":512,"step":1,"pair":true},
+    {"name":"interval","min":0,"max":50,"step":1,"pair":true},
+    {"name":"maxSplit","min":1,"max":256,"step":1,"pair":true},
+    {"name":"tcpConcurrency","values":[-1,0,1,8,32,128]},
+    {"name":"xudpConcurrency","values":[-1,0,8,64,1024]},
+    {"name":"quic","values":["reject","allow","skip"]}
+  ]
+}

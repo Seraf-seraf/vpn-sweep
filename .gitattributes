@@ -1,0 +1,25 @@
+* text=auto eol=lf
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+Makefile text eol=lf
+*.png binary
+*.jpg binary
+*.zip binary
+*.gz binary
+*.db binary
+*.sqlite binary
+*.wasm binary
+*.exe binary
+*.so binary
+*.a binary
+*.bin binary
+/build/** binary
+/dist/** binary
+testdata/bytes/** -text

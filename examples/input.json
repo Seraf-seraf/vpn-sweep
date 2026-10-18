@@ -1,0 +1,8 @@
+{
+  "remarks":"SYNTHETIC ONLY — reserved .invalid endpoint",
+  "outbounds":[{
+    "protocol":"vless",
+    "settings":{"vnext":[{"address":"vpn.invalid","port":443,"users":[{"id":"synthetic-id","encryption":"none"}]}]},
+    "streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.invalid"},"wsSettings":{"path":"/synthetic","headers":{"Host":"ws.invalid"}}}
+  }]
+}
