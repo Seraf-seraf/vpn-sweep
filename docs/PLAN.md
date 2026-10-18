@@ -44,7 +44,7 @@ UI Goal не включён. Разрешены локальная реализ�
 |15|Secure export|private config/report, atomic/recovery|publication|Permissions/redaction/symlink/save failure tests pass|
 |16|Happ adapter|version-specific mapping research/tests|guesses, SOCKS-as-TUN|Known build mapping proved; иначе BLOCKED|
 |17|Android device|target artifact + device lifecycle|live internet claims|Device matrix passes; без устройства BLOCKED|
-|18|Engineering gates|scripts/Makefile/CI declarations|deploy/publish/live secrets|Available test/build/scan gates pass; hosted CI not invented|
+|18|Engineering gates|scripts/Makefile; local execution only|deploy/publish/live secrets|Local test/build/scan results recorded; automatic CI removed by user decision|
 |19|Control live acceptance|separately authorized test server|restricted network|Live policy positive/negative proven; сейчас BLOCKED|
 |20|Restricted acceptance|separately authorized needed network|server changes, extra optimization|Full success/accurate negative proven; сейчас BLOCKED|
 |21|Local package|artifact/checksum/licenses/docs|commit/push/release|Local package verified, outstanding gates explicit|

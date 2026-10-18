@@ -4,7 +4,8 @@ Tracker plan: **vpn-sweep: реализация полного ТЗ Go CLI — 2
 ID: `2c3c68d5-f288-4c9f-b7d5-24f5a99f2669`. UI Goal was not enabled.
 
 This is a locally implemented and synthetically verified product, not a fully accepted Android/Happ/live release.
-No commit, push, PR, deployment, real subscription or live VPN connection was performed.
+During the original local implementation, no commit/push/PR/deployment or live VPN was performed.
+Later publication and the subsequent local-only verification decision are recorded below.
 
 ## 21-stage reconciliation
 
@@ -27,7 +28,7 @@ No commit, push, PR, deployment, real subscription or live VPN connection was pe
 |15|Implemented|Private export/verification/report/hash marker, permissions, idempotence/tamper/no-secret E2E|
 |16|BLOCKED|Happ version/build and UI/runtime mapping unavailable; happ mode fails closed|
 |17|BLOCKED|No actual Android/Termux device/version; compile is not device acceptance|
-|18|Implemented locally|Makefile/scripts, format/scan/vet/race/build, workflow YAML parse; hosted CI/platform lint unverified|
+|18|Implemented locally|Makefile/scripts, format/scan/vet/race/build, local checks retained; automatic CI subsequently removed by user decision|
 |19|BLOCKED|Live VPN testing explicitly forbidden in current authorization|
 |20|BLOCKED|Live testing forbidden and intended restricted network unavailable|
 |21|Local package prepared|Tested Linux/Android binaries, docs/examples/licenses and SHA256 checksums; not published|
@@ -50,7 +51,7 @@ Loopback integration tests needed an authorized sandbox escalation; no external 
 |`python3 scripts/secret-scan.py`|No findings; tracked, untracked non-ignored and staged contents inspected; staged 0|
 |`git diff --check`, `git diff --cached --check`|Exit 0|
 |`git check-attr`, `git check-ignore`|LF/text/binary and private/build paths verified; examples remain visible|
-|workflow YAML parse with PyYAML 6.0.3|PASS; not GitHub platform lint or hosted execution|
+|Historical workflow YAML parse with PyYAML 6.0.3|PASS at implementation time; workflows subsequently removed, not a hosted CI pass|
 |`go list -m all`|Only github.com/Seraf-seraf/vpn-sweep; no third-party Go modules|
 |`file build/vpn-sweep`|ELF x86-64, static|
 |`file build/vpn-sweep-android-arm64`|ELF PIE aarch64, /system/bin/linker64, CGO_ENABLED=0|
@@ -110,3 +111,18 @@ Checkpoint 23 independent reviewer /root/p1_fix_independent_review: no proven P0
 scope of the two P1 fixes and related regressions. Reviewer independently ran uncached race,
 vet, scanners, diff-check, Linux/Android builds and an extra UDP deadline overlay test PASS.
 Not a full re-audit outside changed scope; device/Happ/Xray/live acceptance remains unverified.
+
+## Local-only checks by user decision
+
+Implementation commit 08edf68015618a9c8c4df7e3d34e3747e5305f1b was pushed to main.
+Its GitHub Actions run https://github.com/Seraf-seraf/vpn-sweep/actions/runs/39133659445
+failed with unsafe_directory test setup errors and a state-test nil-pointer panic.
+Read-only reproduction identified t.TempDir permission dependence on umask: 0755 under
+022 versus required 0700 under 077. Ignored Open error at store_test.go:55 leads to panic
+at line 57. Earlier local passes used umask 0077; they do not establish portability.
+
+At the user's explicit request both GitHub workflows were removed; checks are now local-only.
+All tests, Makefile targets, check/build/package/scanner scripts and security guards remain
+unchanged. The fixture permissions and ignored-error defects remain unresolved. No policy
+was prepared. Removing CI is not a green CI result. Historical runs and Actions settings
+were not deleted or changed. Android/Happ/Xray runtime and live acceptance remain unverified.
