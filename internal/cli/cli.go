@@ -26,7 +26,7 @@ import (
 
 type options struct {
 	input, format, subscription, mode, binary, policy, space, state, output, network, ca string
-	attest, custom                                                                       bool
+	attest, custom, unverifiedWeb                                                        bool
 	budgets                                                                              model.Budgets
 }
 
@@ -46,6 +46,7 @@ func flags(args []string) (options, error) {
 	fs.StringVar(&o.network, "network-label", "", "local label identifying current network conditions")
 	fs.StringVar(&o.ca, "ca-file", "", "explicit PEM trust roots for controlled tests")
 	fs.BoolVar(&o.attest, "attest-no-other-vpn", false, "attest Termux is on intended network without another VPN")
+	fs.BoolVar(&o.unverifiedWeb, "allow-unverified-web-profile", false, "accept Google/YouTube web-only scope and live-unverified preset")
 	fs.BoolVar(&o.custom, "allow-custom-policy", false, "explicitly accept custom-v1 verification scope")
 	o.budgets = model.DefaultBudgets()
 	fs.IntVar(&o.budgets.SessionSeconds, "session-seconds", 7200, "session wall budget; 0=unlimited")
@@ -114,11 +115,11 @@ func loadSpace(path string) (*space.Generator, error) {
 func emit(w io.Writer, v any) error { return json.NewEncoder(w).Encode(v) }
 func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
 	if len(args) == 0 || args[0] == "help" {
-		io.WriteString(out, "vpn-sweep inspect|space|run|resume|status|report|export|version\nUse --input private-file --format auto; run requires --mode --core --policy --state --output --network-label --attest-no-other-vpn. See docs/usage.md.\n")
+		io.WriteString(out, "vpn-sweep inspect|space|policy|run|resume|status|report|export|version\nUse --input private-file --format auto; run requires --mode --core --policy --state --output --network-label --attest-no-other-vpn. See docs/usage.md.\n")
 		return 0
 	}
 	if args[0] == "version" {
-		io.WriteString(out, "vpn-sweep p1-fixed-search-v2 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
+		io.WriteString(out, "vpn-sweep google-youtube-web-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
 		return 0
 	}
 	o, e := flags(args[1:])
@@ -161,6 +162,19 @@ func dispatch(ctx context.Context, command string, o options, in io.Reader, out 
 			domains = append(domains, map[string]any{"name": d.Name, "explicit_values": len(d.Values), "min": d.Min, "max": d.Max, "step": d.Step, "pair": d.Pair})
 		}
 		return emit(out, map[string]any{"count": g.Count().String(), "strategy": g.Spec.Strategy, "seed": g.Spec.Seed, "parameters": domains, "catalog": capability.Catalog(), "scope": "before_profile_applicability_filter"})
+	case "policy":
+		b, e := read(o.policy, 1<<20)
+		if e != nil {
+			return e
+		}
+		var p model.Policy
+		if e = model.Decode(b, &p); e != nil {
+			return e
+		}
+		if e = policy.Validate(p); e != nil {
+			return e
+		}
+		return emit(out, map[string]any{"status": "valid_local_structure_only", "policy": p.Version, "verification_scope": policy.Scope(p), "preset_status": policy.PresetStatus(p), "network_requests": false})
 	case "run", "resume":
 		return run(ctx, command, o, in, out)
 	case "status", "report", "export":
@@ -258,6 +272,9 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 		if pol.Version == "custom-v1" && !o.custom {
 			return model.Err("custom_policy_requires_opt_in", "cli")
 		}
+		if pol.Version == policy.GoogleYouTubeWeb && !o.unverifiedWeb {
+			return model.Err("unverified_web_profile_requires_opt_in", "cli")
+		}
 		key, e = state.IdentityKey(filepath.Dir(s.Dir))
 		if e != nil {
 			return e
@@ -312,10 +329,13 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 		}
 		m.Budgets = o.budgets
 	}
+	if m.Policy.Version == policy.GoogleYouTubeWeb && !o.unverifiedWeb {
+		return model.Err("unverified_web_profile_requires_opt_in", "cli")
+	}
 	if e = capability.Gate(m.Mode, m.Core.Commit); e != nil {
 		return e
 	}
-	if e = emit(out, map[string]any{"event": "series_start", "series_id": m.SeriesID, "mode": m.Mode, "core": m.Core, "policy": m.Policy.Version, "budgets": m.Budgets, "space_count": g.Count().String(), "environment": "user_attested_not_independently_proven"}); e != nil {
+	if e = emit(out, map[string]any{"event": "series_start", "series_id": m.SeriesID, "mode": m.Mode, "core": m.Core, "policy": m.Policy.Version, "verification_scope": policy.Scope(m.Policy), "preset_status": policy.PresetStatus(m.Policy), "budgets": m.Budgets, "space_count": g.Count().String(), "environment": "user_attested_not_independently_proven"}); e != nil {
 		return e
 	}
 	runner := core.Runner{Binary: binary, Identity: id, Directory: filepath.Join(s.Dir, "runtime"), Startup: time.Duration(m.Budgets.StartupSeconds) * time.Second, Cleanup: time.Duration(m.Budgets.CleanupSeconds) * time.Second}
@@ -336,7 +356,7 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 	if e != nil {
 		return e
 	}
-	if e = emit(out, map[string]any{"status": status, "series_id": m.SeriesID, "policy": m.Policy.Version, "attempts": s.View().Attempts, "device_acceptance": "unverified", "happ": "mapping_unverified"}); e != nil {
+	if e = emit(out, map[string]any{"status": status, "series_id": m.SeriesID, "policy": m.Policy.Version, "verification_scope": policy.Scope(m.Policy), "preset_status": policy.PresetStatus(m.Policy), "attempts": s.View().Attempts, "device_acceptance": "unverified", "happ": "mapping_unverified"}); e != nil {
 		return e
 	}
 	if status != "success" {

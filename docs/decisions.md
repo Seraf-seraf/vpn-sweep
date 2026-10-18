@@ -83,3 +83,14 @@ continues. Session deadline/external cancellation retain interrupted retry with 
 on resume. Payload budget exhaustion retains existing retry semantics. Context cancellation
 wins over a late pass; no incomplete policy result is exported. Tests cover Open, probe and
 confirmation restart deadlines, cleanup, persisted completion/retry and legacy search rejection.
+
+## Google/YouTube web-only profile
+
+Separate google-youtube-web-v1 validation permits exactly two declared page targets, one
+operator google, no downloads/UDP/QUIC, two fresh rounds. Legacy policy minimums unchanged.
+Preset HTML markers remain live-unverified due cloud CONNECT403; explicit run/resume opt-in
+and scoped reports prevent representing this as video/general Internet acceptance. Complete
+bounded HTML receipt is measured, without false immutable hashes or bulk speed claims.
+New optional omitempty probe fields preserve serialization of existing manifests; search-v2
+and journal versions unchanged. Raw marker drift requires reviewed policy and a new series.
+Unrelated umask-dependent fixtures remain unfixed; local gates run with explicit umask077.

@@ -14,6 +14,7 @@ make check GO=/absolute/path/to/go
 [Локальные команды и известное ограничение fixtures](docs/ci-contract.md).
 
 - [ТЗ и 21 этап](docs/PLAN.md)
+- [Google/YouTube: unverified web-only preset и Termux](docs/google-youtube-termux.md)
 - [Запуск, бюджеты, policy и ограничения](docs/usage.md)
 - [Совместимость и источники](docs/compatibility.md)
 - [RunStore, fault tests и решения](docs/decisions.md)

@@ -18,6 +18,8 @@ import (
 	"time"
 )
 
+const MaxPageBodyBytes int64 = 2 << 20
+
 type Client struct{ Roots *x509.CertPool }
 
 func Validate(p model.Probe) error {
@@ -28,8 +30,16 @@ func Validate(p model.Probe) error {
 	if p.Kind != "page" && p.Kind != "download" {
 		return model.Err("unsupported_probe_kind", "policy")
 	}
-	if p.Contains == "" && p.SHA256 == "" {
+	if p.Contains == "" && p.SHA256 == "" && len(p.ContainsAll) == 0 {
 		return model.Err("missing_content_validator", "policy")
+	}
+	if len(p.ContainsAll) > 8 || p.MinBytes < 0 || p.MinBytes > MaxPageBodyBytes || (p.Bytes > 0 && p.MinBytes > p.Bytes) || (p.Kind != "page" && (len(p.ContainsAll) > 0 || p.MinBytes > 0)) {
+		return model.Err("invalid_body_contract", "policy")
+	}
+	for _, marker := range p.ContainsAll {
+		if len(marker) < 4 || len(marker) > 1024 {
+			return model.Err("invalid_composite_marker", "policy")
+		}
 	}
 	if p.Kind == "download" && (p.SHA256 == "" || p.Bytes < 1) {
 		return model.Err("download_requires_hash_and_size", "policy")
@@ -65,6 +75,9 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		r.Redirects = len(via)
+		if len(p.ContainsAll) > 0 && (req.URL.Hostname() == "consent.google.com" || req.URL.Hostname() == "consent.youtube.com") {
+			return model.Err("site_consent", "site")
+		}
 		if len(via) > 5 || req.URL.Scheme != "https" || req.URL.User != nil {
 			return model.Err("redirect_rejected", "redirect")
 		}
@@ -114,7 +127,7 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 		}
 		return finish("unexpected_http_status", "site")
 	}
-	max := int64(2 << 20)
+	max := MaxPageBodyBytes
 	if p.Bytes > 0 {
 		max = p.Bytes
 	}
@@ -132,13 +145,34 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	if p.Bytes > 0 && r.Bytes != p.Bytes {
 		return finish("wrong_body_size", "content")
 	}
+	m, _, mimeErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mimeErr == nil {
+		r.MIME = m
+	}
 	if p.MIME != "" {
-		m, _, e := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-		if e != nil || m != p.MIME {
+		if mimeErr != nil || m != p.MIME {
 			return finish("unexpected_mime", "content")
 		}
 	}
+	if r.Bytes < p.MinBytes {
+		return finish("body_too_small", "content")
+	}
 	lower := strings.ToLower(string(b))
+	if len(p.ContainsAll) > 0 {
+		for _, marker := range []string{"before you continue to google", "before you continue to youtube", `<form action="https://consent.google.com/`, `<form action="https://consent.youtube.com/`} {
+			if strings.Contains(lower, marker) {
+				return finish("site_consent", "site")
+			}
+		}
+		for _, marker := range []string{"sign in to confirm", "our systems have detected unusual traffic"} {
+			if strings.Contains(lower, marker) {
+				return finish("site_challenge", "site")
+			}
+		}
+		if strings.HasPrefix(resp.Request.URL.Path, "/sorry/") {
+			return finish("site_challenge", "site")
+		}
+	}
 	for _, marker := range []string{"cf-chl-", "g-recaptcha", "verify you are human"} {
 		if strings.Contains(lower, marker) {
 			return finish("site_challenge", "site")
@@ -147,11 +181,17 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	if p.Contains != "" && !strings.Contains(string(b), p.Contains) {
 		return finish("unexpected_content", "content")
 	}
+	for _, marker := range p.ContainsAll {
+		if !strings.Contains(string(b), marker) {
+			return finish("composite_marker_missing", "content")
+		}
+	}
 	if p.SHA256 != "" {
 		h := sha256.Sum256(b)
 		if hex.EncodeToString(h[:]) != strings.ToLower(p.SHA256) {
 			return finish("content_hash_mismatch", "content")
 		}
 	}
+	r.ContentVerified = true
 	return finish("pass", "complete")
 }

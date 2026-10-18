@@ -135,3 +135,15 @@ See decisions.md for fault/recovery guarantees and remaining platform assumption
 остаются доступны. Это предотвращает сохранение пропусков из прежнего алгоритма dedup.
 Timeout отдельного кандидата записывается как attempt_timeout и не останавливает перебор;
 исчерпание session budget и внешняя отмена сохраняют кандидата для resume.
+
+## Google/YouTube web-only profile
+
+See [the full Termux guide](google-youtube-termux.md). examples/google-youtube-web-v1.json
+is a runnable but live-unverified preset. --allow-unverified-web-profile is required on run
+and resume. The `policy --policy private-file` command validates structure offline only.
+Both resources have operator=google; no independence, bulk transfer or video is claimed.
+Composite contains_all and min_bytes do not change legacy contains/bytes/hash semantics.
+Reports/stdout expose verification_scope and preset_status. web-basic-v1/custom-v1 remain
+unchanged; old manifests omit new optional fields and preserve integrity/resume semantics.
+Current version output identifies google-youtube-web-v1 and search=2; older p1-fixed-search-v2
+series with existing supported policies remain readable/resumable.

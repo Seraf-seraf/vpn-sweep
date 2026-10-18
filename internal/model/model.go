@@ -48,6 +48,8 @@ type Probe struct {
 	Operator       string   `json:"operator"`
 	URL            string   `json:"url"`
 	Kind           string   `json:"kind"`
+	ContainsAll    []string `json:"contains_all,omitempty"`
+	MinBytes       int64    `json:"min_bytes,omitempty"`
 	Contains       string   `json:"contains,omitempty"`
 	SHA256         string   `json:"sha256,omitempty"`
 	Bytes          int64    `json:"bytes,omitempty"`
@@ -74,17 +76,19 @@ type UDPProbe struct {
 	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 type ProbeResult struct {
-	ID          string `json:"id"`
-	Probe       string `json:"probe"`
-	Round       int    `json:"round"`
-	Transport   string `json:"transport"`
-	Outcome     string `json:"outcome"`
-	Phase       string `json:"phase"`
-	HTTPStatus  int    `json:"http_status,omitempty"`
-	Bytes       int64  `json:"bytes"`
-	DurationMS  int64  `json:"duration_ms"`
-	TLSVerified bool   `json:"tls_verified"`
-	Redirects   int    `json:"redirects"`
+	ID              string `json:"id"`
+	Probe           string `json:"probe"`
+	Round           int    `json:"round"`
+	Transport       string `json:"transport"`
+	Outcome         string `json:"outcome"`
+	Phase           string `json:"phase"`
+	HTTPStatus      int    `json:"http_status,omitempty"`
+	Bytes           int64  `json:"bytes"`
+	DurationMS      int64  `json:"duration_ms"`
+	ContentVerified bool   `json:"content_verified,omitempty"`
+	MIME            string `json:"mime,omitempty"`
+	TLSVerified     bool   `json:"tls_verified"`
+	Redirects       int    `json:"redirects"`
 }
 type Attempt struct {
 	ID        string        `json:"id"`

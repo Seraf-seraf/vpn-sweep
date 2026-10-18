@@ -13,16 +13,18 @@ import (
 )
 
 type Report struct {
-	Version     int                 `json:"version"`
-	SeriesID    string              `json:"series_id"`
-	CandidateID string              `json:"candidate_id"`
-	AttemptID   string              `json:"attempt_id"`
-	Status      string              `json:"status"`
-	Policy      string              `json:"policy"`
-	Core        model.CoreIdentity  `json:"core"`
-	Environment string              `json:"environment"`
-	Results     []model.ProbeResult `json:"results"`
-	Limitations []string            `json:"limitations"`
+	VerificationScope string              `json:"verification_scope,omitempty"`
+	PresetStatus      string              `json:"preset_status,omitempty"`
+	Version           int                 `json:"version"`
+	SeriesID          string              `json:"series_id"`
+	CandidateID       string              `json:"candidate_id"`
+	AttemptID         string              `json:"attempt_id"`
+	Status            string              `json:"status"`
+	Policy            string              `json:"policy"`
+	Core              model.CoreIdentity  `json:"core"`
+	Environment       string              `json:"environment"`
+	Results           []model.ProbeResult `json:"results"`
+	Limitations       []string            `json:"limitations"`
 }
 
 type completion struct {
@@ -88,7 +90,10 @@ func Save(dir string, m model.Manifest, profiles []model.Profile, a model.Attemp
 	} else if !os.IsNotExist(err) {
 		return model.Err("export_unavailable", "export")
 	}
-	report := Report{Version: 1, SeriesID: m.SeriesID, CandidateID: a.Candidate.ID, AttemptID: a.ID, Status: "policy_satisfied", Policy: m.Policy.Version, Core: m.Core, Environment: m.Environment, Results: a.Results, Limitations: []string{"time_and_network_specific", "no_system_android_vpn_claim", "happ_unverified", "android_device_unverified", "quic_unsupported", "media_not_tested"}}
+	report := Report{VerificationScope: policy.Scope(m.Policy), PresetStatus: policy.PresetStatus(m.Policy), Version: 1, SeriesID: m.SeriesID, CandidateID: a.Candidate.ID, AttemptID: a.ID, Status: "policy_satisfied", Policy: m.Policy.Version, Core: m.Core, Environment: m.Environment, Results: a.Results, Limitations: []string{"time_and_network_specific", "no_system_android_vpn_claim", "happ_unverified", "android_device_unverified", "quic_unsupported", "media_not_tested"}}
+	if m.Policy.Version == policy.GoogleYouTubeWeb {
+		report.Limitations = append(report.Limitations, "google_and_youtube_pages_only", "single_operator_google", "not_general_internet", "no_bulk_download_test", "preset_live_unverified")
+	}
 	cfg, e := capability.Render(profiles[a.Candidate.Profile], a.Candidate.Params, "127.0.0.1:10808", model.ID(), model.ID())
 	if e != nil {
 		return e

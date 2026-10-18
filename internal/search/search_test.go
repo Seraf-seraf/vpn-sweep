@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/Seraf-seraf/vpn-sweep/internal/capability"
+	"github.com/Seraf-seraf/vpn-sweep/internal/export"
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
+	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
 	"github.com/Seraf-seraf/vpn-sweep/internal/space"
 	"github.com/Seraf-seraf/vpn-sweep/internal/state"
 	"math/big"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -252,6 +255,76 @@ func TestLegacySearchSeriesFailsClosed(t *testing.T) {
 	}}
 	status, err := e.Run(context.Background(), m, p, make([]byte, 32), g, s)
 	if status != "unsupported_search_version" || model.Code(err) != "search_version_requires_new_series" || s.View().Attempts != 0 {
+		t.Fatal(status, err)
+	}
+}
+
+func TestWebProfileRestartResumeAndScopedExport(t *testing.T) {
+	m, p, g, s := setup(t)
+	raw, err := os.ReadFile("../../examples/google-youtube-web-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Policy = model.Policy{}
+	if err = model.Decode(raw, &m.Policy); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	m.InputID = model.PrivateID(key, p)
+	m.Space, _ = json.Marshal(g.Spec)
+	if err = s.SaveManifest(m, p, key); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opens, closed, exports := 0, 0, 0
+	out := t.TempDir()
+	e := Engine{Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+		opens++
+		return tunnel{&closed}, nil
+	}, Check: func(ctx context.Context, x socks.Endpoint, pr model.Probe, r int) model.ProbeResult {
+		cancel()
+		return pass(ctx, x, pr, r)
+	}, Export: func(a model.Attempt) error { exports++; return export.Save(out, m, p, a) }}
+	status, err := e.Run(ctx, m, p, key, g, s)
+	if err != nil || status != "interrupted" || s.View().Retry == nil || closed != 1 {
+		t.Fatal(status, err)
+	}
+	dir := s.Dir
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = state.Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	frozen, profiles, k, err := s.LoadManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Digest(frozen.Policy) != model.Digest(m.Policy) {
+		t.Fatal("policy changed during resume")
+	}
+	m = frozen
+	p = profiles
+	e.Check = func(_ context.Context, _ socks.Endpoint, pr model.Probe, r int) model.ProbeResult {
+		return model.ProbeResult{ID: model.ID(), Probe: pr.ID, Round: r, Outcome: "pass", TLSVerified: true, ContentVerified: true, MIME: "text/html", HTTPStatus: 200, Bytes: pr.MinBytes, Transport: "https-tcp"}
+	}
+	status, err = e.Run(context.Background(), m, p, k, g, s)
+	if err != nil || status != "success" || opens != 3 || closed != 3 || exports != 1 || len(s.View().Winner.Results) != 4 {
+		t.Fatal(status, err, opens, closed, exports)
+	}
+	report, err := export.ReadReport(out)
+	if err != nil || report.VerificationScope != policy.Scope(m.Policy) || report.PresetStatus != "live_unverified" {
+		t.Fatal(report, err)
+	}
+	e.Open = func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+		t.Fatal("searched after winner")
+		return nil, nil
+	}
+	status, err = e.Run(context.Background(), m, p, k, g, s)
+	if err != nil || status != "success" || exports != 2 {
 		t.Fatal(status, err)
 	}
 }

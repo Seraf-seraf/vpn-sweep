@@ -13,6 +13,8 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/testkit"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -90,5 +92,86 @@ func TestHTTPSContentTLSAndNoFallback(t *testing.T) {
 	}
 	if hits.Load() != before {
 		t.Fatal("direct request reached target")
+	}
+}
+
+func TestCompositeHTMLContracts(t *testing.T) {
+	var hits atomic.Int64
+	good := "<html><title>Google</title><form action=\"/search\"><input name=\"q\"></form>" + strings.Repeat(" ", 1200) + "</html>"
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/consent":
+			w.Write([]byte("Before you continue to Google" + good))
+		case "/challenge":
+			w.Write([]byte("Sign in to confirm you’re not a bot" + good))
+		case "/small":
+			w.Write([]byte("<title>Google</title> name=\"q\" action=\"/search\""))
+		case "/wrong":
+			w.Write([]byte(strings.Repeat("x", 1200)))
+		case "/mime":
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(good))
+		case "/partial":
+			w.Header().Set("Content-Length", "9999")
+			w.Write([]byte(good))
+		case "/oversize":
+			w.Write([]byte(good + strings.Repeat("x", int(MaxPageBodyBytes))))
+		case "/consentredirect":
+			http.Redirect(w, r, "https://consent.google.com/m", 302)
+		default:
+			w.Write([]byte(good))
+		}
+	}))
+	defer s.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(s.Certificate())
+	binary, id := testkit.FakeCore(t)
+	addr, e := core.ReserveAddress()
+	if e != nil {
+		t.Fatal(e)
+	}
+	proxy := socks.Endpoint{Address: addr, User: "local-user", Pass: "local-pass"}
+	imp, e := importer.Parse([]byte("socks5://127.0.0.1:9"), "uri")
+	if e != nil {
+		t.Fatal(e)
+	}
+	cfg, e := capability.Render(imp.Profiles[0], nil, addr, proxy.User, proxy.Pass)
+	if e != nil {
+		t.Fatal(e)
+	}
+	dir := t.TempDir()
+	if e = os.Chmod(dir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	h, e := (core.Runner{Binary: binary, Identity: id, Directory: dir, Startup: time.Second}).Start(context.Background(), cfg, proxy)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer h.Close()
+	p := model.Probe{ID: "google-home", Operator: "google", URL: s.URL, Kind: "page", ContainsAll: []string{"<title>Google</title>", "name=\"q\"", "action=\"/search\""}, MinBytes: 1024, MIME: "text/html", Status: 200, TimeoutSeconds: 3}
+	c := Client{Roots: roots}
+	for path, want := range map[string]string{"/": "pass", "/consent": "site_consent", "/challenge": "site_challenge", "/small": "body_too_small", "/wrong": "composite_marker_missing", "/mime": "unexpected_mime", "/partial": "transfer_failed", "/oversize": "body_too_large", "/consentredirect": "site_consent"} {
+		p.URL = s.URL + path
+		r := c.Check(context.Background(), proxy, p, 0)
+		if r.Outcome != want {
+			t.Fatal(path, r)
+		}
+		if r.ContentVerified != (want == "pass") {
+			t.Fatal("incorrect content evidence", r)
+		}
+	}
+	p.URL = s.URL
+	if r := (Client{}).Check(context.Background(), proxy, p, 0); r.Outcome != "tls_failure" {
+		t.Fatal(r)
+	}
+	h.Close()
+	before := hits.Load()
+	if r := c.Check(context.Background(), proxy, p, 0); r.Outcome == "pass" {
+		t.Fatal("fallback success")
+	}
+	if hits.Load() != before {
+		t.Fatal("direct fallback reached target")
 	}
 }

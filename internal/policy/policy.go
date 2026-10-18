@@ -9,6 +9,9 @@ import (
 )
 
 func Validate(p model.Policy) error {
+	if p.Version == GoogleYouTubeWeb {
+		return validateGoogleYouTube(p)
+	}
 	if p.Version != "web-basic-v1" && p.Version != "custom-v1" {
 		return model.Err("unsupported_policy_version", "policy")
 	}
@@ -79,7 +82,7 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 		seen[key] = true
 		if r.Outcome != "pass" {
 			switch r.Outcome {
-			case "site_forbidden", "site_rate_limited", "site_restricted", "site_challenge", "unexpected_http_status", "unsupported":
+			case "site_consent", "site_forbidden", "site_rate_limited", "site_restricted", "site_challenge", "unexpected_http_status", "unsupported":
 				inconclusive = true
 			default:
 				return "failed"
@@ -90,6 +93,9 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 		for _, s := range p.Probes {
 			if r.Probe == s.ID {
 				if !r.TLSVerified || r.Transport != "https-tcp" || r.HTTPStatus != s.Status {
+					return "failed"
+				}
+				if p.Version == GoogleYouTubeWeb && (!r.ContentVerified || r.MIME != "text/html" || r.Bytes < s.MinBytes || r.Bytes > probe.MaxPageBodyBytes) {
 					return "failed"
 				}
 				if s.Kind == "download" && r.Bytes != s.Bytes {

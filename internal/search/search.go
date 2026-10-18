@@ -257,7 +257,7 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 			}
 			if r.Outcome != "pass" {
 				switch r.Outcome {
-				case "site_forbidden", "site_rate_limited", "site_restricted", "site_challenge", "unexpected_http_status", "unsupported":
+				case "site_consent", "site_forbidden", "site_rate_limited", "site_restricted", "site_challenge", "unexpected_http_status", "unsupported":
 					inconclusive = true
 				default:
 					failed = true

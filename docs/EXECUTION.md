@@ -126,3 +126,20 @@ All tests, Makefile targets, check/build/package/scanner scripts and security gu
 unchanged. The fixture permissions and ignored-error defects remain unresolved. No policy
 was prepared. Removing CI is not a green CI result. Historical runs and Actions settings
 were not deleted or changed. Android/Happ/Xray runtime and live acceptance remain unverified.
+
+## Google/YouTube web-only profile
+
+Implemented google-youtube-web-v1 with exactly two page targets, both operator google,
+two rounds/restart, composite markers/minimum body/HTML MIME/full bounded transfer evidence.
+Legacy web-basic/custom requirements and search-v2/journal semantics remain unchanged.
+Explicit --allow-unverified-web-profile is required on run and resume. Offline policy
+validation and exported/stdout verification_scope/preset_status prevent general-Internet or
+video claims. Preset raw markers remain unverified after cloud CONNECT403; no live tests run.
+
+GO=go make check and go test -race -count=1 ./... passed with explicit umask077, including
+vet, two Python scanner tests, secret scan and Linux/Android ARM64 builds. Earlier new test
+setup mistakes were corrected; old umask-dependent fixtures were not changed.
+Independent reviewer /root/google_youtube_independent_review found no code P0–P3 in scope;
+a P3 guide flag typo was corrected from --session-seconds600 to --session-seconds 600.
+Reviewer independently passed uncached race, vet, scanner tests and offline policy smoke.
+Android/Happ/Xray runtime/live remain unverified. CI remains absent. No production dependency added.

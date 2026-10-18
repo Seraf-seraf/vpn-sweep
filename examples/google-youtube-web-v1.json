@@ -1,0 +1,34 @@
+{
+  "version": "google-youtube-web-v1",
+  "rounds": 2,
+  "min_operators": 1,
+  "downloads": 0,
+  "min_download_bytes": 0,
+  "require_udp": false,
+  "require_quic": false,
+  "probes": [
+    {
+      "id": "google-home",
+      "operator": "google",
+      "url": "https://www.google.com/?hl=en",
+      "kind": "page",
+      "contains_all": ["<title>Google</title>", "name=\"q\"", "action=\"/search\""],
+      "min_bytes": 4096,
+      "mime": "text/html",
+      "status": 200,
+      "timeout_seconds": 45
+    },
+    {
+      "id": "youtube-home",
+      "operator": "google",
+      "url": "https://www.youtube.com/?hl=en&gl=US",
+      "kind": "page",
+      "contains_all": ["ytInitialData", "ytcfg.set", "\"richGridRenderer\""],
+      "min_bytes": 4096,
+      "mime": "text/html",
+      "status": 200,
+      "timeout_seconds": 45
+    }
+  ],
+  "udp": []
+}
