@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/probe"
 )
@@ -35,12 +36,18 @@ func validateGoogleYouTube(p model.Policy) error {
 }
 
 func Scope(p model.Policy) string {
+	if p.Version == media.Version {
+		return "declared_video_capabilities_only_not_playback_or_general_internet"
+	}
 	if p.Version == GoogleYouTubeWeb {
 		return "google_youtube_web_pages_only_not_video_or_general_internet"
 	}
 	return "declared_policy_resources_only"
 }
 func PresetStatus(p model.Policy) string {
+	if p.Version == media.Version {
+		return "reference_and_device_acceptance_required"
+	}
 	if p.Version == GoogleYouTubeWeb {
 		return "live_unverified"
 	}

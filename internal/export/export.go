@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"github.com/Seraf-seraf/vpn-sweep/internal/capability"
+	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
 	"github.com/Seraf-seraf/vpn-sweep/internal/private"
@@ -13,6 +14,7 @@ import (
 )
 
 type Report struct {
+	Capabilities      map[string]string   `json:"capabilities,omitempty"`
 	VerificationScope string              `json:"verification_scope,omitempty"`
 	PresetStatus      string              `json:"preset_status,omitempty"`
 	Version           int                 `json:"version"`
@@ -93,6 +95,10 @@ func Save(dir string, m model.Manifest, profiles []model.Profile, a model.Attemp
 	report := Report{VerificationScope: policy.Scope(m.Policy), PresetStatus: policy.PresetStatus(m.Policy), Version: 1, SeriesID: m.SeriesID, CandidateID: a.Candidate.ID, AttemptID: a.ID, Status: "policy_satisfied", Policy: m.Policy.Version, Core: m.Core, Environment: m.Environment, Results: a.Results, Limitations: []string{"time_and_network_specific", "no_system_android_vpn_claim", "happ_unverified", "android_device_unverified", "quic_unsupported", "media_not_tested"}}
 	if m.Policy.Version == policy.GoogleYouTubeWeb {
 		report.Limitations = append(report.Limitations, "google_and_youtube_pages_only", "single_operator_google", "not_general_internet", "no_bulk_download_test", "preset_live_unverified")
+	}
+	if m.Policy.Version == media.Version {
+		report.Capabilities = media.Capabilities(m.Policy, a)
+		report.Limitations = []string{"time_and_network_specific", "no_playback_decode_audio_or_drm_claim", "not_general_internet", "android_device_unverified", "happ_unverified", "quic_unsupported", "no_system_android_vpn_claim"}
 	}
 	cfg, e := capability.Render(profiles[a.Candidate.Profile], a.Candidate.Params, "127.0.0.1:10808", model.ID(), model.ID())
 	if e != nil {

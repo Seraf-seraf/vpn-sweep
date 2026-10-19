@@ -13,6 +13,7 @@ if [ -n "$format_files" ]; then
     fi
 fi
 python3 scripts/test_secret_scan.py
+python3 scripts/test_media_resolver.py
 python3 scripts/secret-scan.py
 "$GO" vet ./...
 "$GO" test -race ./...

@@ -1,0 +1,26 @@
+{
+  "version": "representative-video-v1",
+  "rounds": 2,
+  "min_operators": 0,
+  "downloads": 0,
+  "min_download_bytes": 0,
+  "require_udp": false,
+  "require_quic": false,
+  "probes": [],
+  "video": {
+    "required": ["video_transfer"],
+    "samples": 3,
+    "min_mbps": 10,
+    "max_read_gap_ms": 3000,
+    "sample_bytes": 4194304,
+    "timeout_seconds": 30,
+    "reference": {
+      "url": "https://example.invalid/explicitly-unverified.mp4",
+      "bytes": 4194304,
+      "sha256": "",
+      "provenance": "No independently verified public reference available; example only",
+      "license": "unverified",
+      "status": "unverified"
+    }
+  }
+}

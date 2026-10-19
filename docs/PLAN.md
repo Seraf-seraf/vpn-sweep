@@ -50,3 +50,21 @@ UI Goal не включён. Разрешены локальная реализ�
 |21|Local package|artifact/checksum/licenses/docs|commit/push/release|Local package verified, outstanding gates explicit|
 
 Полная приёмка продукта требует этапов 16, 17, 19, 20. Их отсутствие нельзя компенсировать desktop tests.
+
+## Authorized video extension (no commit/push)
+
+|Checkpoint|Goal / allowed actions|Excluded|Binary stop criterion|
+|---|---|---|---|
+|30|Bounded isolated pinned official dependency spike and licensed reference research|Live VPN, accounts, denial bypass|Compatibility matrix or precise blockers recorded|
+|31|Separate opt-in video/YouTube capabilities, streaming/evaluation, frozen resolver, synthetic negative/resume tests|Catalog, CI, unrelated fixtures, publication|Scoped contract/integration/legacy replay tests pass|
+|32|Local race/vet/scanner and Linux/Android builds|Device/live acceptance claim|All available gates recorded truthfully|
+|33|New independent reviewer on real uncommitted workspace; scoped fixes and retest|Self-review substitution, commit/push|No remaining confirmed in-scope P0–P3 or explicit unresolved blocker|
+
+## Authorized strict MP4 fix and publication
+
+|Checkpoint|Goal / allowed actions|Excluded|Binary stop criterion|
+|---|---|---|---|
+|35|Strict tkhd v0/v1 and full hdlr header validation; permanent parser/TLS regressions|Playback/decode, unrelated fixes|Original falsepass repro RED before fix and GREEN after; valid/truncated matrix passes|
+|36|New independent reviewer on actual dirty workspace; scoped fixes/recheck only|Self-review substitution, live media|No remaining proven scoped P0–P3 in complete report|
+|37|Full local gates, optional dependency negatives and Linux/Android builds|Device/live acceptance, CI restore|All requested commands execute and recorded truthfully|
+|38|Audit full source-only staged diff; verify main/origin freshness, Russian Conventional Commit and ordinary push|Force, divergence overwrite, release/deploy|Remote SHA matches commit, worktree clean, workflows absent; otherwise explicit blocker|

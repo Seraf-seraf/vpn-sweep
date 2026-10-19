@@ -9,6 +9,7 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/core"
 	"github.com/Seraf-seraf/vpn-sweep/internal/export"
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
+	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
 	"github.com/Seraf-seraf/vpn-sweep/internal/private"
@@ -25,6 +26,8 @@ import (
 )
 
 type options struct {
+	video                                                                                bool
+	youtubePython, youtubeJS                                                             string
 	input, format, subscription, mode, binary, policy, space, state, output, network, ca string
 	attest, custom, unverifiedWeb                                                        bool
 	budgets                                                                              model.Budgets
@@ -48,6 +51,9 @@ func flags(args []string) (options, error) {
 	fs.BoolVar(&o.attest, "attest-no-other-vpn", false, "attest Termux is on intended network without another VPN")
 	fs.BoolVar(&o.unverifiedWeb, "allow-unverified-web-profile", false, "accept Google/YouTube web-only scope and live-unverified preset")
 	fs.BoolVar(&o.custom, "allow-custom-policy", false, "explicitly accept custom-v1 verification scope")
+	fs.BoolVar(&o.video, "allow-video-profile", false, "accept bounded media delivery scope, not playback")
+	fs.StringVar(&o.youtubePython, "youtube-python", "", "absolute isolated Python containing pinned yt-dlp/EJS")
+	fs.StringVar(&o.youtubeJS, "youtube-js", "", "absolute Node runtime for optional resolver")
 	o.budgets = model.DefaultBudgets()
 	fs.IntVar(&o.budgets.SessionSeconds, "session-seconds", 7200, "session wall budget; 0=unlimited")
 	fs.Int64Var(&o.budgets.PayloadBytes, "payload-bytes", 256<<20, "session payload budget; 0=unlimited")
@@ -115,11 +121,11 @@ func loadSpace(path string) (*space.Generator, error) {
 func emit(w io.Writer, v any) error { return json.NewEncoder(w).Encode(v) }
 func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
 	if len(args) == 0 || args[0] == "help" {
-		io.WriteString(out, "vpn-sweep inspect|space|policy|run|resume|status|report|export|version\nUse --input private-file --format auto; run requires --mode --core --policy --state --output --network-label --attest-no-other-vpn. See docs/usage.md.\n")
+		io.WriteString(out, "vpn-sweep inspect|space|policy|resolver-info|run|resume|status|report|export|version\nUse --input private-file --format auto; run requires --mode --core --policy --state --output --network-label --attest-no-other-vpn. See docs/usage.md.\n")
 		return 0
 	}
 	if args[0] == "version" {
-		io.WriteString(out, "vpn-sweep google-youtube-web-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
+		io.WriteString(out, "vpn-sweep representative-video-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
 		return 0
 	}
 	o, e := flags(args[1:])
@@ -162,6 +168,13 @@ func dispatch(ctx context.Context, command string, o options, in io.Reader, out 
 			domains = append(domains, map[string]any{"name": d.Name, "explicit_values": len(d.Values), "min": d.Min, "max": d.Max, "step": d.Step, "pair": d.Pair})
 		}
 		return emit(out, map[string]any{"count": g.Count().String(), "strategy": g.Spec.Strategy, "seed": g.Spec.Seed, "parameters": domains, "catalog": capability.Catalog(), "scope": "before_profile_applicability_filter"})
+	case "resolver-info":
+		r := media.Resolver{Python: o.youtubePython, JS: o.youtubeJS}
+		id, e := r.Identify(ctx)
+		if e != nil {
+			return e
+		}
+		return emit(out, id)
 	case "policy":
 		b, e := read(o.policy, 1<<20)
 		if e != nil {
@@ -243,6 +256,7 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 		return e
 	}
 	defer s.Close()
+	var resolver *media.Resolver
 	var m model.Manifest
 	var profiles []model.Profile
 	var key []byte
@@ -281,6 +295,20 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 		}
 		raw, _ := json.Marshal(g.Spec)
 		m = model.Manifest{Version: 1, SearchVersion: model.SearchVersion, SeriesID: model.ID(), Created: time.Now().UTC(), Mode: o.mode, NetworkLabel: model.PrivateID(key, o.network), Environment: "user_attested", Core: id, InputID: model.PrivateID(key, profiles), Space: raw, Policy: pol, Budgets: o.budgets, TrustID: "system"}
+		if pol.Version == media.Version {
+			if !o.video {
+				return model.Err("video_profile_requires_opt_in", "cli")
+			}
+			if pol.Video.YouTube != nil {
+				resolver = &media.Resolver{Python: o.youtubePython, JS: o.youtubeJS}
+				rid, err := resolver.Identify(ctx)
+				if err != nil {
+					return err
+				}
+				resolver.Identity = rid
+				m.Resolver = &rid
+			}
+		}
 		if o.ca != "" {
 			b, e = read(o.ca, 1<<20)
 			if e != nil {
@@ -332,6 +360,24 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 	if m.Policy.Version == policy.GoogleYouTubeWeb && !o.unverifiedWeb {
 		return model.Err("unverified_web_profile_requires_opt_in", "cli")
 	}
+	if m.Policy.Version == media.Version {
+		if !o.video {
+			return model.Err("video_profile_requires_opt_in", "cli")
+		}
+		if m.Policy.Video.YouTube != nil {
+			resolver = &media.Resolver{Python: o.youtubePython, JS: o.youtubeJS}
+			rid, err := resolver.Identify(ctx)
+			if err != nil {
+				return err
+			}
+			if m.Resolver == nil || rid != *m.Resolver {
+				return model.Err("resolver_identity_changed", "cli")
+			}
+			resolver.Identity = rid
+		}
+	} else if o.youtubePython != "" || o.youtubeJS != "" || o.video {
+		return model.Err("video_options_require_video_profile", "cli")
+	}
 	if e = capability.Gate(m.Mode, m.Core.Commit); e != nil {
 		return e
 	}
@@ -340,7 +386,8 @@ func run(ctx context.Context, command string, o options, in io.Reader, out io.Wr
 	}
 	runner := core.Runner{Binary: binary, Identity: id, Directory: filepath.Join(s.Dir, "runtime"), Startup: time.Duration(m.Budgets.StartupSeconds) * time.Second, Cleanup: time.Duration(m.Budgets.CleanupSeconds) * time.Second}
 	client := probe.Client{Roots: roots}
-	engine := search.Engine{Open: func(ctx context.Context, p model.Profile, params map[string]any) (search.Tunnel, error) {
+	mediaClient := media.Client{Roots: roots, Resolver: resolver}
+	engine := search.Engine{Media: mediaClient.Round, Open: func(ctx context.Context, p model.Profile, params map[string]any) (search.Tunnel, error) {
 		addr, e := core.ReserveAddress()
 		if e != nil {
 			return nil, e

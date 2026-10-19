@@ -59,15 +59,16 @@ type Probe struct {
 	TimeoutSeconds int      `json:"timeout_seconds"`
 }
 type Policy struct {
-	Version          string     `json:"version"`
-	Rounds           int        `json:"rounds"`
-	MinOperators     int        `json:"min_operators"`
-	Downloads        int        `json:"downloads"`
-	MinDownloadBytes int64      `json:"min_download_bytes"`
-	RequireUDP       bool       `json:"require_udp"`
-	RequireQUIC      bool       `json:"require_quic"`
-	Probes           []Probe    `json:"probes"`
-	UDP              []UDPProbe `json:"udp,omitempty"`
+	Video            *VideoPolicy `json:"video,omitempty"`
+	Version          string       `json:"version"`
+	Rounds           int          `json:"rounds"`
+	MinOperators     int          `json:"min_operators"`
+	Downloads        int          `json:"downloads"`
+	MinDownloadBytes int64        `json:"min_download_bytes"`
+	RequireUDP       bool         `json:"require_udp"`
+	RequireQUIC      bool         `json:"require_quic"`
+	Probes           []Probe      `json:"probes"`
+	UDP              []UDPProbe   `json:"udp,omitempty"`
 }
 
 type UDPProbe struct {
@@ -76,19 +77,20 @@ type UDPProbe struct {
 	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 type ProbeResult struct {
-	ID              string `json:"id"`
-	Probe           string `json:"probe"`
-	Round           int    `json:"round"`
-	Transport       string `json:"transport"`
-	Outcome         string `json:"outcome"`
-	Phase           string `json:"phase"`
-	HTTPStatus      int    `json:"http_status,omitempty"`
-	Bytes           int64  `json:"bytes"`
-	DurationMS      int64  `json:"duration_ms"`
-	ContentVerified bool   `json:"content_verified,omitempty"`
-	MIME            string `json:"mime,omitempty"`
-	TLSVerified     bool   `json:"tls_verified"`
-	Redirects       int    `json:"redirects"`
+	Media           *MediaEvidence `json:"media,omitempty"`
+	ID              string         `json:"id"`
+	Probe           string         `json:"probe"`
+	Round           int            `json:"round"`
+	Transport       string         `json:"transport"`
+	Outcome         string         `json:"outcome"`
+	Phase           string         `json:"phase"`
+	HTTPStatus      int            `json:"http_status,omitempty"`
+	Bytes           int64          `json:"bytes"`
+	DurationMS      int64          `json:"duration_ms"`
+	ContentVerified bool           `json:"content_verified,omitempty"`
+	MIME            string         `json:"mime,omitempty"`
+	TLSVerified     bool           `json:"tls_verified"`
+	Redirects       int            `json:"redirects"`
 }
 type Attempt struct {
 	ID        string        `json:"id"`
@@ -114,19 +116,20 @@ func DefaultBudgets() Budgets {
 }
 
 type Manifest struct {
-	SearchVersion int             `json:"search_version,omitempty"`
-	Version       int             `json:"version"`
-	SeriesID      string          `json:"series_id"`
-	Created       time.Time       `json:"created"`
-	Mode          string          `json:"mode"`
-	NetworkLabel  string          `json:"network_label"`
-	Environment   string          `json:"environment"`
-	Core          CoreIdentity    `json:"core"`
-	InputID       string          `json:"input_id"`
-	Space         json.RawMessage `json:"space"`
-	Policy        Policy          `json:"policy"`
-	Budgets       Budgets         `json:"budgets"`
-	TrustID       string          `json:"trust_id"`
+	Resolver      *ResolverIdentity `json:"resolver,omitempty"`
+	SearchVersion int               `json:"search_version,omitempty"`
+	Version       int               `json:"version"`
+	SeriesID      string            `json:"series_id"`
+	Created       time.Time         `json:"created"`
+	Mode          string            `json:"mode"`
+	NetworkLabel  string            `json:"network_label"`
+	Environment   string            `json:"environment"`
+	Core          CoreIdentity      `json:"core"`
+	InputID       string            `json:"input_id"`
+	Space         json.RawMessage   `json:"space"`
+	Policy        Policy            `json:"policy"`
+	Budgets       Budgets           `json:"budgets"`
+	TrustID       string            `json:"trust_id"`
 }
 
 func ID() string {
@@ -162,4 +165,57 @@ func Decode(data []byte, v any) error {
 		return Err("trailing_json", "input")
 	}
 	return nil
+}
+
+// Optional fields preserve the byte representation of legacy manifests/journal events.
+type VideoPolicy struct {
+	Required       []string          `json:"required"`
+	Samples        int               `json:"samples"`
+	MinMbps        float64           `json:"min_mbps"`
+	MaxReadGapMS   int               `json:"max_read_gap_ms"`
+	SampleBytes    int64             `json:"sample_bytes"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+	Reference      MediaReference    `json:"reference"`
+	YouTube        *YouTubeReference `json:"youtube,omitempty"`
+}
+type MediaReference struct {
+	URL        string `json:"url"`
+	Bytes      int64  `json:"bytes"`
+	SHA256     string `json:"sha256"`
+	Provenance string `json:"provenance"`
+	License    string `json:"license"`
+	Status     string `json:"status"`
+}
+type YouTubeReference struct {
+	VideoID    string `json:"video_id"`
+	Permission string `json:"permission"`
+	MinHeight  int    `json:"min_height"`
+}
+type ResolverIdentity struct {
+	AdapterSHA256  string `json:"adapter_sha256"`
+	PythonSHA256   string `json:"python_sha256"`
+	JSSHA256       string `json:"js_sha256"`
+	PythonVersion  string `json:"python_version"`
+	JSVersion      string `json:"js_version"`
+	YTDLP          string `json:"yt_dlp"`
+	EJS            string `json:"ejs"`
+	PackageSHA256  string `json:"package_sha256"`
+	AdapterVersion int    `json:"adapter_version"`
+}
+type MediaSample struct {
+	Bytes             int64  `json:"bytes"`
+	DurationNS        int64  `json:"duration_ns"`
+	MaxReadGapNS      int64  `json:"max_read_gap_ns"`
+	SHA256            string `json:"sha256"`
+	ReferenceVerified bool   `json:"reference_verified"`
+	ContainerVerified bool   `json:"container_verified"`
+	TLSVerified       bool   `json:"tls_verified"`
+	Status            int    `json:"status"`
+}
+type MediaEvidence struct {
+	Version    int           `json:"version"`
+	Capability string        `json:"capability"`
+	Samples    []MediaSample `json:"samples,omitempty"`
+	FormatID   string        `json:"format_id,omitempty"`
+	Height     int           `json:"height,omitempty"`
 }

@@ -94,3 +94,21 @@ bounded HTML receipt is measured, without false immutable hashes or bulk speed c
 New optional omitempty probe fields preserve serialization of existing manifests; search-v2
 and journal versions unchanged. Raw marker drift requires reviewed policy and a new series.
 Unrelated umask-dependent fixtures remain unfixed; local gates run with explicit umask077.
+
+## Optional video extension
+
+See video-profile.md. Two capability results and explicit required set prevent
+storage delivery from masquerading as YouTube. Initially only bounded fast-start
+clear MP4 and YouTube HTTPS MP4 ranges are supported; no player/downloader suite.
+Video JSON fields are omitempty and legacy event/manifest byte encoding remains
+unchanged. No journal rewrite/migration or SQLite change. Signed URLs live only
+in bounded resolver memory and are refreshed per round/resume. External reference
+acceptance is blocked, synthetic MP4 fixtures are not public media evidence.
+
+Canonical tracker helper was retried using package c1/track-plan expanded resource
+skill://plugin_asdk_app_sites_ae77444ef43481919c2588ef24f70c84/track-plan/scripts/source-snapshot.mjs:
+`failed to read skill resource`. No plugin modification or invented snapshot/PASSED.
+The local gates continue under the user's explicit instruction despite attestation
+unavailability. The existing fixture umask dependency remains untouched. In this
+workspace /tmp/.git is a read-only harness marker; authorized test commands set
+TMPDIR=/var/tmp to exercise outside-checkout export without weakening the guard.

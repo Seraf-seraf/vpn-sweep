@@ -143,3 +143,74 @@ Independent reviewer /root/google_youtube_independent_review found no code P0–
 a P3 guide flag typo was corrected from --session-seconds600 to --session-seconds 600.
 Reviewer independently passed uncached race, vet, scanner tests and offline policy smoke.
 Android/Happ/Xray runtime/live remain unverified. CI remains absent. No production dependency added.
+
+## Video extension (uncommitted; independent review in progress)
+
+Tracker existing plan2c3c68d5-f288-4c9f-b7d5-24f5a99f2669 checkpoints30–33.
+Compatibility spike: official PyPI yt-dlp2026.8.19/EJS0.8.0 in isolated /tmp venv;
+Python3.12.14/Node24.19.0 offline identity verified. No YouTube extraction or live
+VPN/media requests. Exact licensed public reference remains blocked/unverified;
+no fake hashes. The deliberately unverified schema example cannot produce transfer
+success. A suitable independently verified reference and permitted YouTube video
+are required before external acceptance. See video-profile.md.
+
+New independent reviewer /root/video_delivery_independent_review confirmed existing
+workspace and uncommitted diff. Found client fallback and suppressed extraction
+error defects. Fixed with a single web client and guards before other-client
+requests, ignoreerrors=False, and negative regression tests. Review recheck and
+final local gates are recorded below when actually complete.
+
+Safe scoped tests pass under umask077/TMPDIR=/var/tmp; initial sandbox denied
+loopback and /tmp/.git harness marker triggered correct output-inside-checkout
+rejection. Narrow local-check execution resolved these infrastructure limits;
+security guards and unrelated fixture permissions were not changed. The known
+legacy umask fixture defect remains open. Canonical tracker snapshot helper still
+fails to read through the documented skill URI; no source-bound PASSED claimed.
+
+Final safe gates executed with `umask 077`, `TMPDIR=/var/tmp`, and explicit
+VPN_SWEEP_TEST_PYTHON=/tmp/vpn-sweep-video-venv/bin/python,
+VPN_SWEEP_TEST_JS=/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin/node:
+`make check` PASS (format, 2 scanner tests, 4 resolver tests, scan76 files/staged0,
+vet, race, Linux+Android build); `go test -race -count=1 ./...` PASS;
+`go vet ./...` PASS; `git diff --check` and cached check PASS; no Go dependencies.
+Offline built CLI `help`, `policy` on private copy of unverified example and
+`resolver-info` PASS, network_requests=false for policy. No profile network run.
+Independent reviewer /root/video_delivery_independent_review rechecked actual fixes:
+full uncached race/vet PASS, media race with optional deps PASS, resolver4 tests
+PASS. Both confirmed findings fixed; no remaining proven in-scope P0–P3.
+Android output is ELF PIE aarch64 /system/bin/linker64, Go1.27.2, CGO_ENABLED=0;
+actual Android/Happ/Xray/device/live acceptance remains unverified. No commit/push.
+
+Final narrow independent recheck also covers Python datagram denial, all Node
+DNS entry points and owned-child cleanup/no-foreign-kill regression: PASS, no new
+proven P0–P3. Full `make check` and uncached full race/vet were repeated on final
+production code and passed. Final build SHA256: Linux
+4d3079df58b00de48707d4b40290c8ebbd0f75be303fdeb5aaf5b17f79be3b47;
+Android f6f191e04206c8624ceee913c4e466e16d24b8ffc7b1ac67bce485d4c1a9e5d0.
+
+## Strict MP4 P2 correction (authorized publication scope)
+
+New independent read-only review /root/independent_video_adversarial_review found
+one P2: invalid tkhd FullBox version255 passed MP4 and the TLS+SOCKS YouTube-range
+probe. Both original /tmp overlay repros and permanent regressions were confirmed
+RED before fixing. Strict v0/v1 tkhd sizes/offsets and full hdlr header validation
+now reject them; media race including optional dependencies and original repros
+PASS. The scoped media synthetic hdlr fixture was completed; unrelated legacy
+fixtures and umask bug remain untouched. No codec/playback/live acceptance added.
+New reviewer /root/strict_mp4_fix_independent_review and final gates are in progress;
+results and publication evidence follow only after actual execution.
+
+Strict-fix final independent report: /root/strict_mp4_fix_independent_review found
+no remaining proven scoped P0–P3. Independently reran original malformed parser
+and TLS+SOCKS HTTP206 repros and permanent regressions: PASS, malformed output
+container_unsupported_or_invalid/ContainerVerified=false. Separate external overlay
+exhausted tkhd versions2..255/flag bytes and hdlr invalid fixed-header bytes: PASS;
+media uncached race with optional dependencies PASS. No decode expansion.
+
+Parent actual gates on final production code: make check PASS; go test -race
+-count=1 ./... PASS; go vet ./... PASS; scanner2 and resolver4 tests PASS;
+secret scan77/staged0 no findings; make build android PASS; diff checks PASS.
+All use umask077 TMPDIR=/var/tmp and explicit preinstalled optional dependencies.
+No live media/VPN download, CI/security changes or unrelated fixture corrections.
+Publication is authorized only after source-only staging and fresh-main audit;
+actual resulting SHA/push verification are reported in tracker/chat.

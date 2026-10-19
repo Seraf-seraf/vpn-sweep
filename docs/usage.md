@@ -147,3 +147,7 @@ Reports/stdout expose verification_scope and preset_status. web-basic-v1/custom-
 unchanged; old manifests omit new optional fields and preserve integrity/resume semantics.
 Current version output identifies google-youtube-web-v1 and search=2; older p1-fixed-search-v2
 series with existing supported policies remain readable/resumable.
+
+The separate opt-in video/YouTube media extension and exact optional dependency,
+policy/run/resume commands are documented in [video-profile.md](video-profile.md).
+Its schema example is explicitly unverified; it is not a ready public media preset.

@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"github.com/Seraf-seraf/vpn-sweep/internal/capability"
+	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
@@ -17,6 +18,7 @@ type Tunnel interface {
 	Close() error
 }
 type Engine struct {
+	Media  func(context.Context, socks.Endpoint, model.Policy, int) []model.ProbeResult
 	Open   func(context.Context, model.Profile, map[string]any) (Tunnel, error)
 	Check  func(context.Context, socks.Endpoint, model.Probe, int) model.ProbeResult
 	UDP    func(context.Context, socks.Endpoint, string, string, int) model.ProbeResult
@@ -168,6 +170,12 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			}
 			return status("paused_budget")
 		}
+		if outcome == "capability_blocked" {
+			if err = s.End("interrupted"); err != nil {
+				return "state_error", err
+			}
+			return status("capability_blocked")
+		}
 		if outcome == "pass" {
 			if err = s.End("verified_pending_export"); err != nil {
 				return "state_error", err
@@ -233,6 +241,50 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 				h.Close()
 				return "", err
 			}
+		}
+
+		if m.Policy.Version == media.Version {
+			if e.Media == nil {
+				h.Close()
+				return "capability_blocked", nil
+			}
+			if m.Budgets.PayloadBytes > 0 && s.View().PayloadBytes-initialBytes+media.RoundBudget(m.Policy) > m.Budgets.PayloadBytes {
+				if err = h.Close(); err != nil {
+					return "", err
+				}
+				return "interrupted", nil
+			}
+			results := e.Media(ctx, h.Endpoint(), m.Policy, round)
+			blocked := false
+			passed := true
+			for _, r := range results {
+				if err = s.Probe(r); err != nil {
+					h.Close()
+					return "", err
+				}
+				if media.Required(m.Policy, r.Probe) && r.Outcome != "pass" {
+					passed = false
+					if media.Blocked(r.Outcome) {
+						blocked = true
+					}
+				}
+			}
+			if f, ok := h.(interface{ Failure() error }); ok && f.Failure() != nil {
+				passed = false
+			}
+			if err = h.Close(); err != nil {
+				return "", err
+			}
+			if ctx.Err() != nil {
+				return "interrupted", nil
+			}
+			if blocked {
+				return "capability_blocked", nil
+			}
+			if !passed {
+				return "failed", nil
+			}
+			continue
 		}
 		failed := false
 		inconclusive := false

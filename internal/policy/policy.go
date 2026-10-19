@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/probe"
 	"net"
@@ -9,6 +10,12 @@ import (
 )
 
 func Validate(p model.Policy) error {
+	if p.Version == media.Version {
+		return media.Validate(p)
+	}
+	if p.Video != nil {
+		return model.Err("video_requires_separate_profile", "policy")
+	}
 	if p.Version == GoogleYouTubeWeb {
 		return validateGoogleYouTube(p)
 	}
@@ -66,6 +73,9 @@ func Validate(p model.Policy) error {
 	return nil
 }
 func Evaluate(p model.Policy, a model.Attempt) string {
+	if p.Version == media.Version {
+		return media.Evaluate(p, a)
+	}
 	if Validate(p) != nil {
 		return "invalid_policy"
 	}
