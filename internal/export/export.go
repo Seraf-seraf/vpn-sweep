@@ -52,6 +52,74 @@ func verify(dir string, c completion) error {
 	return nil
 }
 
+func readCompletion(dir string) (completion, bool, error) {
+	var c completion
+	path := filepath.Join(dir, "COMPLETE.json")
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return c, false, nil
+	} else if err != nil {
+		return c, false, model.Err("export_unavailable", "export")
+	}
+	b, err := private.Read(path, 4096)
+	if err != nil {
+		return c, false, err
+	}
+	if model.Decode(b, &c) != nil || c.Version != 1 || c.CandidateID == "" {
+		return c, false, model.Err("export_integrity_failed", "export")
+	}
+	if err = verify(dir, c); err != nil {
+		return c, false, err
+	}
+	return c, true, nil
+}
+
+func resultID(id string) bool {
+	if len(id) != 32 && len(id) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
+}
+
+func SavedCandidates(dir string) (map[string]bool, error) {
+	d, err := SafeDirectory(dir)
+	if err != nil {
+		return nil, err
+	}
+	saved := map[string]bool{}
+	c, exists, err := readCompletion(d)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		saved[c.CandidateID] = true
+	}
+	entries, err := os.ReadDir(d)
+	if err != nil {
+		return nil, model.Err("export_unavailable", "export")
+	}
+	for _, entry := range entries {
+		if !resultID(entry.Name()) || !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		child, err := SafeDirectory(filepath.Join(d, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		c, exists, err := readCompletion(child)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			if c.CandidateID != entry.Name() {
+				return nil, model.Err("export_conflict", "export")
+			}
+			saved[c.CandidateID] = true
+		}
+	}
+	return saved, nil
+}
+
 func SafeDirectory(path string) (string, error) {
 	d, e := private.Dir(path)
 	if e != nil {
@@ -79,18 +147,28 @@ func Save(dir string, m model.Manifest, profiles []model.Profile, a model.Attemp
 	if e != nil {
 		return e
 	}
-	if _, err := os.Lstat(filepath.Join(d, "COMPLETE.json")); err == nil {
-		b, e := private.Read(filepath.Join(d, "COMPLETE.json"), 4096)
+	c, exists, e := readCompletion(d)
+	if e != nil {
+		return e
+	}
+	if exists && c.CandidateID != a.Candidate.ID {
+		if !resultID(a.Candidate.ID) {
+			return model.Err("export_conflict", "export")
+		}
+		d, e = SafeDirectory(filepath.Join(d, a.Candidate.ID))
 		if e != nil {
 			return e
 		}
-		var c completion
-		if model.Decode(b, &c) != nil || c.Version != 1 || c.SeriesID != m.SeriesID || c.CandidateID != a.Candidate.ID {
+		c, exists, e = readCompletion(d)
+		if e != nil {
+			return e
+		}
+	}
+	if exists {
+		if c.SeriesID != m.SeriesID || c.CandidateID != a.Candidate.ID {
 			return model.Err("export_conflict", "export")
 		}
-		return verify(d, c)
-	} else if !os.IsNotExist(err) {
-		return model.Err("export_unavailable", "export")
+		return nil
 	}
 	report := Report{VerificationScope: policy.Scope(m.Policy), PresetStatus: policy.PresetStatus(m.Policy), Version: 1, SeriesID: m.SeriesID, CandidateID: a.Candidate.ID, AttemptID: a.ID, Status: "policy_satisfied", Policy: m.Policy.Version, Core: m.Core, Environment: m.Environment, Results: a.Results, Limitations: []string{"time_and_network_specific", "no_system_android_vpn_claim", "happ_unverified", "android_device_unverified", "quic_unsupported", "media_not_tested"}}
 	if m.Policy.Version == policy.GoogleYouTubeWeb {

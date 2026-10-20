@@ -28,6 +28,8 @@ func progressLog(w io.Writer) (*log.Logger, func(search.Progress)) {
 		}
 		flush()
 		switch p.Event {
+		case "saved_result_skipped":
+			l.Print("Рабочий вариант уже сохранён; поиск следующего")
 		case "attempt_started":
 			l.Printf("Попытка %d: конфигурация %d", p.Attempt, p.Profile)
 		case "core_starting":

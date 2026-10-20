@@ -18,6 +18,7 @@ type Tunnel interface {
 	Close() error
 }
 type Engine struct {
+	Saved    map[string]bool
 	Progress func(Progress)
 	Media    func(context.Context, socks.Endpoint, model.Policy, int) []model.ProbeResult
 	Open     func(context.Context, model.Profile, map[string]any) (Tunnel, error)
@@ -119,10 +120,16 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		}
 	}
 	if winner := s.View().Winner; winner != nil {
-		if err := e.Export(*winner); err != nil {
-			return "result_save_failed", err
+		if !e.Saved[winner.Candidate.ID] {
+			if err := e.Export(*winner); err != nil {
+				return "result_save_failed", err
+			}
+			return status("success")
 		}
-		return status("success")
+		if err := s.MarkSaved(winner.Candidate.ID); err != nil {
+			return "state_error", err
+		}
+		e.notify(s, Progress{Event: "saved_result_skipped"})
 	}
 	for {
 		view := s.View()
@@ -171,6 +178,13 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		if s.Seen(c.ID) {
 			e.notify(s, Progress{Event: "candidate_skipped", Outcome: "duplicate"})
 			if err := s.End("duplicate"); err != nil {
+				return "state_error", err
+			}
+			continue
+		}
+		if e.Saved[c.ID] {
+			e.notify(s, Progress{Event: "saved_result_skipped"})
+			if err := s.End("already_saved"); err != nil {
 				return "state_error", err
 			}
 			continue

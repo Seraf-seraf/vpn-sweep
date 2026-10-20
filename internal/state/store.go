@@ -26,6 +26,7 @@ type manifestEnvelope struct {
 }
 
 type Event struct {
+	CandidateID string             `json:"candidate_id,omitempty"`
 	Refinements []model.Candidate  `json:"refinements,omitempty"`
 	Kind        string             `json:"kind"`
 	Attempt     *model.Attempt     `json:"attempt,omitempty"`
@@ -49,6 +50,7 @@ type View struct {
 	PayloadBytes int64             `json:"payload_bytes"`
 	Pending      *model.Attempt    `json:"pending,omitempty"`
 	Winner       *model.Attempt    `json:"winner,omitempty"`
+	LastSaved    *model.Attempt    `json:"last_saved,omitempty"`
 	Inconclusive uint64            `json:"inconclusive"`
 	Retry        *model.Candidate  `json:"retry,omitempty"`
 }
@@ -204,6 +206,13 @@ func (s *Store) apply(e Event) error {
 		s.view.Pending = nil
 	case "status":
 		s.view.Status = e.Status
+	case "saved":
+		if s.view.Pending != nil || s.view.Winner == nil || e.CandidateID != s.view.Winner.Candidate.ID {
+			return model.Err("invalid_transition", "state")
+		}
+		s.view.LastSaved = s.view.Winner
+		s.view.Winner = nil
+		s.view.Status = "ready"
 	case "refine":
 		if len(s.view.Refinements)+len(e.Refinements) > 32 {
 			return model.Err("refinement_queue_limit", "state")
@@ -320,6 +329,14 @@ func (s *Store) Status(status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.append(Event{Kind: "status", Status: status})
+}
+func (s *Store) MarkSaved(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.view.Pending != nil || s.view.Winner == nil || s.view.Winner.Candidate.ID != id {
+		return model.Err("invalid_transition", "state")
+	}
+	return s.append(Event{Kind: "saved", CandidateID: id})
 }
 func (s *Store) View() View {
 	s.mu.Lock()

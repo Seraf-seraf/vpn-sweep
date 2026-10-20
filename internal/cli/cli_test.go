@@ -99,13 +99,37 @@ func TestCompleteCLIWithControlledCore(t *testing.T) {
 		t.Fatal("secret in public diagnostics")
 	}
 	before, _ := os.ReadFile(filepath.Join(resultDir, "working.json"))
+	frozen, e := os.ReadFile(filepath.Join(stateDir, "manifest.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
 	out.Reset()
 	if code := Run(context.Background(), []string{"resume", "--core", binary, "--state", stateDir, "--output", resultDir}, nil, &out, &stderr); code != 0 {
 		t.Fatal("resume export", stderr.String())
 	}
 	after, _ := os.ReadFile(filepath.Join(resultDir, "working.json"))
 	if !bytes.Equal(before, after) {
-		t.Fatal("non-idempotent export")
+		t.Fatal("previous working config overwritten")
+	}
+	afterManifest, e := os.ReadFile(filepath.Join(stateDir, "manifest.json"))
+	if e != nil || !bytes.Equal(frozen, afterManifest) {
+		t.Fatal("resume changed frozen search", e)
+	}
+	store, e := state.Open(stateDir, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	v := store.View()
+	store.Close()
+	if v.LastSaved == nil || v.LastSaved.Candidate.ID != report.CandidateID || v.Winner == nil || v.Winner.Candidate.ID == report.CandidateID || v.Next == "1" {
+		t.Fatal("resume did not search for a different config", v)
+	}
+	second, e := export.ReadReport(filepath.Join(resultDir, v.Winner.Candidate.ID))
+	if e != nil || second.CandidateID != v.Winner.Candidate.ID || second.SeriesID != report.SeriesID {
+		t.Fatal("new result not saved separately", e)
+	}
+	if !strings.Contains(stderr.String(), "Рабочий вариант уже сохранён; поиск следующего") {
+		t.Fatal("saved result skip not logged")
 	}
 	out.Reset()
 	changed := filepath.Join(base, "changed-core")

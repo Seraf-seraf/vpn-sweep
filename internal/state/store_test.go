@@ -213,6 +213,56 @@ func TestRefinementIssuanceAndInterruptedRecovery(t *testing.T) {
 	}
 }
 
+func TestSavedWinnerTransitionAndReplayKeepSearchPosition(t *testing.T) {
+	d := t.TempDir()
+	s, err := Open(d, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.MarkSaved("candidate-a"); model.Code(err) != "invalid_transition" {
+		t.Fatal("accepted save without winner", err)
+	}
+	neighbor := model.Candidate{ID: "candidate-neighbor", Params: map[string]any{"mux": true}}
+	if err = s.Refine([]model.Candidate{neighbor}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Begin(attempt(), "17"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.End("verified_pending_export"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.MarkSaved("another-candidate"); model.Code(err) != "invalid_transition" {
+		t.Fatal("wrong winner acknowledged", err)
+	}
+	s.maxBytes = 1
+	if err = s.MarkSaved("candidate-a"); model.Code(err) != "journal_budget" || s.View().Winner == nil {
+		t.Fatal("uncommitted save cleared winner", err)
+	}
+	s.maxBytes = 0
+	if err = s.MarkSaved("candidate-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(d, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	v := s.View()
+	if v.Winner != nil || v.LastSaved == nil || v.LastSaved.Candidate.ID != "candidate-a" || v.Next != "17" || !s.Seen("candidate-a") || len(v.Refinements) != 1 || v.Refinements[0].ID != neighbor.ID {
+		t.Fatal("search state lost after acknowledging save", v)
+	}
+	a := attempt()
+	a.ID, a.Candidate.ID = "attempt-next", "candidate-next"
+	if err = s.Begin(a, "18"); err != nil {
+		t.Fatal("next attempt blocked", err)
+	}
+}
+
 func TestManifestIntegrityAndPrivateInput(t *testing.T) {
 	d := t.TempDir()
 	s, _ := Open(d, 0)

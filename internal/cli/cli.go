@@ -156,10 +156,14 @@ func dispatch(ctx context.Context, command string, o options, in io.Reader, out,
 		}
 		v := s.View()
 		if command == "export" {
-			if v.Winner == nil || o.output == "" {
+			a := v.Winner
+			if a == nil {
+				a = v.LastSaved
+			}
+			if a == nil || o.output == "" {
 				return model.Err("no_verified_result_or_output", "export")
 			}
-			if e = export.Save(o.output, m, p, *v.Winner); e != nil {
+			if e = export.Save(o.output, m, p, *a); e != nil {
 				return e
 			}
 			return emit(out, map[string]any{"status": "exported", "series_id": m.SeriesID})
@@ -185,6 +189,11 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 		return e
 	}
 	if _, e := export.SafeDirectory(o.output); e != nil {
+		return e
+	}
+	logger.Print("Подготовка: проверка сохранённых результатов")
+	saved, e := export.SavedCandidates(o.output)
+	if e != nil {
 		return e
 	}
 	binary, e := filepath.Abs(o.binary)
@@ -305,7 +314,7 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 	client := probe.Client{Roots: roots}
 	mediaClient := media.Client{Roots: roots, Resolver: resolver}
 	logger.Print("Подготовка завершена; начинается подбор")
-	engine := search.Engine{Progress: progress, Media: mediaClient.Round, Open: func(ctx context.Context, p model.Profile, params map[string]any) (search.Tunnel, error) {
+	engine := search.Engine{Saved: saved, Progress: progress, Media: mediaClient.Round, Open: func(ctx context.Context, p model.Profile, params map[string]any) (search.Tunnel, error) {
 		addr, e := core.ReserveAddress()
 		if e != nil {
 			return nil, e

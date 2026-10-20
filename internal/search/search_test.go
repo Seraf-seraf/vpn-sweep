@@ -64,6 +64,94 @@ func TestFirstSuccessStopAndWinnerRecovery(t *testing.T) {
 		t.Fatal("export recovery", status, err)
 	}
 }
+
+func TestSavedWinnerContinuesFromCheckpointWithoutRepeating(t *testing.T) {
+	m, p, _, s := setup(t)
+	input, err := importer.Parse([]byte("vless://synthetic-id@vpn.invalid:443?encryption=none"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p = input.Profiles
+	g, err := space.New(space.Spec{Version: 1, Strategy: "exhaustive", Parameters: []space.Domain{{Name: "mux", Values: []any{false, true}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	closed, opens, exports := 0, 0, 0
+	e := Engine{Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+		opens++
+		return tunnel{&closed}, nil
+	}, Check: pass, Export: func(model.Attempt) error { exports++; return nil }}
+	if status, err := e.Run(context.Background(), m, p, key, g, s); err != nil || status != "success" {
+		t.Fatal(status, err)
+	}
+	first := s.View().Winner.Candidate.ID
+	e.Saved = map[string]bool{first: true}
+	dir := s.Dir
+	s.Close()
+	s, err = state.Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if status, err := e.Run(context.Background(), m, p, key, g, s); err != nil || status != "success" {
+		t.Fatal(status, err)
+	}
+	v := s.View()
+	if exports != 2 || opens != 4 || closed != 4 || v.Winner.Candidate.ID == first || v.LastSaved == nil || v.LastSaved.Candidate.ID != first || v.Next != "3" || !s.Seen(first) {
+		t.Fatal("saved winner repeated or checkpoint lost", exports, opens, closed, v)
+	}
+	e.Saved[v.Winner.Candidate.ID] = true
+	e.Open = func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+		t.Fatal("saved result tested again")
+		return nil, nil
+	}
+	if status, err := e.Run(context.Background(), m, p, key, g, s); err != nil || status != "space_exhausted" || exports != 2 {
+		t.Fatal(status, err, exports)
+	}
+}
+
+func TestPreviouslySavedCandidateSkipsNetworkInNewSeries(t *testing.T) {
+	m, p, _, s := setup(t)
+	input, err := importer.Parse([]byte("vless://synthetic-id@vpn.invalid:443?encryption=none"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p = input.Profiles
+	g, err := space.New(space.Spec{Version: 1, Strategy: "exhaustive", Parameters: []space.Domain{{Name: "mux", Values: []any{true}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	c, _, _ := Candidate(p, key, g, big.NewInt(0))
+	closed := 0
+	e := Engine{Saved: map[string]bool{c.ID: true}, Open: func(_ context.Context, _ model.Profile, params map[string]any) (Tunnel, error) {
+		if params["mux"] != true {
+			t.Fatal("saved baseline tested again")
+		}
+		return tunnel{&closed}, nil
+	}, Check: pass, Export: func(model.Attempt) error { return nil }}
+	if status, err := e.Run(context.Background(), m, p, key, g, s); err != nil || status != "success" || closed != 2 || s.View().Winner.Candidate.ID == c.ID {
+		t.Fatal(status, err, closed)
+	}
+}
+
+func TestExportFailureRetainsWinnerForRecovery(t *testing.T) {
+	m, p, g, s := setup(t)
+	closed := 0
+	e := Engine{Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) { return tunnel{&closed}, nil }, Check: pass, Export: func(model.Attempt) error { return model.Err("write_failed", "export") }}
+	if status, err := e.Run(context.Background(), m, p, make([]byte, 32), g, s); status != "result_save_failed" || model.Code(err) != "write_failed" || s.View().Winner == nil {
+		t.Fatal(status, err)
+	}
+	e.Open = func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+		t.Fatal("searched before recovering export")
+		return nil, nil
+	}
+	e.Export = func(model.Attempt) error { return nil }
+	if status, err := e.Run(context.Background(), m, p, make([]byte, 32), g, s); err != nil || status != "success" || s.View().Attempts != 1 {
+		t.Fatal(status, err)
+	}
+}
 func TestInterruptRetriesSameCandidateWithNewAttempt(t *testing.T) {
 	m, p, g, s := setup(t)
 	ctx, cancel := context.WithCancel(context.Background())
