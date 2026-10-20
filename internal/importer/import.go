@@ -84,9 +84,6 @@ func Parse(data []byte, format string) (Result, error) {
 			if !keys(m, "outbounds inbounds dns routing policy log stats api remarks meta") {
 				return out, fail("unsupported_root_field")
 			}
-			if m["api"] != nil {
-				return out, fail("unsupported_api")
-			}
 			obs := list(m["outbounds"])
 			if len(obs) == 0 {
 				return out, fail("missing_outbound")
@@ -101,12 +98,17 @@ func Parse(data []byte, format string) (Result, error) {
 					out.Notices = append(out.Notices, "utility_outbound_removed")
 					continue
 				}
+				notices, e := normalizeJSONOutbound(o)
+				if e != nil {
+					return out, e
+				}
 				if e := Validate(model.Profile{Outbound: o}); e != nil {
 					return out, e
 				}
+				out.Notices = append(out.Notices, notices...)
 				out.Profiles = append(out.Profiles, model.Profile{Outbound: o})
 			}
-			for _, k := range []string{"inbounds", "dns", "routing", "policy", "log", "stats"} {
+			for _, k := range []string{"inbounds", "dns", "routing", "policy", "log", "stats", "api"} {
 				if m[k] != nil {
 					out.Notices = append(out.Notices, "test_envelope_replaces_"+k)
 				}
@@ -142,6 +144,37 @@ func Parse(data []byte, format string) (Result, error) {
 		return out, fail("no_supported_profiles")
 	}
 	return out, nil
+}
+
+func normalizeJSONOutbound(o map[string]any) ([]string, error) {
+	var notices []string
+	s := obj(o["settings"])
+	_, flat := s["address"]
+	_, nested := s["vnext"]
+	if str(o["protocol"]) == "vless" && flat && !nested {
+		if !keys(s, "address port id encryption flow level security") {
+			return nil, fail("unsupported_settings")
+		}
+		user := map[string]any{}
+		for _, k := range []string{"id", "encryption", "flow", "level", "security"} {
+			if v, ok := s[k]; ok {
+				user[k] = v
+			}
+		}
+		o["settings"] = map[string]any{"vnext": []any{map[string]any{
+			"address": s["address"], "port": s["port"], "users": []any{user},
+		}}}
+		notices = append(notices, "flat_vless_settings_normalized")
+	}
+	tls := obj(obj(o["streamSettings"])["tlsSettings"])
+	if show, ok := tls["show"]; ok {
+		if _, ok := show.(bool); !ok {
+			return nil, fail("unsupported_tls_field")
+		}
+		delete(tls, "show")
+		notices = append(notices, "client_tls_show_removed")
+	}
+	return notices, nil
 }
 
 func Validate(p model.Profile) error {
