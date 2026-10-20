@@ -96,9 +96,12 @@ func Save(dir string, m model.Manifest, profiles []model.Profile, a model.Attemp
 	if m.Policy.Version == policy.GoogleYouTubeWeb {
 		report.Limitations = append(report.Limitations, "google_and_youtube_pages_only", "single_operator_google", "not_general_internet", "no_bulk_download_test", "preset_live_unverified")
 	}
-	if m.Policy.Version == media.Version {
-		report.Capabilities = media.Capabilities(m.Policy, a)
+	if policy.HasVideo(m.Policy) {
+		report.Capabilities = media.Capabilities(policy.MediaPolicy(m.Policy), a)
 		report.Limitations = []string{"time_and_network_specific", "no_playback_decode_audio_or_drm_claim", "not_general_internet", "android_device_unverified", "happ_unverified", "quic_unsupported", "no_system_android_vpn_claim"}
+		if m.Policy.Version == policy.GoogleYouTube {
+			report.Limitations = append(report.Limitations, "preset_live_unverified")
+		}
 	}
 	cfg, e := capability.Render(profiles[a.Candidate.Profile], a.Candidate.Params, "127.0.0.1:10808", model.ID(), model.ID())
 	if e != nil {

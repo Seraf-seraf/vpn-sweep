@@ -19,4 +19,4 @@ Tested Python3.12.14 (PSF) and Node24.19.0 (MIT plus bundled third-party notices
 Adapter requires Node>=24, verifies pinned package versions and freezes actual
 binary/package/adapter hashes. Termux package/runtime compatibility is unverified.
 No auto-update, remote EJS download, provider plugins, FFmpeg or new Go module.
-See video-profile.md for scope, official sources, limitations and opt-in commands.
+See video-profile.md for scope, official sources, limitations and automatic preparation.

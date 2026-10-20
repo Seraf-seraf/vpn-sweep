@@ -101,10 +101,10 @@ func (r Resolver) Identify(ctx context.Context) (model.ResolverIdentity, error) 
 		return id, e
 	}
 	major, _ := strconv.Atoi(strings.Split(strings.TrimPrefix(id.JSVersion, "v"), ".")[0])
-	if major < 24 {
+	if major < minNodeMajor {
 		return id, model.Err("resolver_node_24_required", "resolver")
 	}
-	if id.YTDLP != "2026.8.19" || id.EJS != "0.8.0" || id.AdapterVersion != 1 || !strings.HasPrefix(id.JSVersion, "v") {
+	if id.YTDLP != ytDLPVersion || id.EJS != ejsVersion || id.AdapterVersion != 1 || !strings.HasPrefix(id.JSVersion, "v") {
 		return id, model.Err("resolver_unsupported", "resolver")
 	}
 	return id, nil

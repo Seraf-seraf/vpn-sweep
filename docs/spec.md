@@ -13,7 +13,7 @@ Status success requires all policy probes in both fresh-core rounds, required do
 successful child cleanup and durable private export. Partial is never success.
 Budget exhaustion pauses the series. Finite exhaustive traversal reports only the researched space.
 
-Network environment must be explicitly attested; this is not proof that Android has no other VPN.
-Unknown/conflicting environments cannot produce a verified result. No system setting is changed.
+New series record the network environment as unverified; no network label or attestation is requested.
+Success confirms only the application probes, not the absence of another VPN. No system setting is changed.
 
 Storage implementation and unsupported features are documented in EXECUTION.md, not silently substituted.

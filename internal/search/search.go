@@ -18,11 +18,47 @@ type Tunnel interface {
 	Close() error
 }
 type Engine struct {
-	Media  func(context.Context, socks.Endpoint, model.Policy, int) []model.ProbeResult
-	Open   func(context.Context, model.Profile, map[string]any) (Tunnel, error)
-	Check  func(context.Context, socks.Endpoint, model.Probe, int) model.ProbeResult
-	UDP    func(context.Context, socks.Endpoint, string, string, int) model.ProbeResult
-	Export func(model.Attempt) error
+	Progress func(Progress)
+	Media    func(context.Context, socks.Endpoint, model.Policy, int) []model.ProbeResult
+	Open     func(context.Context, model.Profile, map[string]any) (Tunnel, error)
+	Check    func(context.Context, socks.Endpoint, model.Probe, int) model.ProbeResult
+	UDP      func(context.Context, socks.Endpoint, string, string, int) model.ProbeResult
+	Export   func(model.Attempt) error
+}
+
+type Progress struct {
+	Event      string
+	Attempt    uint64
+	Profile    int
+	Round      int
+	Probe      int
+	Outcome    string
+	Bytes      int64
+	DurationMS int64
+}
+
+func (e Engine) notify(s *state.Store, p Progress) {
+	if e.Progress == nil {
+		return
+	}
+	v := s.View()
+	p.Attempt = v.Attempts
+	if v.Pending != nil {
+		p.Profile = v.Pending.Candidate.Profile + 1
+	}
+	e.Progress(p)
+}
+
+func (e Engine) recordProbe(s *state.Store, r model.ProbeResult, index int) error {
+	if err := s.Probe(r); err != nil {
+		return err
+	}
+	event := "probe_finished"
+	if r.Transport == "core" {
+		event = "core_failed"
+	}
+	e.notify(s, Progress{Event: event, Round: r.Round + 1, Probe: index, Outcome: r.Outcome, Bytes: r.Bytes, DurationMS: r.DurationMS})
+	return nil
 }
 
 func Effective(p model.Profile, params map[string]any) map[string]any {
@@ -49,7 +85,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 	if m.SearchVersion != model.SearchVersion {
 		return "unsupported_search_version", model.Err("search_version_requires_new_series", "search")
 	}
-	if m.Environment != "user_attested" || m.NetworkLabel == "" {
+	if m.Environment != "unverified" && (m.Environment != "user_attested" || m.NetworkLabel == "") {
 		return "environment_blocked", model.Err("environment_unverified", "search")
 	}
 	if err := policy.Validate(m.Policy); err != nil {
@@ -94,9 +130,15 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			if ctx.Err() != nil {
 				return status("interrupted")
 			}
+			e.notify(s, Progress{Event: "budget_reached", Outcome: "session_budget"})
 			return status("paused_budget")
 		}
 		if b.Attempts > 0 && usedAttempts >= b.Attempts || b.PayloadBytes > 0 && view.PayloadBytes-initial.PayloadBytes >= b.PayloadBytes {
+			reason := "payload_budget"
+			if b.Attempts > 0 && usedAttempts >= b.Attempts {
+				reason = "attempt_budget"
+			}
+			e.notify(s, Progress{Event: "budget_reached", Outcome: reason})
 			return status("paused_budget")
 		}
 		var c model.Candidate
@@ -121,29 +163,34 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		a := model.Attempt{ID: model.ID(), Candidate: c, Started: time.Now().UTC(), Outcome: "running"}
 		if err := s.Begin(a, next); err != nil {
 			if model.Code(err) == "journal_budget" {
+				e.notify(s, Progress{Event: "budget_reached", Outcome: "journal_budget"})
 				return "paused_budget", nil
 			}
 			return "state_error", err
 		}
 		if s.Seen(c.ID) {
+			e.notify(s, Progress{Event: "candidate_skipped", Outcome: "duplicate"})
 			if err := s.End("duplicate"); err != nil {
 				return "state_error", err
 			}
 			continue
 		}
 		if err := capability.Check(profiles[c.Profile], c.Params); err != nil {
+			e.notify(s, Progress{Event: "candidate_skipped", Outcome: model.Code(err)})
 			if err = s.End(model.Code(err)); err != nil {
 				return "state_error", err
 			}
 			continue
 		}
 		if c.Params["noise"] == true && len(m.Policy.UDP) == 0 {
+			e.notify(s, Progress{Event: "candidate_skipped", Outcome: "noise_udp_probe_required"})
 			if err := s.End("noise_udp_probe_required"); err != nil {
 				return "state_error", err
 			}
 			continue
 		}
 		usedAttempts++
+		e.notify(s, Progress{Event: "attempt_started"})
 		attemptCtx, stop := context.WithTimeout(session, time.Duration(b.AttemptSeconds)*time.Second)
 		outcome, err := e.attempt(attemptCtx, m, profiles[c.Profile], c, s, initial.PayloadBytes)
 
@@ -155,6 +202,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			outcome = "attempt_timeout"
 		}
 		stop()
+		e.notify(s, Progress{Event: "attempt_finished", Outcome: outcome})
 		if err != nil {
 			return "attempt_error", err
 		}
@@ -166,6 +214,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 				return status("interrupted")
 			}
 			if session.Err() != nil {
+				e.notify(s, Progress{Event: "budget_reached", Outcome: "session_budget"})
 				return status("paused_budget")
 			}
 			return status("paused_budget")
@@ -226,40 +275,54 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 		if ctx.Err() != nil {
 			return "interrupted", nil
 		}
+		e.notify(s, Progress{Event: "core_starting", Round: round + 1})
 		h, err := e.Open(ctx, p, c.Params)
 		if err != nil {
 			if ctx.Err() != nil {
 				return "interrupted", nil
 			}
-			if er := s.Probe(model.ProbeResult{ID: model.ID(), Probe: "core-start", Round: round, Transport: "core", Outcome: model.Code(err), Phase: "core"}); er != nil {
+			if er := e.recordProbe(s, model.ProbeResult{ID: model.ID(), Probe: "core-start", Round: round, Transport: "core", Outcome: model.Code(err), Phase: "core"}, 0); er != nil {
 				return "", er
 			}
 			return "failed", nil
 		}
+		e.notify(s, Progress{Event: "core_ready", Round: round + 1})
+		closeTunnel := func() error {
+			e.notify(s, Progress{Event: "core_stopping", Round: round + 1})
+			err := h.Close()
+			outcome := "pass"
+			if err != nil {
+				outcome = model.Code(err)
+			}
+			e.notify(s, Progress{Event: "core_stopped", Round: round + 1, Outcome: outcome})
+			return err
+		}
 		if round > 0 {
 			if err = s.Restart(); err != nil {
-				h.Close()
+				closeTunnel()
 				return "", err
 			}
 		}
 
 		if m.Policy.Version == media.Version {
 			if e.Media == nil {
-				h.Close()
+				closeTunnel()
 				return "capability_blocked", nil
 			}
 			if m.Budgets.PayloadBytes > 0 && s.View().PayloadBytes-initialBytes+media.RoundBudget(m.Policy) > m.Budgets.PayloadBytes {
-				if err = h.Close(); err != nil {
+				e.notify(s, Progress{Event: "budget_reached", Outcome: "payload_budget"})
+				if err = closeTunnel(); err != nil {
 					return "", err
 				}
 				return "interrupted", nil
 			}
+			e.notify(s, Progress{Event: "media_started", Round: round + 1})
 			results := e.Media(ctx, h.Endpoint(), m.Policy, round)
 			blocked := false
 			passed := true
-			for _, r := range results {
-				if err = s.Probe(r); err != nil {
-					h.Close()
+			for i, r := range results {
+				if err = e.recordProbe(s, r, i+1); err != nil {
+					closeTunnel()
 					return "", err
 				}
 				if media.Required(m.Policy, r.Probe) && r.Outcome != "pass" {
@@ -272,7 +335,7 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 			if f, ok := h.(interface{ Failure() error }); ok && f.Failure() != nil {
 				passed = false
 			}
-			if err = h.Close(); err != nil {
+			if err = closeTunnel(); err != nil {
 				return "", err
 			}
 			if ctx.Err() != nil {
@@ -288,7 +351,7 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 		}
 		failed := false
 		inconclusive := false
-		for _, pr := range m.Policy.Probes {
+		for i, pr := range m.Policy.Probes {
 			if pr.Kind == "download" && round > 0 {
 				continue
 			}
@@ -297,14 +360,16 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 				limit = 2 << 20
 			}
 			if m.Budgets.PayloadBytes > 0 && s.View().PayloadBytes-initialBytes+limit > m.Budgets.PayloadBytes {
-				if err = h.Close(); err != nil {
+				e.notify(s, Progress{Event: "budget_reached", Outcome: "payload_budget"})
+				if err = closeTunnel(); err != nil {
 					return "", err
 				}
 				return "interrupted", nil
 			}
+			e.notify(s, Progress{Event: "probe_started", Round: round + 1, Probe: i + 1})
 			r := e.Check(ctx, h.Endpoint(), pr, round)
-			if err = s.Probe(r); err != nil {
-				h.Close()
+			if err = e.recordProbe(s, r, i+1); err != nil {
+				closeTunnel()
 				return "", err
 			}
 			if r.Outcome != "pass" {
@@ -316,28 +381,37 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 				}
 			}
 		}
-		for _, pr := range m.Policy.UDP {
+		for i, pr := range m.Policy.UDP {
+			e.notify(s, Progress{Event: "probe_started", Round: round + 1, Probe: len(m.Policy.Probes) + i + 1})
 			udpCtx, cancel := context.WithTimeout(ctx, time.Duration(pr.TimeoutSeconds)*time.Second)
 			r := e.UDP(udpCtx, h.Endpoint(), pr.ID, pr.Address, round)
 			cancel()
-			if err = s.Probe(r); err != nil {
-				h.Close()
+			if err = e.recordProbe(s, r, len(m.Policy.Probes)+i+1); err != nil {
+				closeTunnel()
 				return "", err
 			}
 			if r.Outcome != "pass" {
 				failed = true
 			}
 		}
+		mediaOutcome := "pass"
+		if m.Policy.Version == policy.GoogleYouTube && !failed && !inconclusive {
+			mediaOutcome, err = e.checkMedia(ctx, m, h, s, round, initialBytes)
+			if err != nil {
+				closeTunnel()
+				return "", err
+			}
+		}
 		if f, ok := h.(interface{ Failure() error }); ok {
 			if failure := f.Failure(); failure != nil {
 				failed = true
-				if er := s.Probe(model.ProbeResult{ID: model.ID(), Probe: "core-exit", Round: round, Transport: "core", Outcome: model.Code(failure), Phase: "core"}); er != nil {
-					h.Close()
+				if er := e.recordProbe(s, model.ProbeResult{ID: model.ID(), Probe: "core-exit", Round: round, Transport: "core", Outcome: model.Code(failure), Phase: "core"}, 0); er != nil {
+					closeTunnel()
 					return "", er
 				}
 			}
 		}
-		if err = h.Close(); err != nil {
+		if err = closeTunnel(); err != nil {
 			return "", err
 		}
 		if ctx.Err() != nil {
@@ -349,6 +423,38 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 		if inconclusive {
 			return "inconclusive", nil
 		}
+		if mediaOutcome != "pass" {
+			return mediaOutcome, nil
+		}
 	}
 	return policy.Evaluate(m.Policy, *s.View().Pending), nil
+}
+
+func (e Engine) checkMedia(ctx context.Context, m model.Manifest, h Tunnel, s *state.Store, round int, initialBytes int64) (string, error) {
+	if e.Media == nil {
+		return "capability_blocked", nil
+	}
+	p := policy.MediaPolicy(m.Policy)
+	if m.Budgets.PayloadBytes > 0 && s.View().PayloadBytes-initialBytes+media.RoundBudget(p) > m.Budgets.PayloadBytes {
+		e.notify(s, Progress{Event: "budget_reached", Outcome: "payload_budget"})
+		return "interrupted", nil
+	}
+	e.notify(s, Progress{Event: "media_started", Round: round + 1})
+	failed, blocked := false, false
+	for i, r := range e.Media(ctx, h.Endpoint(), p, round) {
+		if err := e.recordProbe(s, r, len(m.Policy.Probes)+i+1); err != nil {
+			return "", err
+		}
+		if media.Required(p, r.Probe) && r.Outcome != "pass" {
+			failed = true
+			blocked = blocked || media.Blocked(r.Outcome)
+		}
+	}
+	if blocked {
+		return "capability_blocked", nil
+	}
+	if failed {
+		return "failed", nil
+	}
+	return "pass", nil
 }

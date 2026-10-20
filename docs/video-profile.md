@@ -1,6 +1,7 @@
-# Optional video delivery profile (local implementation, live unverified)
+# Video delivery checks (local implementation, live unverified)
 
-`representative-video-v1` has two independent capability results:
+New runs use built-in `google-youtube-v1`: Google and YouTube pages plus required
+YouTube delivery. Legacy `representative-video-v1` series retain two independent capability results:
 `video_transfer` (a declared, independently hashed clear MP4 reference) and
 `youtube_delivery` (media bytes for one explicitly permitted public YouTube video).
 A generic file, Google Storage object, HTML, thumbnail, or manifest alone never
@@ -80,79 +81,30 @@ requires a new series. Signed URLs are resolved afresh each round and on resume;
 they are not frozen. Old manifests/journal events omit the new optional fields,
 retaining legacy serialization/hashchain/HMAC. SearchVersion remains 2.
 
-## Actual CLI and Termux setup
+## Current preparation and launch
 
-These commands install dependencies **only when the user elects the optional
-YouTube adapter**; the profile has no verified public media preset yet.
-
-```sh
-pkg install golang python nodejs-lts ca-certificates
-umask 077
-mkdir -p "$HOME/.local/share/vpn-sweep"
-python -m venv "$HOME/.local/share/vpn-sweep/youtube-venv"
-"$HOME/.local/share/vpn-sweep/youtube-venv/bin/python" -m pip install 'yt-dlp==2026.8.19' 'yt-dlp-ejs==0.8.0'
-# In the cloned project:
-go build -trimpath -o build/vpn-sweep ./cmd/vpn-sweep
-./build/vpn-sweep resolver-info \
-  --youtube-python "$HOME/.local/share/vpn-sweep/youtube-venv/bin/python" \
-  --youtube-js "$(command -v node)"
-```
-
-`resolver-info` is offline and does not start Xray. It must succeed before using
-the adapter. Node supplied by Termux must be >=24; package availability is not
-promised. yt-dlp wheel: Unlicense; EJS wheel: Unlicense AND MIT AND ISC;
-Python PSF; Node MIT plus third-party notices. Dependencies are not bundled in the
-Go artifact. Sources: https://pypi.org/project/yt-dlp/2026.8.19/,
-https://pypi.org/project/yt-dlp-ejs/0.8.0/,
-https://github.com/yt-dlp/yt-dlp/wiki/EJS,
-https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide.
-
-`examples/representative-video-unverified.json` is a **schema example, not a
-runnable verified preset**. Before a meaningful run, create a private policy
-outside git and replace the example reference with an explicitly allowed public
-fast-start MP4 URL, its independently established byte size and SHA256,
-provenance/license, and `status:"verified_reference"`. To enable YouTube, add:
-
-```json
-"youtube": {"video_id":"PUBLIC_ID_11_CHARS", "permission":"documented permission and provenance", "min_height":1080}
-```
-
-The shown video ID is a placeholder and intentionally fails validation. Choose a
-permitted public video yourself; do not supply cookies/account secrets. Add
-`"youtube_delivery"` to `required` only if it must govern success. Offline
-validation does not verify permission, endpoint availability or the reference.
-
-After those prerequisites, the exact opt-in flags for the existing run command are:
+Dependencies are prepared automatically before a YouTube check. The app uses a private
+managed venv with yt-dlp==2026.8.19 and yt-dlp-ejs==0.8.0, and finds Node >=24 automatically.
+In Termux, missing runtimes are installed through pkg. Linux needs Python and Node on PATH.
+The runtime-path flags have been removed. Setup is serialized and bounded to 10 minutes;
+a failed install can be retried. Resume verifies the frozen identity and never upgrades it.
 
 ```sh
-base="$HOME/.local/share/vpn-sweep"
-./build/vpn-sweep policy --policy "$base/video-policy.json"
-./build/vpn-sweep run --mode core --core "$HOME/Xray-core/xray" \
-  --input "$base/input-cli.json" --format json --policy "$base/video-policy.json" \
-  --state "$base/video-series-v2" --output "$base/video-result-v2" \
-  --network-label restricted-network --attest-no-other-vpn --allow-video-profile \
-  --youtube-python "$base/youtube-venv/bin/python" --youtube-js "$(command -v node)" \
-  --payload-bytes 67108864 --attempt-seconds 240
+./build/vpn-sweep resolver-info
+./build/vpn-sweep policy
+./build/vpn-sweep run --core "$HOME/Xray-core/xray" \
+  --input "$HOME/.local/share/vpn-sweep/input.json" \
+  --state "$HOME/.local/share/vpn-sweep/series-001" \
+  --output "$HOME/.local/share/vpn-sweep/result-001"
 ```
 
-Only pass the two `--youtube-*` options when YouTube is configured. Input needs
-0600; runtime/state/output directories 0700 outside git. A policy loader also
-requires file0600. Xray identity must report exact target ac5d8a8; mode core does
-not bypass that gate. No nested VPN; environment attestation is not proof.
-Stop with Ctrl-C. Resume uses **no** input/policy/space flags:
-
-```sh
-./build/vpn-sweep resume --core "$HOME/Xray-core/xray" \
-  --state "$base/video-series-v2" --output "$base/video-result-v2" \
-  --network-label restricted-network --attest-no-other-vpn --allow-video-profile \
-  --youtube-python "$base/youtube-venv/bin/python" --youtube-js "$(command -v node)" \
-  --payload-bytes 67108864 --attempt-seconds 240
-```
-
-`report --state ...` emits sanitized journal evidence for partial/blocked runs.
-Successful export includes `report.json` with independent `capabilities`,
-`verification.json`, `working.json`, and final `COMPLETE.json`. Xray is closed
-before export. Any policy/dependency/video constraints change needs a new series.
+resolver-info may install dependencies; it does not extract YouTube or start Xray.
+No policy file or allow-* flags are required. Built-in resources, required checks, sample
+limits and search domains are internal. The test video is the public yt-dlp extractor test
+video BaW_jenozKc; current extraction/delivery and availability remain live-unverified.
+Additional sites can be added to the internal probe list. All declared checks are required.
+Older saved policies keep their own scope on resume; JSON files in examples describe those
+legacy schemas and are not a current CLI configuration interface.
 
 ## External acceptance blockers
 
@@ -160,7 +112,7 @@ Big Buck Bunny's Blender project license/provenance is documented as CC BY3.0
 (https://peach.blender.org/about/, https://peach.blender.org/download/), but the
 current environment could not retrieve those pages (research fetch402) or verify
 an exact suitable MP4/reference hash. External media downloading was stopped;
-no runnable public reference or YouTube test video is asserted. Prior media-host
+no independently verified generic public MP4 reference is asserted. The built-in YouTube test video is selected, but its actual extraction/delivery has not been accepted live. Prior media-host
 requests encountered managed proxy CONNECT403. No denial was bypassed. A user's
 permission for a video does not supersede platform terms; the API route does not
 provide an official media-download API (https://developers.google.com/youtube/terms/developer-policies).

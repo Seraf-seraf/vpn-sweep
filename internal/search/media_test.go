@@ -2,12 +2,95 @@ package search
 
 import (
 	"context"
+	"github.com/Seraf-seraf/vpn-sweep/internal/export"
 	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
+	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
 	"strings"
 	"testing"
 )
+
+func TestBuiltinPagesAndYouTubeShareFreshCoreRounds(t *testing.T) {
+	for _, outcome := range []string{"pass", "video_failed", "video_blocked", "page_failed", "interrupted"} {
+		t.Run(outcome, func(t *testing.T) {
+			m, profiles, g, s := setup(t)
+			m.Policy = policy.Default()
+			m.Environment, m.NetworkLabel = "unverified", ""
+			m.Budgets.Attempts = 1
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			opens, closed, pages, videos, exports := 0, 0, 0, 0, 0
+			result := t.TempDir()
+			e := Engine{Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+				opens++
+				return tunnel{&closed}, nil
+			}, Check: func(ctx context.Context, proxy socks.Endpoint, pr model.Probe, round int) model.ProbeResult {
+				pages++
+				r := pass(ctx, proxy, pr, round)
+				r.Bytes, r.MIME, r.ContentVerified = pr.MinBytes, "text/html", true
+				if outcome == "page_failed" {
+					r.Outcome = "request_failed"
+				}
+				return r
+			}, Media: func(_ context.Context, _ socks.Endpoint, p model.Policy, round int) []model.ProbeResult {
+				videos++
+				if p.Version != media.YouTubeVersion || pages != (round+1)*len(m.Policy.Probes) {
+					t.Fatal("video is not checking the same round after the pages")
+				}
+				r := model.ProbeResult{ID: model.ID(), Probe: media.YouTube, Round: round, Transport: "https-tcp", Outcome: "pass", TLSVerified: true, ContentVerified: true, Media: &model.MediaEvidence{Version: 1, Capability: media.YouTube, FormatID: "137", Height: 1080}}
+				for i := 0; i < p.Video.Samples; i++ {
+					r.Bytes += p.Video.SampleBytes
+					r.Media.Samples = append(r.Media.Samples, model.MediaSample{Bytes: p.Video.SampleBytes, DurationNS: 1000000, MaxReadGapNS: 1000, SHA256: strings.Repeat("1", 64), ContainerVerified: true, TLSVerified: true, Status: 206})
+				}
+				switch outcome {
+				case "video_failed":
+					r.Outcome = "transfer_failed"
+				case "video_blocked":
+					r.Outcome = "resolver_token_required"
+				case "interrupted":
+					cancel()
+				}
+				return []model.ProbeResult{r}
+			}, Export: func(a model.Attempt) error {
+				if closed != opens {
+					t.Fatal("export before core cleanup")
+				}
+				exports++
+				return export.Save(result, m, profiles, a)
+			}}
+			status, err := e.Run(ctx, m, profiles, make([]byte, 32), g, s)
+			if err != nil || closed != opens || s.View().Pending != nil {
+				t.Fatal(status, err, opens, closed)
+			}
+			want := "paused_budget"
+			switch outcome {
+			case "pass":
+				want = "success"
+				if opens != 2 || videos != 2 || exports != 1 {
+					t.Fatal("incomplete round sequence", opens, videos, exports)
+				}
+				report, err := export.ReadReport(result)
+				if err != nil || report.Capabilities[media.YouTube] != "pass" || report.Environment != "unverified" {
+					t.Fatal(report, err)
+				}
+			case "video_blocked":
+				want = "capability_blocked"
+			case "interrupted":
+				want = "interrupted"
+			}
+			if status != want || outcome != "pass" && exports != 0 {
+				t.Fatal(status, exports)
+			}
+			if outcome == "page_failed" && videos != 0 {
+				t.Fatal("video ran after page failure")
+			}
+			if (outcome == "video_blocked" || outcome == "interrupted") != (s.View().Retry != nil) {
+				t.Fatal("wrong retry state", s.View())
+			}
+		})
+	}
+}
 
 func videoPolicy() model.Policy {
 	return model.Policy{Version: media.Version, Rounds: 2, Video: &model.VideoPolicy{Required: []string{media.Transfer}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 1 << 20, TimeoutSeconds: 5, Reference: model.MediaReference{URL: "https://sample.invalid/video.mp4", Bytes: 1 << 20, SHA256: strings.Repeat("1", 64), Status: "verified_reference", License: "synthetic", Provenance: "synthetic"}}}

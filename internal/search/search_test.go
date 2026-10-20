@@ -103,6 +103,77 @@ func TestNoPartialSuccessAndBudget(t *testing.T) {
 	_ = time.Second
 }
 
+func TestProgressTracksRunningChecksAndFailures(t *testing.T) {
+	for _, outcome := range []string{"pass", "request_failed", "interrupted", "core_start_failed"} {
+		t.Run(outcome, func(t *testing.T) {
+			m, p, g, s := setup(t)
+			m.Budgets.Attempts = 1
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var events []Progress
+			closed := 0
+			e := Engine{Progress: func(p Progress) { events = append(events, p) }, Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+				if events[len(events)-1].Event != "core_starting" {
+					t.Fatal("core started before progress was reported")
+				}
+				if outcome == "core_start_failed" {
+					return nil, model.Err(outcome, "core")
+				}
+				return tunnel{&closed}, nil
+			}, Check: func(ctx context.Context, proxy socks.Endpoint, pr model.Probe, round int) model.ProbeResult {
+				if events[len(events)-1].Event != "probe_started" {
+					t.Fatal("probe started before progress was reported")
+				}
+				r := pass(ctx, proxy, pr, round)
+				if outcome == "request_failed" {
+					r.Outcome = outcome
+				}
+				if outcome == "interrupted" {
+					cancel()
+				}
+				return r
+			}, Export: func(model.Attempt) error { return nil }}
+			status, err := e.Run(ctx, m, p, make([]byte, 32), g, s)
+			wantStatus, wantOutcome := "paused_budget", "failed"
+			if outcome == "pass" {
+				wantStatus, wantOutcome = "success", "pass"
+			} else if outcome == "interrupted" {
+				wantStatus, wantOutcome = "interrupted", "interrupted"
+			}
+			if err != nil || status != wantStatus {
+				t.Fatal(status, err)
+			}
+			if len(events) == 0 || events[0].Event != "attempt_started" {
+				t.Fatal("attempt start missing", events)
+			}
+			var result Progress
+			for _, event := range events {
+				if event.Event == "attempt_finished" {
+					result = event
+				}
+			}
+			if result.Outcome != wantOutcome {
+				t.Fatal("attempt result missing", events)
+			}
+			foundFailure := false
+			for _, event := range events {
+				if event.Attempt != 1 || event.Event != "budget_reached" && event.Profile != 1 {
+					t.Fatal("wrong attempt context", event)
+				}
+				if (event.Event == "probe_finished" || event.Event == "core_failed") && event.Outcome == outcome {
+					foundFailure = true
+				}
+			}
+			if (outcome == "request_failed" || outcome == "core_start_failed") && !foundFailure {
+				t.Fatal("failure reason missing", events)
+			}
+			if s.View().Pending != nil || (outcome == "interrupted") != (s.View().Retry != nil) {
+				t.Fatal("progress changed recovery", s.View())
+			}
+		})
+	}
+}
+
 func TestMuxCandidateIdentityMatchesRenderedSettings(t *testing.T) {
 	r, err := importer.Parse([]byte("vless://synthetic@vpn.invalid:443?type=ws&security=tls"), "uri")
 	if err != nil {

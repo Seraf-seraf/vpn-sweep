@@ -54,14 +54,14 @@ func TestRejectUnsafeAndUnknown(t *testing.T) {
 		}
 	}
 }
-func TestBase64ExplicitAndBounds(t *testing.T) {
+func TestBase64EnvelopeRejectedAndBounds(t *testing.T) {
 	u := "socks5://a:1"
 	encoded := base64.StdEncoding.EncodeToString([]byte(u))
 	if _, e := Parse([]byte(encoded), "auto"); e == nil {
 		t.Fatal("implicit conversion")
 	}
-	if _, e := Parse([]byte(encoded), "base64"); e != nil {
-		t.Fatal(e)
+	if _, e := Parse([]byte(encoded), "base64"); model.Code(e) != "unsupported_format" {
+		t.Fatal("removed envelope accepted", e)
 	}
 	if _, e := Parse(make([]byte, MaxInputBytes+1), "json"); e == nil {
 		t.Fatal("unbounded")

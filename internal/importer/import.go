@@ -64,14 +64,6 @@ func Parse(data []byte, format string) (Result, error) {
 	}
 	out.Format = format
 	switch format {
-	case "base64":
-		b, e := decode64(string(data))
-		if e != nil {
-			return out, fail("invalid_base64")
-		}
-		r, e := Parse(b, "auto")
-		r.Format = "base64/" + r.Format
-		return r, e
 	case "json":
 		var raw any
 		if e := model.Decode(data, &raw); e != nil {

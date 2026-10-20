@@ -10,6 +10,7 @@ import (
 )
 
 const Version = "representative-video-v1"
+const YouTubeVersion = "youtube-delivery-v1"
 const Transfer = "video_transfer"
 const YouTube = "youtube_delivery"
 const MaxSampleBytes int64 = 16 << 20
@@ -23,7 +24,7 @@ func HTTPS(raw string) bool {
 }
 func Validate(p model.Policy) error {
 	v := p.Video
-	if p.Version != Version || v == nil || p.Rounds != 2 || len(p.Probes) != 0 || len(p.UDP) != 0 || p.RequireUDP || p.RequireQUIC || p.Downloads != 0 || p.MinOperators != 0 || p.MinDownloadBytes != 0 {
+	if (p.Version != Version && p.Version != YouTubeVersion) || v == nil || p.Rounds != 2 || len(p.Probes) != 0 || len(p.UDP) != 0 || p.RequireUDP || p.RequireQUIC || p.Downloads != 0 || p.MinOperators != 0 || p.MinDownloadBytes != 0 {
 		return model.Err("invalid_video_scope", "policy")
 	}
 	if v.Samples < 1 || v.Samples > 10 || math.IsNaN(v.MinMbps) || math.IsInf(v.MinMbps, 0) || v.MinMbps <= 0 || v.MinMbps > 10000 || v.MaxReadGapMS < 1 || v.MaxReadGapMS > 30000 || v.SampleBytes < 65536 || v.SampleBytes > MaxSampleBytes || v.TimeoutSeconds < 1 || v.TimeoutSeconds > 300 {
@@ -40,7 +41,11 @@ func Validate(p model.Policy) error {
 		return model.Err("explicit_media_requirements_needed", "policy")
 	}
 	r := v.Reference
-	if !HTTPS(r.URL) || r.Bytes < 65536 || r.Bytes > v.SampleBytes || r.Provenance == "" || len(r.Provenance) > 1024 || r.License == "" || len(r.License) > 128 || (r.Status != "verified_reference" && r.Status != "unverified") {
+	if p.Version == YouTubeVersion {
+		if len(v.Required) != 1 || !seen[YouTube] || r != (model.MediaReference{}) {
+			return model.Err("invalid_youtube_scope", "policy")
+		}
+	} else if !HTTPS(r.URL) || r.Bytes < 65536 || r.Bytes > v.SampleBytes || r.Provenance == "" || len(r.Provenance) > 1024 || r.License == "" || len(r.License) > 128 || (r.Status != "verified_reference" && r.Status != "unverified") {
 		return model.Err("invalid_media_reference", "policy")
 	}
 	h, e := hex.DecodeString(r.SHA256)
@@ -70,7 +75,10 @@ func RoundBudget(p model.Policy) int64 {
 
 // Capabilities are evaluated independently; only explicitly required ones govern stop.
 func Capabilities(p model.Policy, a model.Attempt) map[string]string {
-	out := map[string]string{Transfer: "partial"}
+	out := map[string]string{}
+	if p.Version != YouTubeVersion {
+		out[Transfer] = "partial"
+	}
 	if p.Video.YouTube != nil {
 		out[YouTube] = "partial"
 	}
@@ -131,6 +139,9 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 		return "invalid_policy"
 	}
 	for _, r := range a.Results {
+		if p.Version == YouTubeVersion && r.Probe != YouTube {
+			return "failed"
+		}
 		if r.Probe != Transfer && (r.Probe != YouTube || p.Video.YouTube == nil) {
 			return "failed"
 		}

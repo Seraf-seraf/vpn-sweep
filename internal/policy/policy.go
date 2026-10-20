@@ -10,11 +10,20 @@ import (
 )
 
 func Validate(p model.Policy) error {
+	if p.Version == GoogleYouTube {
+		if err := validateBuiltinWeb(pagePolicy(p)); err != nil {
+			return err
+		}
+		return media.Validate(MediaPolicy(p))
+	}
 	if p.Version == media.Version {
 		return media.Validate(p)
 	}
 	if p.Video != nil {
 		return model.Err("video_requires_separate_profile", "policy")
+	}
+	if p.Version == builtinWeb {
+		return validateBuiltinWeb(p)
 	}
 	if p.Version == GoogleYouTubeWeb {
 		return validateGoogleYouTube(p)
@@ -73,6 +82,9 @@ func Validate(p model.Policy) error {
 	return nil
 }
 func Evaluate(p model.Policy, a model.Attempt) string {
+	if p.Version == GoogleYouTube {
+		return evaluateCombined(p, a)
+	}
 	if p.Version == media.Version {
 		return media.Evaluate(p, a)
 	}
@@ -105,7 +117,7 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 				if !r.TLSVerified || r.Transport != "https-tcp" || r.HTTPStatus != s.Status {
 					return "failed"
 				}
-				if p.Version == GoogleYouTubeWeb && (!r.ContentVerified || r.MIME != "text/html" || r.Bytes < s.MinBytes || r.Bytes > probe.MaxPageBodyBytes) {
+				if (p.Version == GoogleYouTubeWeb || p.Version == builtinWeb) && (!r.ContentVerified || r.MIME != "text/html" || r.Bytes < s.MinBytes || r.Bytes > probe.MaxPageBodyBytes) {
 					return "failed"
 				}
 				if s.Kind == "download" && r.Bytes != s.Bytes {

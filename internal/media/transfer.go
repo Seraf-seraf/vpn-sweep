@@ -299,6 +299,9 @@ func (c Client) Round(ctx context.Context, proxy socks.Endpoint, p model.Policy,
 	v := p.Video
 	out := []model.ProbeResult{}
 	for _, capability := range []string{Transfer, YouTube} {
+		if capability == Transfer && p.Version == YouTubeVersion {
+			continue
+		}
 		if capability == YouTube && v.YouTube == nil {
 			continue
 		}
