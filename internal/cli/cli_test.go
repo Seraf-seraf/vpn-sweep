@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"github.com/Seraf-seraf/vpn-sweep/internal/export"
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
+	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
 	"github.com/Seraf-seraf/vpn-sweep/internal/state"
@@ -45,6 +46,10 @@ func TestPublicCLIAndSecretErrors(t *testing.T) {
 		if strings.Contains(out.String()+err.String(), "secret-marker") {
 			t.Fatal("argument leaked", name)
 		}
+	}
+	var out, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"resolver-info"}, nil, &out, &stderr); code != 2 || !strings.Contains(stderr.String(), `"error":"unknown_command"`) {
+		t.Fatal("removed resolver command accepted", code, stderr.String())
 	}
 }
 func TestCompleteCLIWithControlledCore(t *testing.T) {
@@ -159,7 +164,7 @@ func TestBuiltinPolicyAndLegacyResumeWithoutOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, stderr bytes.Buffer
-	if Run(context.Background(), []string{"policy"}, nil, &out, &stderr) != 0 || !strings.Contains(out.String(), policy.GoogleYouTube) || !strings.Contains(out.String(), `"network_requests":false`) {
+	if Run(context.Background(), []string{"policy"}, nil, &out, &stderr) != 0 || !strings.Contains(out.String(), `"policy":"`+policy.GoogleYouTubeWeb+`"`) || !strings.Contains(out.String(), `"network_requests":false`) {
 		t.Fatal(out.String(), stderr.String())
 	}
 	binary, id := testkit.FakeCore(t)
@@ -214,5 +219,135 @@ func TestBuiltinPolicyAndLegacyResumeWithoutOptIn(t *testing.T) {
 	defer s.Close()
 	if s.View().Attempts != 1 {
 		t.Fatal("legacy policy restarted instead of exporting")
+	}
+}
+
+func TestLegacyYouTubeResumeRequiresNewSeries(t *testing.T) {
+	binary, id := testkit.FakeCore(t)
+	imp, err := importer.Parse([]byte("socks5://synthetic.invalid:1080"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{policy.GoogleYouTube, media.Version} {
+		t.Run(version, func(t *testing.T) {
+			base := t.TempDir()
+			dir := filepath.Join(base, "series")
+			key := make([]byte, 32)
+			p := policy.Default()
+			p.Version = version
+			p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "abcdefghijk", Permission: "synthetic", MinHeight: 1080}}
+			if version == media.Version {
+				p.Probes = nil
+				p.MinOperators = 0
+				p.Video.Reference = model.MediaReference{URL: "https://sample.invalid/video.mp4", Bytes: 1 << 20, SHA256: strings.Repeat("1", 64), Status: "verified_reference", License: "synthetic", Provenance: "synthetic"}
+			}
+			if err := policy.Validate(p); err != nil {
+				t.Fatal(err)
+			}
+			m := model.Manifest{Version: 1, SearchVersion: model.SearchVersion, SeriesID: model.ID(), Mode: "core", Core: id, TrustID: "system", Policy: p, InputID: model.PrivateID(key, imp.Profiles), Space: json.RawMessage(`{"version":1,"strategy":"exhaustive"}`), Environment: "unverified", Resolver: &model.ResolverIdentity{AdapterVersion: 1, YTDLP: "2026.8.19", EJS: "0.8.0"}}
+			s, err := state.Open(dir, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = s.SaveManifest(m, imp.Profiles, key); err != nil {
+				t.Fatal(err)
+			}
+			if err = s.Begin(model.Attempt{ID: model.ID(), Candidate: model.Candidate{ID: model.ID()}}, "1"); err != nil {
+				t.Fatal(err)
+			}
+			if err = s.End("interrupted"); err != nil {
+				t.Fatal(err)
+			}
+			if err = s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal, err := os.ReadFile(filepath.Join(dir, "journal.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out, stderr bytes.Buffer
+			args := []string{"resume", "--core", binary, "--state", dir, "--output", filepath.Join(base, "result")}
+			if code := Run(context.Background(), args, nil, &out, &stderr); code != 2 || !strings.Contains(stderr.String(), "youtube_video_removed_new_series_required") {
+				t.Fatal("legacy resume not rejected explicitly", code, stderr.String())
+			}
+			after, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("manifest changed", err)
+			}
+			afterJournal, err := os.ReadFile(filepath.Join(dir, "journal.jsonl"))
+			if err != nil || !bytes.Equal(journal, afterJournal) {
+				t.Fatal("journal changed", err)
+			}
+			for _, cmd := range []string{"status", "report"} {
+				out.Reset()
+				stderr.Reset()
+				if code := Run(context.Background(), []string{cmd, "--state", dir}, nil, &out, &stderr); code != 0 {
+					t.Fatal(cmd, stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestExportSavedLegacyYouTubeWinner(t *testing.T) {
+	imp, err := importer.Parse([]byte("socks5://synthetic.invalid:1080"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := policy.Default()
+	p.Version = policy.GoogleYouTube
+	p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "abcdefghijk", Permission: "synthetic", MinHeight: 1080}}
+	base := t.TempDir()
+	dir := filepath.Join(base, "series")
+	key := make([]byte, 32)
+	m := model.Manifest{Version: 1, SearchVersion: model.SearchVersion, SeriesID: model.ID(), Mode: "core", TrustID: "system", Policy: p, InputID: model.PrivateID(key, imp.Profiles), Space: json.RawMessage(`{"version":1,"strategy":"exhaustive"}`), Environment: "unverified", Resolver: &model.ResolverIdentity{AdapterVersion: 1, YTDLP: "2026.8.19", EJS: "0.8.0"}}
+	s, err := state.Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveManifest(m, imp.Profiles, key); err != nil {
+		t.Fatal(err)
+	}
+	a := model.Attempt{ID: model.ID(), Candidate: model.Candidate{ID: model.ID(), Profile: 0}}
+	if err = s.Begin(a, "1"); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < p.Rounds; round++ {
+		if round > 0 {
+			if err = s.Restart(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, pr := range p.Probes {
+			if err = s.Probe(model.ProbeResult{ID: model.ID(), Probe: pr.ID, Round: round, Transport: "https-tcp", Outcome: "pass", HTTPStatus: 200, Bytes: pr.MinBytes, MIME: "text/html", TLSVerified: true, ContentVerified: true}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := model.ProbeResult{ID: model.ID(), Probe: media.YouTube, Round: round, Transport: "https-tcp", Outcome: "pass", TLSVerified: true, ContentVerified: true, Media: &model.MediaEvidence{Version: 1, Capability: media.YouTube, FormatID: "137", Height: 1080}}
+		for i := 0; i < p.Video.Samples; i++ {
+			r.Media.Samples = append(r.Media.Samples, model.MediaSample{Bytes: p.Video.SampleBytes, DurationNS: 1000000, MaxReadGapNS: 1000, SHA256: strings.Repeat("1", 64), ContainerVerified: true, TLSVerified: true, Status: 206})
+		}
+		if err = s.Probe(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = s.End("verified_pending_export"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := filepath.Join(base, "result")
+	var out, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"export", "--state", dir, "--output", result}, nil, &out, &stderr); code != 0 {
+		t.Fatal(code, stderr.String())
+	}
+	report, err := export.ReadReport(result)
+	if err != nil || report.Capabilities[media.YouTube] != "pass" {
+		t.Fatal(report, err)
 	}
 }

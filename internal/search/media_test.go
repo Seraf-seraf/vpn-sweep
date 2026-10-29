@@ -11,16 +11,14 @@ import (
 	"testing"
 )
 
-func TestBuiltinPagesAndYouTubeShareFreshCoreRounds(t *testing.T) {
-	for _, outcome := range []string{"pass", "video_failed", "video_blocked", "page_failed", "interrupted"} {
+func TestBuiltinPagesRunTwiceWithoutVideo(t *testing.T) {
+	for _, outcome := range []string{"pass", "page_failed"} {
 		t.Run(outcome, func(t *testing.T) {
 			m, profiles, g, s := setup(t)
 			m.Policy = policy.Default()
 			m.Environment, m.NetworkLabel = "unverified", ""
 			m.Budgets.Attempts = 1
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			opens, closed, pages, videos, exports := 0, 0, 0, 0, 0
+			opens, closed, pages, exports := 0, 0, 0, 0
 			result := t.TempDir()
 			e := Engine{Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
 				opens++
@@ -33,25 +31,9 @@ func TestBuiltinPagesAndYouTubeShareFreshCoreRounds(t *testing.T) {
 					r.Outcome = "request_failed"
 				}
 				return r
-			}, Media: func(_ context.Context, _ socks.Endpoint, p model.Policy, round int) []model.ProbeResult {
-				videos++
-				if p.Version != media.YouTubeVersion || pages != (round+1)*len(m.Policy.Probes) {
-					t.Fatal("video is not checking the same round after the pages")
-				}
-				r := model.ProbeResult{ID: model.ID(), Probe: media.YouTube, Round: round, Transport: "https-tcp", Outcome: "pass", TLSVerified: true, ContentVerified: true, Media: &model.MediaEvidence{Version: 1, Capability: media.YouTube, FormatID: "137", Height: 1080}}
-				for i := 0; i < p.Video.Samples; i++ {
-					r.Bytes += p.Video.SampleBytes
-					r.Media.Samples = append(r.Media.Samples, model.MediaSample{Bytes: p.Video.SampleBytes, DurationNS: 1000000, MaxReadGapNS: 1000, SHA256: strings.Repeat("1", 64), ContainerVerified: true, TLSVerified: true, Status: 206})
-				}
-				switch outcome {
-				case "video_failed":
-					r.Outcome = "transfer_failed"
-				case "video_blocked":
-					r.Outcome = "resolver_token_required"
-				case "interrupted":
-					cancel()
-				}
-				return []model.ProbeResult{r}
+			}, Media: func(context.Context, socks.Endpoint, model.Policy, int) []model.ProbeResult {
+				t.Fatal("default policy started a video check")
+				return nil
 			}, Export: func(a model.Attempt) error {
 				if closed != opens {
 					t.Fatal("export before core cleanup")
@@ -59,34 +41,20 @@ func TestBuiltinPagesAndYouTubeShareFreshCoreRounds(t *testing.T) {
 				exports++
 				return export.Save(result, m, profiles, a)
 			}}
-			status, err := e.Run(ctx, m, profiles, make([]byte, 32), g, s)
+			status, err := e.Run(context.Background(), m, profiles, make([]byte, 32), g, s)
 			if err != nil || closed != opens || s.View().Pending != nil {
 				t.Fatal(status, err, opens, closed)
 			}
-			want := "paused_budget"
-			switch outcome {
-			case "pass":
-				want = "success"
-				if opens != 2 || videos != 2 || exports != 1 {
-					t.Fatal("incomplete round sequence", opens, videos, exports)
+			if outcome == "pass" {
+				if status != "success" || opens != 2 || pages != 4 || exports != 1 {
+					t.Fatal(status, opens, pages, exports)
 				}
 				report, err := export.ReadReport(result)
-				if err != nil || report.Capabilities[media.YouTube] != "pass" || report.Environment != "unverified" {
+				if err != nil || report.VerificationScope != "google_youtube_web_pages_only_not_video_or_general_internet" || len(report.Capabilities) != 0 {
 					t.Fatal(report, err)
 				}
-			case "video_blocked":
-				want = "capability_blocked"
-			case "interrupted":
-				want = "interrupted"
-			}
-			if status != want || outcome != "pass" && exports != 0 {
+			} else if status != "paused_budget" || exports != 0 {
 				t.Fatal(status, exports)
-			}
-			if outcome == "page_failed" && videos != 0 {
-				t.Fatal("video ran after page failure")
-			}
-			if (outcome == "video_blocked" || outcome == "interrupted") != (s.View().Retry != nil) {
-				t.Fatal("wrong retry state", s.View())
 			}
 		})
 	}

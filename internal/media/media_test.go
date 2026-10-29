@@ -7,16 +7,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -164,6 +158,11 @@ func TestStreamingTLSRangeHashNoFallback(t *testing.T) {
 	if out != "pass" || !sample.ReferenceVerified {
 		t.Fatal(out, sample)
 	}
+	p.Video.Reference.URL = server.URL
+	results := c.Round(context.Background(), proxy, p, 0)
+	if len(results) != 1 || results[0].Probe != Transfer || results[0].Outcome != "pass" || len(results[0].Media.Samples) != p.Video.Samples {
+		t.Fatal("legacy reference transfer", results)
+	}
 	for _, tc := range []struct {
 		path   string
 		ranged bool
@@ -195,65 +194,6 @@ func TestStreamingTLSRangeHashNoFallback(t *testing.T) {
 	}
 }
 func stringInt(n int) string { b, _ := json.Marshal(n); return string(b) }
-func TestResolverURLGate(t *testing.T) {
-	for _, bad := range []string{"https://googlevideo.com.evil.invalid/videoplayback", "https://storage.googleapis.com/movie.mp4", "http://r.googlevideo.com/videoplayback", "https://a:b@r.googlevideo.com/videoplayback", "https://r.googlevideo.com:444/videoplayback", "https://r.googlevideo.com/thumbnail"} {
-		if YouTubeURL(bad) {
-			t.Fatal(bad)
-		}
-	}
-	if !YouTubeURL("https://rr1.googlevideo.com/videoplayback?expire=synthetic") {
-		t.Fatal("valid")
-	}
-}
-func TestResolverProcessTimeout(t *testing.T) {
-	// No shell invocation or real dependency/network required by the adapter test.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	cmd := exec.Command("sh", "-c", "sleep 60 & wait")
-	started := time.Now()
-	if runProcess(ctx, cmd) == nil || time.Since(started) > 2*time.Second {
-		t.Fatal("process cleanup")
-	}
-}
-
-func TestResolverOutputBound(t *testing.T) {
-	w := &limitedOutput{}
-	if _, e := w.Write(make([]byte, 16384)); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := w.Write([]byte("synthetic signed secret")); e == nil {
-		t.Fatal("unbounded output")
-	}
-}
-
-func TestResolverIdentityAndBlockedSOCKS(t *testing.T) {
-	python := os.Getenv("VPN_SWEEP_TEST_PYTHON")
-	js := os.Getenv("VPN_SWEEP_TEST_JS")
-	if python == "" || js == "" {
-		t.Skip("explicit optional isolated dependencies not provided")
-	}
-	r := Resolver{Python: python, JS: js}
-	id, e := r.Identify(context.Background())
-	if e != nil {
-		t.Fatal(e)
-	}
-	r.Identity = id
-	// A closed loopback port makes any attempted resolver request fail locally.
-	addr, e := core.ReserveAddress()
-	if e != nil {
-		t.Fatal(e)
-	}
-	result, e := r.Resolve(context.Background(), socks.Endpoint{Address: addr, User: "synthetic-secret-user", Pass: "synthetic-secret-password"}, model.YouTubeReference{VideoID: "abcdefghijk", MinHeight: 1080})
-	if e == nil || model.Code(e) != "resolver_network_failed" || result.NetworkBytes > MaxResolverBytes {
-		t.Fatal("resolver fallback", model.Code(e))
-	}
-	r.Identity.PackageSHA256 = "changed"
-	_, e = r.Resolve(context.Background(), socks.Endpoint{Address: addr, User: "user", Pass: "pass"}, model.YouTubeReference{VideoID: "abcdefghijk", MinHeight: 1080})
-	if model.Code(e) != "resolver_identity_changed" {
-		t.Fatal("frozen identity", model.Code(e))
-	}
-}
-
 func TestPolicyMeasurementBoundaryMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -284,47 +224,5 @@ func TestPolicyMeasurementBoundaryMatrix(t *testing.T) {
 	p.Video.TimeoutSeconds = 300
 	if Validate(p) != nil {
 		t.Fatal("boundary rejected")
-	}
-}
-
-func TestResolverKillsOwnedChildrenNotUnrelatedProcess(t *testing.T) {
-	unrelated := exec.Command("sleep", "60")
-	if e := unrelated.Start(); e != nil {
-		t.Fatal(e)
-	}
-	defer func() { unrelated.Process.Kill(); unrelated.Wait() }()
-	pidFile := filepath.Join(t.TempDir(), "child-pid")
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	cmd := exec.Command("sh", "-c", `sleep 60 & printf '%s' "$!" > "$1"; wait`, "owned", pidFile)
-	if runProcess(ctx, cmd) == nil {
-		t.Fatal("timeout expected")
-	}
-	b, e := os.ReadFile(pidFile)
-	if e != nil {
-		t.Fatal(e)
-	}
-	pid, e := strconv.Atoi(string(b))
-	if e != nil {
-		t.Fatal(e)
-	}
-	for i := 0; i < 50; i++ {
-		stat, e := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if os.IsNotExist(e) {
-			break
-		}
-		if e == nil {
-			end := strings.LastIndex(string(stat), ")")
-			if end >= 0 && strings.HasPrefix(string(stat[end+1:]), " Z") {
-				break
-			}
-		}
-		if i == 49 {
-			t.Fatal("owned child still running")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e := unrelated.Process.Signal(syscall.Signal(0)); e != nil {
-		t.Fatal("foreign process affected", e)
 	}
 }

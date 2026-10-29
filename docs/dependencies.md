@@ -11,12 +11,3 @@
 
 No SQLite driver, QUIC SDK, VPN binary or CA secret is vendored. Device trust-store availability
 and exact target Xray acceptance are separate gates. The local package is not an accepted release.
-
-Optional video resolver (not bundled into Go binary): official PyPI yt-dlp2026.8.19
-(Unlicense), yt-dlp-ejs0.8.0 (wheel License-Expression: Unlicense AND MIT AND ISC).
-Isolated spike installed only those two runtime packages plus venv pip25.0.1.
-Tested Python3.12.14 (PSF) and Node24.19.0 (MIT plus bundled third-party notices).
-Adapter requires Node>=24, verifies pinned package versions and freezes actual
-binary/package/adapter hashes. Termux package/runtime compatibility is unverified.
-No auto-update, remote EJS download, provider plugins, FFmpeg or new Go module.
-See video-profile.md for scope, official sources, limitations and automatic preparation.

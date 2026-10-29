@@ -180,8 +180,7 @@ func videoTrack(b []byte, minHeight int) bool {
 }
 
 type Client struct {
-	Roots    *x509.CertPool
-	Resolver *Resolver
+	Roots *x509.CertPool
 }
 
 func (c Client) sample(ctx context.Context, proxy socks.Endpoint, raw string, n int64, ranged bool, minHeight int, wantHash string, v *model.VideoPolicy) (s model.MediaSample, outcome string) {
@@ -296,62 +295,30 @@ func (c Client) sample(ctx context.Context, proxy socks.Endpoint, raw string, n 
 	return s, "pass"
 }
 func (c Client) Round(ctx context.Context, proxy socks.Endpoint, p model.Policy, round int) []model.ProbeResult {
-	v := p.Video
-	out := []model.ProbeResult{}
-	for _, capability := range []string{Transfer, YouTube} {
-		if capability == Transfer && p.Version == YouTubeVersion {
-			continue
-		}
-		if capability == YouTube && v.YouTube == nil {
-			continue
-		}
-		r := model.ProbeResult{ID: model.ID(), Probe: capability, Round: round, Transport: "https-tcp", Phase: "media", Outcome: "pass", Media: &model.MediaEvidence{Version: 1, Capability: capability}}
-		started := time.Now()
-		raw := v.Reference.URL
-		n := v.Reference.Bytes
-		hash := v.Reference.SHA256
-		height := 1
-		if capability == Transfer && v.Reference.Status != "verified_reference" {
-			r.Outcome = "reference_unverified"
-		}
-		if capability == YouTube {
-			if c.Resolver == nil {
-				r.Outcome = "resolver_unavailable"
-			} else {
-				var resolved Resolved
-				var e error
-				resolved, e = c.Resolver.Resolve(ctx, proxy, *v.YouTube)
-				r.Bytes += resolved.NetworkBytes
-				if e != nil {
-					r.Outcome = model.Code(e)
-					r.Phase = "resolver"
-				} else {
-					raw = resolved.URL
-					n = v.SampleBytes
-					hash = ""
-					height = v.YouTube.MinHeight
-					r.Media.FormatID = resolved.FormatID
-					r.Media.Height = resolved.Height
-				}
-			}
-		}
-		if r.Outcome == "pass" {
-			for i := 0; i < v.Samples; i++ {
-				s, outcome := c.sample(ctx, proxy, raw, n, capability == YouTube, height, hash, v)
-				r.Bytes += s.Bytes
-				r.Media.Samples = append(r.Media.Samples, s)
-				if outcome != "pass" {
-					r.Outcome = outcome
-					break
-				}
-			}
-		}
-		r.DurationMS = time.Since(started).Milliseconds()
-		r.TLSVerified = r.Outcome == "pass"
-		r.ContentVerified = r.Outcome == "pass"
-		out = append(out, r)
+	if p.Version == YouTubeVersion {
+		return []model.ProbeResult{}
 	}
-	return out
+	v := p.Video
+	r := model.ProbeResult{ID: model.ID(), Probe: Transfer, Round: round, Transport: "https-tcp", Phase: "media", Outcome: "pass", Media: &model.MediaEvidence{Version: 1, Capability: Transfer}}
+	started := time.Now()
+	if v.Reference.Status != "verified_reference" {
+		r.Outcome = "reference_unverified"
+	}
+	if r.Outcome == "pass" {
+		for i := 0; i < v.Samples; i++ {
+			s, outcome := c.sample(ctx, proxy, v.Reference.URL, v.Reference.Bytes, false, 1, v.Reference.SHA256, v)
+			r.Bytes += s.Bytes
+			r.Media.Samples = append(r.Media.Samples, s)
+			if outcome != "pass" {
+				r.Outcome = outcome
+				break
+			}
+		}
+	}
+	r.DurationMS = time.Since(started).Milliseconds()
+	r.TLSVerified = r.Outcome == "pass"
+	r.ContentVerified = r.Outcome == "pass"
+	return []model.ProbeResult{r}
 }
 func Blocked(outcome string) bool {
 	switch outcome {

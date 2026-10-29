@@ -29,19 +29,10 @@ candidate-identity.key. Keep that key for stable candidate identity across serie
 The external Xray must report commit ac5d8a8 or its full SHA; its hash is frozen.
 Imported server addresses, credentials and transport/security contracts are preserved.
 
-Search parameters are built in. New searches require Google and YouTube HTML pages plus
-YouTube video delivery, in two fresh-core rounds. There is no separate mode, policy-file,
-search-space, custom-CA, network-label, attestation, allow-* or YouTube-runtime flag.
-The command policy validates the built-in rules offline; it does not fetch the sites.
-The public preset remains live-unverified. The delivery check does not prove playback,
-audio, DRM, general Internet or QUIC. See [video details](video-profile.md).
-
-YouTube dependencies are prepared automatically in the private application cache.
-Termux uses pkg to install missing Python/Node; Linux requires Python and Node >=24 on PATH.
-Pinned yt-dlp/EJS packages are installed in a managed venv. resolver-info performs the
-same preparation and identifies the environment without fetching YouTube or starting Xray.
-Installation uses the ordinary network before testing; resolver/media requests during
-candidate verification use only the candidate SOCKS. No cookies or accounts are used.
+Search parameters are built in. New searches require the Google and YouTube HTML
+pages in two fresh-core rounds; video delivery is not checked. The command policy
+validates the built-in rules offline; it does not fetch the sites. The public preset
+remains live-unverified and does not establish general Internet or QUIC access.
 
 Resume and inspection:
 
@@ -53,12 +44,11 @@ vpn-sweep report --state /private/vpn-sweep/series-001
 vpn-sweep export --state /private/vpn-sweep/series-001 --output /private/vpn-sweep/result-001
 ```
 
-Resume keeps the frozen policy, search space, profiles and trust roots, including older
-supported series. Changed core or resolver identity is rejected. A prior manually chosen
-resolver path is not retained in manifests; those media series need the same dependencies
-in the managed environment or a new series. No automatic claim about current network
-conditions is made: new manifests record environment=unverified. Existing legacy
-attestations describe the original series and are not renewed by resume.
+Resume keeps the frozen policy, search space, profiles and trust roots. A changed
+core is rejected. Saved series requiring YouTube video cannot resume: start a new series;
+status, report and export of already verified results remain available. Legacy separate
+video series without YouTube retain their saved policy. New manifests record
+environment=unverified; legacy attestations are not renewed by resume.
 
 Run/resume print preparation, attempts, rounds, probe outcomes, core cleanup and stop
 reasons to stderr automatically. Stdout remains JSON. Logs omit endpoints, URLs,
@@ -73,8 +63,7 @@ not exact mobile wire traffic. Budget exhaustion pauses; it does not mean space 
 
 Success stops search, closes Xray and saves working.json, verification.json, report.json
 and the COMPLETE.json integrity marker. Existing complete exports are verified idempotently;
-a durable winner can be exported again without searching. New built-in sites are added
-in code and become required; saved series keep their original checks.
+a durable winner can be exported again without searching. Saved series keep their original checks.
 
 Exit codes: 0 success, 2 invalid/unsupported/infrastructure/save error, 3 finite space
 exhausted, 4 budget pause, 130 interrupted. Status/report return 0 when reading succeeds;

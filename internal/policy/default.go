@@ -11,17 +11,16 @@ const builtinWeb = "builtin-web-v1"
 
 func Default() model.Policy {
 	return model.Policy{
-		Version: GoogleYouTube, Rounds: 2, MinOperators: 1,
+		Version: GoogleYouTubeWeb, Rounds: 2, MinOperators: 1,
 		Probes: []model.Probe{
 			{ID: "google-home", Operator: "google", URL: "https://www.google.com/?hl=en", Kind: "page", ContainsAll: []string{"<title>Google</title>", "name=\"q\"", "action=\"/search\""}, MinBytes: 4096, MIME: "text/html", Status: 200, TimeoutSeconds: 45},
 			{ID: "youtube-home", Operator: "google", URL: "https://www.youtube.com/?hl=en&gl=US", Kind: "page", ContainsAll: []string{"ytInitialData", "ytcfg.set", "\"richGridRenderer\""}, MinBytes: 4096, MIME: "text/html", Status: 200, TimeoutSeconds: 45},
 		},
-		Video: &model.VideoPolicy{
-			Required: []string{media.YouTube}, Samples: 3, MinMbps: 10,
-			MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30,
-			YouTube: &model.YouTubeReference{VideoID: "BaW_jenozKc", Permission: "Public yt-dlp extractor test video; no account or cookies", MinHeight: 1080},
-		},
 	}
+}
+
+func RequiresRemovedYouTube(p model.Policy) bool {
+	return p.Version == GoogleYouTube || p.Video != nil && p.Video.YouTube != nil
 }
 
 func HasVideo(p model.Policy) bool {

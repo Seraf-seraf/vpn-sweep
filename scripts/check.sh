@@ -3,7 +3,10 @@ set -eu
 : "${GO:?set GO to the Go executable}"
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
-format_files=$(git ls-files --cached --others --exclude-standard -- '*.go')
+format_files=$(git ls-files --cached --others --exclude-standard -- '*.go' |
+    while IFS= read -r name; do
+        if [ -f "$name" ]; then printf '%s\n' "$name"; fi
+    done)
 if [ -n "$format_files" ]; then
     # Repository source names are controlled and contain no whitespace.
     format_output=$(printf '%s\n' "$format_files" | xargs gofmt -l)
@@ -13,7 +16,6 @@ if [ -n "$format_files" ]; then
     fi
 fi
 python3 scripts/test_secret_scan.py
-python3 scripts/test_media_resolver.py
 python3 scripts/secret-scan.py
 "$GO" vet ./...
 "$GO" test -race ./...

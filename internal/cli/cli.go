@@ -19,7 +19,6 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/space"
 	"github.com/Seraf-seraf/vpn-sweep/internal/state"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 )
@@ -79,11 +78,11 @@ func loadInput(o options, in io.Reader) (importer.Result, error) {
 func emit(w io.Writer, v any) error { return json.NewEncoder(w).Encode(v) }
 func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
 	if len(args) == 0 || args[0] == "help" {
-		io.WriteString(out, "vpn-sweep inspect|space|policy|resolver-info|run|resume|status|report|export|version\nrun --core xray --input private-file --state private-directory --output private-directory\nGoogle, YouTube and YouTube video checks and search parameters are built in. See docs/usage.md.\n")
+		io.WriteString(out, "vpn-sweep inspect|space|policy|run|resume|status|report|export|version\nrun --core xray --input private-file --state private-directory --output private-directory\nGoogle and YouTube page checks and search parameters are built in. See docs/usage.md.\n")
 		return 0
 	}
 	if args[0] == "version" {
-		io.WriteString(out, "vpn-sweep google-youtube-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
+		io.WriteString(out, "vpn-sweep google-youtube-web-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
 		return 0
 	}
 	o, e := flags(args[1:])
@@ -126,13 +125,6 @@ func dispatch(ctx context.Context, command string, o options, in io.Reader, out,
 			domains = append(domains, map[string]any{"name": d.Name, "explicit_values": len(d.Values), "min": d.Min, "max": d.Max, "step": d.Step, "pair": d.Pair})
 		}
 		return emit(out, map[string]any{"count": g.Count().String(), "strategy": g.Spec.Strategy, "seed": g.Spec.Seed, "parameters": domains, "catalog": capability.Catalog(), "scope": "before_profile_applicability_filter"})
-	case "resolver-info":
-		logger, _ := progressLog(errOut)
-		r, e := prepareResolver(ctx, nil, func(message string) { logger.Print(message) })
-		if e != nil {
-			return e
-		}
-		return emit(out, r.Identity)
 	case "policy":
 		p := o.checks
 		if e := policy.Validate(p); e != nil {
@@ -210,7 +202,6 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 		return e
 	}
 	defer s.Close()
-	var resolver *media.Resolver
 	var m model.Manifest
 	var profiles []model.Profile
 	var key []byte
@@ -254,6 +245,9 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 		if e != nil {
 			return e
 		}
+		if policy.RequiresRemovedYouTube(m.Policy) {
+			return model.Err("youtube_video_removed_new_series_required", "cli")
+		}
 		if o.input != "" || len(o.trust) > 0 {
 			return model.Err("resume_input_changes_require_new_series", "cli")
 		}
@@ -283,22 +277,6 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 	if e = policy.Validate(m.Policy); e != nil {
 		return e
 	}
-	if policy.HasVideo(m.Policy) {
-		if m.Policy.Video.YouTube != nil {
-			var expected *model.ResolverIdentity
-			if command == "resume" {
-				if m.Resolver == nil {
-					return model.Err("resolver_identity_changed", "cli")
-				}
-				expected = m.Resolver
-			}
-			resolver, e = prepareResolver(ctx, expected, func(message string) { logger.Print(message) })
-			if e != nil {
-				return e
-			}
-			m.Resolver = &resolver.Identity
-		}
-	}
 	if e = capability.Gate(m.Mode, m.Core.Commit); e != nil {
 		return e
 	}
@@ -312,7 +290,7 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 	}
 	runner := core.Runner{Binary: binary, Identity: id, Directory: filepath.Join(s.Dir, "runtime"), Startup: time.Duration(m.Budgets.StartupSeconds) * time.Second, Cleanup: time.Duration(m.Budgets.CleanupSeconds) * time.Second}
 	client := probe.Client{Roots: roots}
-	mediaClient := media.Client{Roots: roots, Resolver: resolver}
+	mediaClient := media.Client{Roots: roots}
 	logger.Print("Подготовка завершена; начинается подбор")
 	engine := search.Engine{Saved: saved, Progress: progress, Media: mediaClient.Round, Open: func(ctx context.Context, p model.Profile, params map[string]any) (search.Tunnel, error) {
 		addr, e := core.ReserveAddress()
@@ -343,16 +321,4 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 		return model.Err(status, "search")
 	}
 	return nil
-}
-
-func prepareResolver(ctx context.Context, expected *model.ResolverIdentity, notify func(string)) (*media.Resolver, error) {
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return nil, model.Err("youtube_directory_unavailable", "setup")
-	}
-	dir, err := export.SafeDirectory(filepath.Join(cache, "vpn-sweep", "youtube"))
-	if err != nil {
-		return nil, err
-	}
-	return media.Prepare(ctx, dir, expected, notify)
 }

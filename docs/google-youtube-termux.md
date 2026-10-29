@@ -1,6 +1,6 @@
-# Google, YouTube and video: Termux ARM64
+# Google and YouTube pages: Termux ARM64
 
-The built-in google-youtube-v1 checks both pages and YouTube video delivery. It remains
+The built-in google-youtube-web-v1 checks both pages in two rounds. It remains
 live-unverified; desktop tests and cross-build do not establish Android device acceptance.
 
 ```sh
@@ -29,10 +29,8 @@ chmod 600 "$SWEEP_PRIVATE/input.json"
   --state "$SWEEP_PRIVATE/series-001" --output "$SWEEP_PRIVATE/result-001"
 ```
 
-Xray must report commit ac5d8a8 or its full SHA. The app prepares its managed YouTube
-venv automatically; missing Python/Node are installed with pkg. Node must be >=24.
-Setup requires network access. No manual policy/space files, runtime paths or confirmation
-flags are needed. No Android VPN setting is changed or independently verified.
+Xray must report commit ac5d8a8 or its full SHA. No manual policy/space files,
+YouTube runtime dependencies or confirmation flags are needed. No Android VPN setting is changed or independently verified.
 An already active VPN can affect the tested path.
 
 Watch stderr for preparation, current attempt/round/check, outcomes and stop reasons.
@@ -45,7 +43,7 @@ Ctrl-C requests cleanup; wait for exit before using status/report or another wri
   --state "$SWEEP_PRIVATE/series-001" --output "$SWEEP_PRIVATE/result-001"
 ```
 
-The first success requires every page and the video samples again after core restart.
-Working.json contains credentials; do not publish it. Missing/challenge/forbidden pages,
-unsupported media and incomplete transfers are not success. A blocked required capability
-pauses with a retryable candidate. See [usage](usage.md) and [video limits](video-profile.md).
+The first success requires both pages again after core restart. Working.json contains
+credentials; do not publish it. Missing, challenge or forbidden pages are not success.
+Saved series requiring YouTube video need a new series; status/report and export of verified
+results remain available. See [usage](usage.md).

@@ -83,6 +83,9 @@ func Candidate(profiles []model.Profile, key []byte, g *space.Generator, pos *bi
 	return c, new(big.Int).Add(pos, big.NewInt(1)), true
 }
 func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Profile, key []byte, g *space.Generator, s *state.Store) (string, error) {
+	if policy.RequiresRemovedYouTube(m.Policy) {
+		return "youtube_video_removed_new_series_required", model.Err("youtube_video_removed_new_series_required", "search")
+	}
 	if m.SearchVersion != model.SearchVersion {
 		return "unsupported_search_version", model.Err("search_version_requires_new_series", "search")
 	}
@@ -408,14 +411,6 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 				failed = true
 			}
 		}
-		mediaOutcome := "pass"
-		if m.Policy.Version == policy.GoogleYouTube && !failed && !inconclusive {
-			mediaOutcome, err = e.checkMedia(ctx, m, h, s, round, initialBytes)
-			if err != nil {
-				closeTunnel()
-				return "", err
-			}
-		}
 		if f, ok := h.(interface{ Failure() error }); ok {
 			if failure := f.Failure(); failure != nil {
 				failed = true
@@ -437,38 +432,6 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 		if inconclusive {
 			return "inconclusive", nil
 		}
-		if mediaOutcome != "pass" {
-			return mediaOutcome, nil
-		}
 	}
 	return policy.Evaluate(m.Policy, *s.View().Pending), nil
-}
-
-func (e Engine) checkMedia(ctx context.Context, m model.Manifest, h Tunnel, s *state.Store, round int, initialBytes int64) (string, error) {
-	if e.Media == nil {
-		return "capability_blocked", nil
-	}
-	p := policy.MediaPolicy(m.Policy)
-	if m.Budgets.PayloadBytes > 0 && s.View().PayloadBytes-initialBytes+media.RoundBudget(p) > m.Budgets.PayloadBytes {
-		e.notify(s, Progress{Event: "budget_reached", Outcome: "payload_budget"})
-		return "interrupted", nil
-	}
-	e.notify(s, Progress{Event: "media_started", Round: round + 1})
-	failed, blocked := false, false
-	for i, r := range e.Media(ctx, h.Endpoint(), p, round) {
-		if err := e.recordProbe(s, r, len(m.Policy.Probes)+i+1); err != nil {
-			return "", err
-		}
-		if media.Required(p, r.Probe) && r.Outcome != "pass" {
-			failed = true
-			blocked = blocked || media.Blocked(r.Outcome)
-		}
-	}
-	if blocked {
-		return "capability_blocked", nil
-	}
-	if failed {
-		return "failed", nil
-	}
-	return "pass", nil
 }
