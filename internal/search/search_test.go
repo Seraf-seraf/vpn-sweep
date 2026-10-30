@@ -12,8 +12,10 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/space"
 	"github.com/Seraf-seraf/vpn-sweep/internal/state"
 	"math/big"
+	"net"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,14 @@ type tunnel struct{ closed *int }
 
 func (t tunnel) Endpoint() socks.Endpoint { return socks.Endpoint{} }
 func (t tunnel) Close() error             { *t.closed++; return nil }
+
+type closeErrorTunnel struct{ closed *int }
+
+func (t closeErrorTunnel) Endpoint() socks.Endpoint { return socks.Endpoint{} }
+func (t closeErrorTunnel) Close() error {
+	*t.closed++
+	return model.Err("core_kill_failed", "core")
+}
 func setup(t *testing.T) (model.Manifest, []model.Profile, *space.Generator, *state.Store) {
 	t.Helper()
 	p, _ := importer.Parse([]byte("socks5://synthetic.invalid:1080"), "uri")
@@ -41,6 +51,265 @@ func setup(t *testing.T) (model.Manifest, []model.Profile, *space.Generator, *st
 }
 func pass(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
 	return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, Bytes: p.Bytes}
+}
+
+func syntheticSS(host string) string {
+	return "ss://" + "YWVzLTEyOC1nY206c3ludGhldGlj" + "@" + net.JoinHostPort(host, "8388")
+}
+
+func TestDefaultEarlyCoverageUsesApplicableProfiles(t *testing.T) {
+	inputs := []string{
+		"vless://synthetic@vpn.invalid:443?type=tcp&security=tls&sni=tls.invalid",
+		syntheticSS("192.0.2.1"),
+		syntheticSS("2001:db8::1"),
+		syntheticSS("vpn.invalid"),
+		"socks5://vpn.invalid:1080",
+	}
+	profiles := make([]model.Profile, 0, len(inputs))
+	for _, input := range inputs {
+		r, err := importer.Parse([]byte(input), "uri")
+		if err != nil {
+			t.Fatal(err)
+		}
+		profiles = append(profiles, r.Profiles[0])
+	}
+	g, err := space.New(space.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := newCandidateSchedule(profiles, make([]byte, 32), g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make([]map[string]map[string]bool, len(profiles))
+	for i := range seen {
+		seen[i] = map[string]map[string]bool{}
+	}
+	for pos := int64(0); pos < int64(len(profiles)*128); pos++ {
+		c, next, ok := schedule.candidate(big.NewInt(pos))
+		if !ok || next.Int64() != pos+1 {
+			t.Fatal("missing candidate", pos)
+		}
+		if err := capability.Check(profiles[c.Profile], c.Params); err != nil {
+			t.Fatalf("inapplicable early candidate %d for profile %d: %v", pos, c.Profile, err)
+		}
+		for _, name := range []string{"fragment", "mux", "noise", "fingerprint", "packets", "length", "interval", "maxSplit", "tcpConcurrency", "xudpConcurrency", "quic"} {
+			if value, exists := c.Params[name]; exists {
+				if seen[c.Profile][name] == nil {
+					seen[c.Profile][name] = map[string]bool{}
+				}
+				seen[c.Profile][name][model.Digest(value)] = true
+			}
+		}
+		if c.Params["noise"] == true {
+			items := c.Params["noises"].([]any)
+			item := items[0].(map[string]any)
+			for _, name := range []string{"type", "delay", "applyTo"} {
+				if seen[c.Profile][name] == nil {
+					seen[c.Profile][name] = map[string]bool{}
+				}
+				seen[c.Profile][name][model.Digest(item[name])] = true
+			}
+			packetKey := "packet:" + item["type"].(string)
+			if seen[c.Profile][packetKey] == nil {
+				seen[c.Profile][packetKey] = map[string]bool{}
+			}
+			seen[c.Profile][packetKey][model.Digest(item["packet"])] = true
+			if seen[c.Profile]["count"] == nil {
+				seen[c.Profile]["count"] = map[string]bool{}
+			}
+			seen[c.Profile]["count"][model.Digest(len(items))] = true
+			family := item["applyTo"]
+			if c.Profile == 1 && family == "ipv6" || c.Profile == 2 && family == "ipv4" || c.Profile == 3 && family != "ip" {
+				t.Fatalf("noise family %v does not match profile %d", family, c.Profile)
+			}
+		}
+	}
+	for name, count := range map[string]int{"fragment": 2, "mux": 2, "fingerprint": 10, "packets": 3, "tcpConcurrency": 6, "xudpConcurrency": 5, "quic": 3} {
+		if got := len(seen[0][name]); got != count {
+			t.Fatalf("TLS profile covers %d %s values, want %d", got, name, count)
+		}
+	}
+	for name, values := range map[string][]string{"length": {"1", "10-50", "512"}, "interval": {"0", "10-50", "50"}, "maxSplit": {"1", "10-50", "256"}} {
+		for _, value := range values {
+			if !seen[0][name][model.Digest(value)] {
+				t.Fatalf("TLS profile did not cover %s=%s", name, value)
+			}
+		}
+	}
+	for profile := 1; profile <= 3; profile++ {
+		for name, count := range map[string]int{"noise": 2, "type": 4, "delay": 3, "count": 4, "packet:rand": 3, "packet:str": 6, "packet:hex": 6, "packet:base64": 6} {
+			if got := len(seen[profile][name]); got != count {
+				t.Fatalf("profile %d covers %d %s values, want %d", profile, got, name, count)
+			}
+		}
+	}
+	if len(seen[1]["applyTo"]) != 2 || len(seen[2]["applyTo"]) != 2 || len(seen[3]["applyTo"]) != 1 {
+		t.Fatal("missing applicable address families")
+	}
+}
+
+func TestProfileSpacesFinishInRoundRobinOrder(t *testing.T) {
+	tls, err := importer.Parse([]byte("vless://synthetic@vpn.invalid:443?type=tcp&security=tls&sni=tls.invalid"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := importer.Parse([]byte("socks5://vpn.invalid:1080"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := []model.Profile{tls.Profiles[0], plain.Profiles[0]}
+	g, err := space.New(space.Spec{Version: 2, Strategy: "broad", Seed: 42, Parameters: []space.Domain{{Name: "fingerprint", Optional: true, Values: []any{"chrome", "firefox"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := []int{0, 1, 0, 1, 0, 0}
+	for pos, want := range order {
+		c, _, ok := Candidate(profiles, make([]byte, 32), g, big.NewInt(int64(pos)))
+		if !ok || c.Profile != want || capability.Check(profiles[c.Profile], c.Params) != nil {
+			t.Fatal("invalid profile schedule", pos, c)
+		}
+	}
+	if _, _, ok := Candidate(profiles, make([]byte, 32), g, big.NewInt(int64(len(order)))); ok {
+		t.Fatal("profile scheduler did not stop at the finite boundary")
+	}
+}
+
+func TestNoiseUDPIsConditionalAndRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		noise      bool
+		udpOutcome string
+		wantStatus string
+		wantUDP    int
+	}{
+		{name: "web only", wantStatus: "success"},
+		{name: "noise succeeds", noise: true, udpOutcome: "pass", wantStatus: "success", wantUDP: 2},
+		{name: "noise UDP fails", noise: true, udpOutcome: "udp_timeout_or_read_failed", wantStatus: "space_exhausted", wantUDP: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _, s := setup(t)
+			m.Policy = policy.Default()
+			m.Budgets.SessionSeconds = 10
+			profile, err := importer.Parse([]byte(syntheticSS("192.0.2.1")), "uri")
+			if err != nil {
+				t.Fatal(err)
+			}
+			noise := []any{map[string]any{"type": "rand", "packet": "1", "delay": "0", "applyTo": "ip"}}
+			g, err := space.New(space.Spec{Version: 2, Strategy: "exhaustive", Parameters: []space.Domain{
+				{Name: "mux", Values: []any{false}},
+				{Name: "noise", Values: []any{false, true}},
+				{Name: "noises", Values: []any{noise}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed, udpCalls, exports := 0, 0, 0
+			e := Engine{
+				Open: func(_ context.Context, _ model.Profile, params map[string]any) (Tunnel, error) {
+					if (params["noise"] == true) != tc.noise {
+						return nil, model.Err("core_start_failed", "core")
+					}
+					return tunnel{&closed}, nil
+				},
+				Check: func(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
+					return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, ContentVerified: true, MIME: "text/html", Bytes: p.MinBytes}
+				},
+				UDP: func(_ context.Context, _ socks.Endpoint, p model.UDPProbe, round int) model.ProbeResult {
+					udpCalls++
+					if p.ID != policy.NoiseDNSProbeID || p.Address != policy.NoiseDNSProbeAddress || p.Kind != "dns-a" {
+						t.Fatal("unexpected DNS probe")
+					}
+					return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: tc.udpOutcome, Transport: "udp-socks5"}
+				},
+				Export: func(model.Attempt) error { exports++; return nil },
+			}
+			status, err := e.Run(context.Background(), m, profile.Profiles, make([]byte, 32), g, s)
+			if err != nil || status != tc.wantStatus || udpCalls != tc.wantUDP {
+				t.Fatalf("status %s, UDP %d, err %v", status, udpCalls, err)
+			}
+			if tc.wantStatus == "success" && exports != 1 || tc.wantStatus != "success" && exports != 0 {
+				t.Fatal("wrong export count", exports)
+			}
+		})
+	}
+}
+
+func TestNoiseDNSRespectsPayloadBudgetBeforeSending(t *testing.T) {
+	for _, remaining := range []int64{511, 512, 513} {
+		t.Run(strconv.FormatInt(remaining, 10), func(t *testing.T) {
+			m, profiles, _, s := setup(t)
+			m.Policy = policy.Default()
+			m.Budgets.PayloadBytes = 4 << 20
+			c := model.Candidate{Profile: 0, ID: model.ID(), Params: map[string]any{"noise": true}}
+			if err := s.Begin(model.Attempt{ID: model.ID(), Candidate: c}, "1"); err != nil {
+				t.Fatal(err)
+			}
+			closed, pages, udpCalls := 0, 0, 0
+			e := Engine{
+				Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) { return tunnel{&closed}, nil },
+				Check: func(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
+					pages++
+					bytes := int64(2 << 20)
+					if pages == 2 {
+						bytes -= remaining
+					}
+					return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, ContentVerified: true, MIME: "text/html", Bytes: bytes}
+				},
+				UDP: func(_ context.Context, _ socks.Endpoint, p model.UDPProbe, round int) model.ProbeResult {
+					udpCalls++
+					return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "udp-socks5", Bytes: 512}
+				},
+			}
+			outcome, err := e.attempt(context.Background(), m, profiles[0], c, s, 0)
+			wantUDP, wantClosed := 0, 1
+			if remaining >= 512 {
+				wantUDP, wantClosed = 1, 2
+			}
+			if err != nil || outcome != "interrupted" || pages != 2 || udpCalls != wantUDP || closed != wantClosed {
+				t.Fatalf("outcome %s, pages %d, UDP %d, closed %d, err %v", outcome, pages, udpCalls, closed, err)
+			}
+			if got := s.View().PayloadBytes; got > m.Budgets.PayloadBytes {
+				t.Fatalf("payload budget exceeded: %d", got)
+			}
+		})
+	}
+}
+
+func TestMissingNoiseProbeStopsAndPreservesCleanupError(t *testing.T) {
+	for _, failClose := range []bool{false, true} {
+		t.Run(strconv.FormatBool(failClose), func(t *testing.T) {
+			m, profiles, _, s := setup(t)
+			m.Policy = policy.Default()
+			c := model.Candidate{Profile: 0, ID: model.ID(), Params: map[string]any{"noise": true}}
+			if err := s.Begin(model.Attempt{ID: model.ID(), Candidate: c}, "1"); err != nil {
+				t.Fatal(err)
+			}
+			closed := 0
+			e := Engine{
+				Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+					if failClose {
+						return closeErrorTunnel{&closed}, nil
+					}
+					return tunnel{&closed}, nil
+				},
+				Check: func(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
+					return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, ContentVerified: true, MIME: "text/html", Bytes: p.MinBytes}
+				},
+			}
+			outcome, err := e.attempt(context.Background(), m, profiles[0], c, s, 0)
+			if closed != 1 {
+				t.Fatal("core was not closed", closed)
+			}
+			if failClose {
+				if model.Code(err) != "core_kill_failed" {
+					t.Fatal("cleanup failure was lost", err)
+				}
+			} else if err != nil || outcome != "capability_blocked" {
+				t.Fatal("missing UDP probe did not block the candidate", outcome, err)
+			}
+		})
+	}
 }
 func TestFirstSuccessStopAndWinnerRecovery(t *testing.T) {
 	m, p, g, s := setup(t)

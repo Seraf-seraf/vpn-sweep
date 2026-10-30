@@ -22,6 +22,14 @@ func Validate(p model.Policy) error {
 	if p.Video != nil {
 		return model.Err("video_requires_separate_profile", "policy")
 	}
+	if p.Version == GoogleYouTubeWebNoise {
+		return validateGoogleYouTubeWebNoise(p)
+	}
+	for _, s := range p.UDP {
+		if s.Kind != "" || s.NoiseOnly {
+			return model.Err("unsupported_udp_probe", "policy")
+		}
+	}
 	if p.Version == builtinWeb {
 		return validateBuiltinWeb(p)
 	}
@@ -117,7 +125,7 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 				if !r.TLSVerified || r.Transport != "https-tcp" || r.HTTPStatus != s.Status {
 					return "failed"
 				}
-				if (p.Version == GoogleYouTubeWeb || p.Version == builtinWeb) && (!r.ContentVerified || r.MIME != "text/html" || r.Bytes < s.MinBytes || r.Bytes > probe.MaxPageBodyBytes) {
+				if (p.Version == GoogleYouTubeWeb || p.Version == GoogleYouTubeWebNoise || p.Version == builtinWeb) && (!r.ContentVerified || r.MIME != "text/html" || r.Bytes < s.MinBytes || r.Bytes > probe.MaxPageBodyBytes) {
 					return "failed"
 				}
 				if s.Kind == "download" && r.Bytes != s.Bytes {
@@ -127,6 +135,9 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 			}
 		}
 		for _, s := range p.UDP {
+			if s.NoiseOnly && a.Candidate.Params["noise"] != true {
+				continue
+			}
 			if r.Probe == s.ID {
 				if r.Transport != "udp-socks5" {
 					return "failed"
@@ -148,6 +159,9 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 			}
 		}
 		for _, s := range p.UDP {
+			if s.NoiseOnly && a.Candidate.Params["noise"] != true {
+				continue
+			}
 			if !seen[strconv.Itoa(round)+":"+s.ID] {
 				return "partial"
 			}

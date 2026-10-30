@@ -75,6 +75,8 @@ type UDPProbe struct {
 	ID             string `json:"id"`
 	Address        string `json:"address"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
+	Kind           string `json:"kind,omitempty"`
+	NoiseOnly      bool   `json:"noise_only,omitempty"`
 }
 type ProbeResult struct {
 	Media           *MediaEvidence `json:"media,omitempty"`

@@ -50,7 +50,7 @@ func TestBuiltinPagesRunTwiceWithoutVideo(t *testing.T) {
 					t.Fatal(status, opens, pages, exports)
 				}
 				report, err := export.ReadReport(result)
-				if err != nil || report.VerificationScope != "google_youtube_web_pages_only_not_video_or_general_internet" || len(report.Capabilities) != 0 {
+				if err != nil || report.VerificationScope != "google_youtube_web_pages_and_udp_dns_for_noise_only" || len(report.Capabilities) != 0 {
 					t.Fatal(report, err)
 				}
 			} else if status != "paused_budget" || exports != 0 {

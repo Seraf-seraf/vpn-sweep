@@ -6,6 +6,7 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
+	"github.com/Seraf-seraf/vpn-sweep/internal/probe"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
 	"github.com/Seraf-seraf/vpn-sweep/internal/space"
 	"github.com/Seraf-seraf/vpn-sweep/internal/state"
@@ -23,7 +24,7 @@ type Engine struct {
 	Media    func(context.Context, socks.Endpoint, model.Policy, int) []model.ProbeResult
 	Open     func(context.Context, model.Profile, map[string]any) (Tunnel, error)
 	Check    func(context.Context, socks.Endpoint, model.Probe, int) model.ProbeResult
-	UDP      func(context.Context, socks.Endpoint, string, string, int) model.ProbeResult
+	UDP      func(context.Context, socks.Endpoint, model.UDPProbe, int) model.ProbeResult
 	Export   func(model.Attempt) error
 }
 
@@ -66,21 +67,11 @@ func Effective(p model.Profile, params map[string]any) map[string]any {
 	return capability.Effective(p, params)
 }
 func Candidate(profiles []model.Profile, key []byte, g *space.Generator, pos *big.Int) (model.Candidate, *big.Int, bool) {
-	n := big.NewInt(int64(len(profiles)))
-	total := new(big.Int).Mul(new(big.Int).Add(g.Count(), big.NewInt(1)), n)
-	if len(profiles) == 0 || pos.Sign() < 0 || pos.Cmp(total) >= 0 {
+	s, err := newCandidateSchedule(profiles, key, g)
+	if err != nil {
 		return model.Candidate{}, nil, false
 	}
-	params := map[string]any{}
-	profile := int(new(big.Int).Mod(pos, n).Int64())
-	if pos.Cmp(n) >= 0 {
-		rank := new(big.Int).Quo(pos, n)
-		rank.Sub(rank, big.NewInt(1))
-		params, _ = g.At(rank)
-	}
-	c := model.Candidate{Profile: profile, Params: params}
-	c.ID = model.PrivateID(key, []any{"candidate-v2", profiles[profile], Effective(profiles[profile], params)})
-	return c, new(big.Int).Add(pos, big.NewInt(1)), true
+	return s.candidate(pos)
 }
 func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Profile, key []byte, g *space.Generator, s *state.Store) (string, error) {
 	if policy.RequiresRemovedYouTube(m.Policy) {
@@ -103,6 +94,10 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			return "unsupported", err
 		}
 		_ = p
+	}
+	schedule, err := newCandidateSchedule(profiles, key, g)
+	if err != nil {
+		return "invalid_input", err
 	}
 	b := m.Budgets
 	if b.AttemptSeconds < 1 {
@@ -164,7 +159,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			}
 			var n *big.Int
 			var exists bool
-			c, n, exists = Candidate(profiles, key, g, pos)
+			c, n, exists = schedule.candidate(pos)
 			if !exists {
 				return status("space_exhausted")
 			}
@@ -266,7 +261,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			}
 			if progress {
 				neighbors := []model.Candidate{}
-				for _, params := range g.Neighbors(c.Params) {
+				for _, params := range schedule.spaces[c.Profile].Neighbors(c.Params) {
 					if capability.Check(profiles[c.Profile], params) != nil {
 						continue
 					}
@@ -399,9 +394,25 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 			}
 		}
 		for i, pr := range m.Policy.UDP {
+			if pr.NoiseOnly && c.Params["noise"] != true {
+				continue
+			}
+			if e.UDP == nil {
+				if err = closeTunnel(); err != nil {
+					return "", err
+				}
+				return "capability_blocked", nil
+			}
+			if pr.Kind == "dns-a" && m.Budgets.PayloadBytes > 0 && s.View().PayloadBytes-initialBytes+probe.MaxDNSResponseBytes > m.Budgets.PayloadBytes {
+				e.notify(s, Progress{Event: "budget_reached", Outcome: "payload_budget"})
+				if err = closeTunnel(); err != nil {
+					return "", err
+				}
+				return "interrupted", nil
+			}
 			e.notify(s, Progress{Event: "probe_started", Round: round + 1, Probe: len(m.Policy.Probes) + i + 1})
 			udpCtx, cancel := context.WithTimeout(ctx, time.Duration(pr.TimeoutSeconds)*time.Second)
-			r := e.UDP(udpCtx, h.Endpoint(), pr.ID, pr.Address, round)
+			r := e.UDP(udpCtx, h.Endpoint(), pr, round)
 			cancel()
 			if err = e.recordProbe(s, r, len(m.Policy.Probes)+i+1); err != nil {
 				closeTunnel()

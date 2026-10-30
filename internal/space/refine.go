@@ -6,9 +6,21 @@ import (
 )
 
 func (d Domain) index(v any) int64 {
+	if d.Preset != "" {
+		if index, ok := noiseIndex(d.Preset, v); ok {
+			return index
+		}
+		return 0
+	}
 	if len(d.Values) > 0 {
+		if d.Optional && v == nil {
+			return 0
+		}
 		for i, x := range d.Values {
 			if model.Digest(x) == model.Digest(v) {
+				if d.Optional {
+					return int64(i + 1)
+				}
 				return int64(i)
 			}
 		}
@@ -49,7 +61,9 @@ func (g *Generator) Neighbors(params map[string]any) []map[string]any {
 		}
 		for _, d := range dims {
 			if active(d.Name, p) && p[d.Name] == nil {
-				p[d.Name] = d.value(0)
+				if value := d.value(0); value != nil {
+					p[d.Name] = value
+				}
 			}
 		}
 		for j := 0; j < 2 && j < len(dims); j++ {
@@ -58,11 +72,17 @@ func (g *Generator) Neighbors(params map[string]any) []map[string]any {
 				continue
 			}
 			idx := (d.index(p[d.Name]) + int64(1+k/len(dims))) % d.count()
-			p[d.Name] = d.value(idx)
+			if value := d.value(idx); value != nil {
+				p[d.Name] = value
+			} else {
+				delete(p, d.Name)
+			}
 		}
 		for _, d := range dims {
 			if active(d.Name, p) && p[d.Name] == nil {
-				p[d.Name] = d.value(0)
+				if value := d.value(0); value != nil {
+					p[d.Name] = value
+				}
 			}
 		}
 		p = capability.Canonical(p)

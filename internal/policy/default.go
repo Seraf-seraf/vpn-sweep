@@ -8,15 +8,30 @@ import (
 
 const GoogleYouTube = "google-youtube-v1"
 const builtinWeb = "builtin-web-v1"
+const GoogleYouTubeWebNoise = "google-youtube-web-noise-v1"
+const NoiseDNSProbeID = "noise-dns"
+const NoiseDNSProbeAddress = "8.8.8.8:53"
+const NoiseDNSProbeTimeoutSeconds = 5
 
 func Default() model.Policy {
 	return model.Policy{
-		Version: GoogleYouTubeWeb, Rounds: 2, MinOperators: 1,
+		Version: GoogleYouTubeWebNoise, Rounds: 2, MinOperators: 1,
 		Probes: []model.Probe{
 			{ID: "google-home", Operator: "google", URL: "https://www.google.com/?hl=en", Kind: "page", ContainsAll: []string{"<title>Google</title>", "name=\"q\"", "action=\"/search\""}, MinBytes: 4096, MIME: "text/html", Status: 200, TimeoutSeconds: 45},
 			{ID: "youtube-home", Operator: "google", URL: "https://www.youtube.com/?hl=en&gl=US", Kind: "page", ContainsAll: []string{"ytInitialData", "ytcfg.set", "\"richGridRenderer\""}, MinBytes: 4096, MIME: "text/html", Status: 200, TimeoutSeconds: 45},
 		},
+		UDP: []model.UDPProbe{{ID: NoiseDNSProbeID, Address: NoiseDNSProbeAddress, TimeoutSeconds: NoiseDNSProbeTimeoutSeconds, Kind: "dns-a", NoiseOnly: true}},
 	}
+}
+
+func validateGoogleYouTubeWebNoise(p model.Policy) error {
+	if len(p.UDP) != 1 || p.UDP[0] != (model.UDPProbe{ID: NoiseDNSProbeID, Address: NoiseDNSProbeAddress, TimeoutSeconds: NoiseDNSProbeTimeoutSeconds, Kind: "dns-a", NoiseOnly: true}) {
+		return model.Err("invalid_noise_udp_policy", "policy")
+	}
+	base := p
+	base.Version = GoogleYouTubeWeb
+	base.UDP = nil
+	return validateGoogleYouTube(base)
 }
 
 func RequiresRemovedYouTube(p model.Policy) bool {

@@ -27,13 +27,14 @@ func builtinAttempt(p model.Policy) model.Attempt {
 func legacyCombinedPolicy() model.Policy {
 	p := Default()
 	p.Version = GoogleYouTube
+	p.UDP = nil
 	p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "BaW_jenozKc", Permission: "synthetic", MinHeight: 1080}}
 	return p
 }
 
 func TestDefaultRequiresPagesAndFreshRoundsWithoutVideo(t *testing.T) {
 	p := Default()
-	if p.Version != GoogleYouTubeWeb || p.Video != nil || len(p.Probes) != 2 || p.Rounds != 2 {
+	if p.Version != GoogleYouTubeWebNoise || p.Video != nil || len(p.Probes) != 2 || p.Rounds != 2 {
 		t.Fatalf("unexpected default policy: %+v", p)
 	}
 	if err := Validate(p); err != nil {
@@ -59,6 +60,50 @@ func TestDefaultRequiresPagesAndFreshRoundsWithoutVideo(t *testing.T) {
 	a.Restarts = 0
 	if Evaluate(p, a) == "pass" {
 		t.Fatal("missing restart accepted")
+	}
+}
+
+func TestDefaultNoiseRequiresUDPInEveryRound(t *testing.T) {
+	p := Default()
+	if len(p.UDP) != 1 || p.UDP[0].Address != "8.8.8.8:53" || p.UDP[0].Kind != "dns-a" || !p.UDP[0].NoiseOnly || p.UDP[0].TimeoutSeconds != 5 {
+		t.Fatal("missing conditional DNS probe", p.UDP)
+	}
+	a := builtinAttempt(p)
+	a.Candidate.Params = map[string]any{"noise": true}
+	if result := Evaluate(p, a); result == "pass" {
+		t.Fatal("noise was accepted without UDP evidence")
+	}
+	for round := 0; round < p.Rounds; round++ {
+		a.Results = append(a.Results, model.ProbeResult{Probe: p.UDP[0].ID, Round: round, Transport: "udp-socks5", Outcome: "pass"})
+	}
+	if result := Evaluate(p, a); result != "pass" {
+		t.Fatal("valid noise evidence rejected", result)
+	}
+	for _, mutate := range []func(*model.Attempt){
+		func(a *model.Attempt) { a.Results = a.Results[:len(a.Results)-1] },
+		func(a *model.Attempt) { a.Results[len(a.Results)-1].Outcome = "udp_timeout_or_read_failed" },
+		func(a *model.Attempt) { a.Results[len(a.Results)-1].Transport = "https-tcp" },
+	} {
+		b := a
+		b.Results = append([]model.ProbeResult(nil), a.Results...)
+		mutate(&b)
+		if Evaluate(p, b) == "pass" {
+			t.Fatal("incomplete or invalid UDP evidence accepted")
+		}
+	}
+	plain := builtinAttempt(p)
+	if result := Evaluate(p, plain); result != "pass" {
+		t.Fatal("web-only candidate was forced to use UDP", result)
+	}
+	plain.Results = append(plain.Results, a.Results[len(a.Results)-1])
+	if Evaluate(p, plain) == "pass" {
+		t.Fatal("unexpected noise UDP evidence accepted for web-only candidate")
+	}
+	invalid := p
+	invalid.UDP = append([]model.UDPProbe(nil), p.UDP...)
+	invalid.UDP[0].Address = "203.0.113.1:53"
+	if Validate(invalid) == nil {
+		t.Fatal("unverified default UDP endpoint accepted")
 	}
 }
 

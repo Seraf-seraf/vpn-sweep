@@ -52,6 +52,35 @@ func TestPublicCLIAndSecretErrors(t *testing.T) {
 		t.Fatal("removed resolver command accepted", code, stderr.String())
 	}
 }
+
+func TestSpaceReportsNoisePresetAndOptionalFingerprint(t *testing.T) {
+	var out, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"space"}, nil, &out, &stderr); code != 0 {
+		t.Fatal(stderr.String())
+	}
+	var result struct {
+		Parameters []struct {
+			Name     string `json:"name"`
+			Preset   string `json:"preset"`
+			Optional bool   `json:"optional"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	var noisePreset, optionalFingerprint bool
+	for _, d := range result.Parameters {
+		if d.Name == "noises" && d.Preset == "udp-noise-v1" {
+			noisePreset = true
+		}
+		if d.Name == "fingerprint" && d.Optional {
+			optionalFingerprint = true
+		}
+	}
+	if !noisePreset || !optionalFingerprint {
+		t.Fatal("space output does not describe generated noises and the source fingerprint")
+	}
+}
 func TestCompleteCLIWithControlledCore(t *testing.T) {
 	payload := []byte("synthetic verified data")
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +193,7 @@ func TestBuiltinPolicyAndLegacyResumeWithoutOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, stderr bytes.Buffer
-	if Run(context.Background(), []string{"policy"}, nil, &out, &stderr) != 0 || !strings.Contains(out.String(), `"policy":"`+policy.GoogleYouTubeWeb+`"`) || !strings.Contains(out.String(), `"network_requests":false`) {
+	if Run(context.Background(), []string{"policy"}, nil, &out, &stderr) != 0 || !strings.Contains(out.String(), `"policy":"`+policy.GoogleYouTubeWebNoise+`"`) || !strings.Contains(out.String(), `"network_requests":false`) {
 		t.Fatal(out.String(), stderr.String())
 	}
 	binary, id := testkit.FakeCore(t)
@@ -235,6 +264,7 @@ func TestLegacyYouTubeResumeRequiresNewSeries(t *testing.T) {
 			key := make([]byte, 32)
 			p := policy.Default()
 			p.Version = version
+			p.UDP = nil
 			p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "abcdefghijk", Permission: "synthetic", MinHeight: 1080}}
 			if version == media.Version {
 				p.Probes = nil
@@ -300,6 +330,7 @@ func TestExportSavedLegacyYouTubeWinner(t *testing.T) {
 	}
 	p := policy.Default()
 	p.Version = policy.GoogleYouTube
+	p.UDP = nil
 	p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "abcdefghijk", Permission: "synthetic", MinHeight: 1080}}
 	base := t.TempDir()
 	dir := filepath.Join(base, "series")

@@ -12,12 +12,14 @@ import (
 )
 
 type Domain struct {
-	Name   string `json:"name"`
-	Values []any  `json:"values,omitempty"`
-	Min    *int   `json:"min,omitempty"`
-	Max    *int   `json:"max,omitempty"`
-	Step   int    `json:"step,omitempty"`
-	Pair   bool   `json:"pair,omitempty"`
+	Name     string `json:"name"`
+	Values   []any  `json:"values,omitempty"`
+	Min      *int   `json:"min,omitempty"`
+	Max      *int   `json:"max,omitempty"`
+	Step     int    `json:"step,omitempty"`
+	Pair     bool   `json:"pair,omitempty"`
+	Preset   string `json:"preset,omitempty"`
+	Optional bool   `json:"optional,omitempty"`
 }
 type Spec struct {
 	Version    int      `json:"version"`
@@ -26,18 +28,33 @@ type Spec struct {
 	Parameters []Domain `json:"parameters"`
 }
 type Generator struct {
-	Spec   Spec
-	total  *big.Int
-	stride *big.Int
-	offset *big.Int
+	Spec     Spec
+	total    *big.Int
+	stride   *big.Int
+	offset   *big.Int
+	coverage []*big.Int
+	excluded []*big.Int
 }
 
 func Default() Spec {
 	lo, hi, z, delay, split := 1, 512, 0, 50, 256
-	return Spec{Version: 1, Strategy: "broad", Seed: 1, Parameters: []Domain{{Name: "fragment", Values: []any{false, true}}, {Name: "mux", Values: []any{false, true}}, {Name: "packets", Values: []any{"tlshello", "1-1", "1-3"}}, {Name: "length", Min: &lo, Max: &hi, Step: 1, Pair: true}, {Name: "interval", Min: &z, Max: &delay, Step: 1, Pair: true}, {Name: "maxSplit", Min: &lo, Max: &split, Step: 1, Pair: true}, {Name: "tcpConcurrency", Values: []any{float64(-1), float64(0), float64(1), float64(8), float64(32), float64(128)}}, {Name: "xudpConcurrency", Values: []any{float64(-1), float64(0), float64(8), float64(64), float64(1024)}}, {Name: "quic", Values: []any{"reject", "allow", "skip"}}}}
+	return Spec{Version: 2, Strategy: "broad", Seed: 1, Parameters: []Domain{
+		{Name: "fragment", Values: []any{false, true}},
+		{Name: "mux", Values: []any{false, true}},
+		{Name: "noise", Values: []any{false, true}},
+		{Name: "noises", Preset: noisePreset},
+		{Name: "fingerprint", Optional: true, Values: []any{"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized"}},
+		{Name: "packets", Values: []any{"tlshello", "1-1", "1-3"}},
+		{Name: "length", Min: &lo, Max: &hi, Step: 1, Pair: true},
+		{Name: "interval", Min: &z, Max: &delay, Step: 1, Pair: true},
+		{Name: "maxSplit", Min: &lo, Max: &split, Step: 1, Pair: true},
+		{Name: "tcpConcurrency", Values: []any{float64(-1), float64(0), float64(1), float64(8), float64(32), float64(128)}},
+		{Name: "xudpConcurrency", Values: []any{float64(-1), float64(0), float64(8), float64(64), float64(1024)}},
+		{Name: "quic", Values: []any{"reject", "allow", "skip"}},
+	}}
 }
 func New(s Spec) (*Generator, error) {
-	if s.Version != 1 || (s.Strategy != "exhaustive" && s.Strategy != "broad") {
+	if (s.Version != 1 && s.Version != 2) || (s.Strategy != "exhaustive" && s.Strategy != "broad") {
 		return nil, model.Err("unsupported_space_version_or_strategy", "space")
 	}
 	seen := map[string]bool{}
@@ -46,6 +63,16 @@ func New(s Spec) (*Generator, error) {
 			return nil, model.Err("duplicate_parameter", "space")
 		}
 		seen[d.Name] = true
+		if d.Optional && (s.Version != 2 || d.Name != "fingerprint" || len(d.Values) == 0) {
+			return nil, model.Err("invalid_domain", "space")
+		}
+		if d.Preset != "" {
+			_, supported := presetFamilies(d.Preset)
+			if s.Version != 2 || d.Name != "noises" || !supported || d.Optional || len(d.Values) != 0 || d.Min != nil || d.Max != nil || d.Step != 0 || d.Pair {
+				return nil, model.Err("invalid_domain", "space")
+			}
+			continue
+		}
 		if len(d.Values) > 0 {
 			if d.Min != nil || d.Max != nil || d.Pair {
 				return nil, model.Err("ambiguous_domain", "space")
@@ -118,11 +145,21 @@ func New(s Spec) (*Generator, error) {
 			g.stride.Add(g.stride, big.NewInt(1))
 		}
 	}
+	if s.Version == 2 && s.Strategy == "broad" {
+		g.prepareCoverage()
+	}
 	return g, nil
 }
 func (d Domain) count() int64 {
+	if d.Preset != "" {
+		return noiseCount(d.Preset)
+	}
 	if len(d.Values) > 0 {
-		return int64(len(d.Values))
+		n := int64(len(d.Values))
+		if d.Optional {
+			n++
+		}
+		return n
 	}
 	n := int64((*d.Max-*d.Min)/d.Step + 1)
 	if d.Pair {
@@ -131,7 +168,16 @@ func (d Domain) count() int64 {
 	return n
 }
 func (d Domain) value(index int64) any {
+	if d.Preset != "" {
+		return noiseValue(d.Preset, index)
+	}
 	if len(d.Values) > 0 {
+		if d.Optional {
+			if index == 0 {
+				return nil
+			}
+			index--
+		}
 		return d.Values[index]
 	}
 	n := int64((*d.Max-*d.Min)/d.Step + 1)
@@ -189,7 +235,23 @@ func (g *Generator) At(position *big.Int) (map[string]any, bool) {
 		return nil, false
 	}
 	rank := new(big.Int).Set(position)
-	if g.Spec.Strategy == "broad" {
+	fromCoverage := false
+	if len(g.coverage) > 0 {
+		prefix := big.NewInt(int64(len(g.coverage)))
+		if rank.Cmp(prefix) < 0 {
+			rank.Set(g.coverage[rank.Int64()])
+			fromCoverage = true
+		} else {
+			rank.Sub(rank, prefix)
+			for _, skipped := range g.excluded {
+				if skipped.Cmp(rank) > 0 {
+					break
+				}
+				rank.Add(rank, big.NewInt(1))
+			}
+		}
+	}
+	if g.Spec.Strategy == "broad" && !fromCoverage {
 		rank.Mul(rank, g.stride).Add(rank, g.offset).Mod(rank, g.total)
 	}
 	p := map[string]any{}
@@ -210,7 +272,9 @@ func (g *Generator) At(position *big.Int) (map[string]any, bool) {
 			c := g.count(i+1, p)
 			q, r := new(big.Int), new(big.Int)
 			q.QuoRem(rank, c, r)
-			p[d.Name] = d.value(q.Int64())
+			if value := d.value(q.Int64()); value != nil {
+				p[d.Name] = value
+			}
 			rank = r
 		}
 	}

@@ -82,7 +82,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		return 0
 	}
 	if args[0] == "version" {
-		io.WriteString(out, "vpn-sweep google-youtube-web-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
+		io.WriteString(out, "vpn-sweep google-youtube-web-noise-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
 		return 0
 	}
 	o, e := flags(args[1:])
@@ -122,7 +122,14 @@ func dispatch(ctx context.Context, command string, o options, in io.Reader, out,
 		}
 		domains := []map[string]any{}
 		for _, d := range g.Spec.Parameters {
-			domains = append(domains, map[string]any{"name": d.Name, "explicit_values": len(d.Values), "min": d.Min, "max": d.Max, "step": d.Step, "pair": d.Pair})
+			entry := map[string]any{"name": d.Name, "explicit_values": len(d.Values), "min": d.Min, "max": d.Max, "step": d.Step, "pair": d.Pair}
+			if d.Preset != "" {
+				entry["preset"] = d.Preset
+			}
+			if d.Optional {
+				entry["optional"] = true
+			}
+			domains = append(domains, entry)
 		}
 		return emit(out, map[string]any{"count": g.Count().String(), "strategy": g.Spec.Strategy, "seed": g.Spec.Seed, "parameters": domains, "catalog": capability.Catalog(), "scope": "before_profile_applicability_filter"})
 	case "policy":
@@ -303,7 +310,16 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 			return nil, e
 		}
 		return runner.Start(ctx, cfg, socks.Endpoint{Address: addr, User: user, Pass: pass})
-	}, Check: client.Check, UDP: probe.UDPEcho, Export: func(a model.Attempt) error {
+	}, Check: client.Check, UDP: func(ctx context.Context, endpoint socks.Endpoint, p model.UDPProbe, round int) model.ProbeResult {
+		switch p.Kind {
+		case "":
+			return probe.UDPEcho(ctx, endpoint, p.ID, p.Address, round)
+		case "dns-a":
+			return probe.UDPDNS(ctx, endpoint, p.ID, p.Address, round)
+		default:
+			return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Transport: "udp-socks5", Outcome: "unsupported", Phase: "capability"}
+		}
+	}, Export: func(a model.Attempt) error {
 		logger.Print("Проверки пройдены; сохранение результата")
 		return export.Save(o.output, m, profiles, a)
 	}}
