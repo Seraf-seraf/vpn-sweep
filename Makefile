@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: check test vet build android package scan
+.PHONY: check test vet build android package scan android-core android-apk android-check
 check:
 	GO="$(GO)" sh scripts/check.sh
 test:
@@ -15,3 +15,10 @@ scan:
 	python3 scripts/secret-scan.py
 package:
 	GO="$(GO)" sh scripts/package.sh
+android-core:
+	GO="$(GO)" sh scripts/android-core.sh
+android-apk: android-core
+	cd android && ./gradlew --no-daemon :app:assembleDebug
+android-check: android-core
+	cd android/core && $(GO) vet -mod=readonly ./... && $(GO) test -mod=readonly -race ./...
+	cd android && ./gradlew --no-daemon :app:lintDebug :app:testDebugUnitTest :app:assembleDebug

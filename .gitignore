@@ -29,4 +29,9 @@ happ.json
 *.out
 __pycache__/
 /vpn-sweep
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/**/build/
+/android/app/libs/
 # Clean JSON fixtures/examples are intentionally versioned.

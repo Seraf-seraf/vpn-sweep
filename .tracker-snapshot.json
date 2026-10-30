@@ -1,0 +1,9 @@
+{
+  "exclude": [
+    ".codex-task-state.md",
+    "android/.gradle",
+    "android/.kotlin",
+    "android/app/libs",
+    "android/local.properties"
+  ]
+}
