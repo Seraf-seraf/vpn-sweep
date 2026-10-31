@@ -23,12 +23,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -52,7 +50,6 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
@@ -167,19 +164,8 @@ internal fun SubscriptionDialogContent(
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
             val actions = dialogActionsLayout(maxWidth, horizontalPadding = 12.dp, confirmExtra = if (loading) 24.dp else 0.dp)
-            val actionHeight = maxOf(48.dp, with(LocalDensity.current) { 20.sp.toDp() } + 24.dp)
-            val footerHeight = if (actions.stacked) actionHeight * 2 + 8.dp else actionHeight
-            val scrollEntireDialog = maxHeight < footerHeight + 48.dp
-            Column(
-                modifier = Modifier.fillMaxWidth().then(
-                    if (scrollEntireDialog) Modifier.verticalScroll(rememberScrollState()) else Modifier,
-                ),
-            ) {
-                Column(
-                    modifier = if (scrollEntireDialog) Modifier else Modifier
-                        .weight(1f, fill = false)
-                        .verticalScroll(rememberScrollState()),
-                ) {
+            DialogBodyFooter(
+                body = {
                     Text(
                         text = "Добавить подписку",
                         modifier = Modifier.fillMaxWidth(),
@@ -216,15 +202,17 @@ internal fun SubscriptionDialogContent(
                     Spacer(Modifier.height(16.dp))
                     SubscriptionStatusMessage(status)
                     Spacer(Modifier.height(24.dp))
-                }
-                SubscriptionActions(
-                    canSubmit = canSubmit,
-                    loading = loading,
-                    onDismiss = onDismiss,
-                    onSubmit = submit,
-                    layout = actions,
-                )
-            }
+                },
+                footer = {
+                    SubscriptionActions(
+                        canSubmit = canSubmit,
+                        loading = loading,
+                        onDismiss = onDismiss,
+                        onSubmit = submit,
+                        layout = actions,
+                    )
+                },
+            )
         }
     }
 }

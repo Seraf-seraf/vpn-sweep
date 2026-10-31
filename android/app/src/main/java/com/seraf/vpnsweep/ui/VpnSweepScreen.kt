@@ -31,7 +31,6 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -48,8 +47,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.semantics.Role
@@ -81,18 +82,12 @@ internal fun VpnSweepScreenContent(
     state: VpnState,
     selected: Boolean,
     importing: Boolean,
-    message: String,
-    testing: Boolean,
-    checkResults: List<String>,
     onPower: () -> Unit,
-    onImport: () -> Unit,
-    onRunChecks: () -> Unit,
     onSubscription: () -> Unit,
     onServers: () -> Unit,
     permissionMessage: String = "",
     contentWindowInsets: WindowInsets = WindowInsets.safeDrawing,
 ) {
-    val busy = state.phase in setOf(VpnPhase.CONNECTING, VpnPhase.RUNNING, VpnPhase.STOPPING)
     val powerEnabled = selected && !importing && state.phase != VpnPhase.STOPPING
     val powerAction = when (state.phase) {
         VpnPhase.CONNECTING -> "Отменить подключение VPN"
@@ -102,7 +97,7 @@ internal fun VpnSweepScreenContent(
     }
     val powerHint = when {
         importing -> "Дождитесь окончания чтения файла"
-        !selected -> "Выберите working.json для управления VPN"
+        !selected -> "Конфигурация VPN пока недоступна"
         state.phase == VpnPhase.STOPPING -> "Дождитесь отключения VPN"
         state.phase == VpnPhase.CONNECTING -> "Нажмите, чтобы отменить подключение"
         state.phase == VpnPhase.RUNNING -> "Нажмите, чтобы отключить VPN"
@@ -180,17 +175,6 @@ internal fun VpnSweepScreenContent(
             )
             Spacer(Modifier.height(16.dp))
             InformationPanel()
-            Spacer(Modifier.height(16.dp))
-            DiagnosticsPanel(
-                state = state,
-                importing = importing,
-                importEnabled = !busy && !importing,
-                message = message,
-                testing = testing,
-                checkResults = checkResults,
-                onImport = onImport,
-                onRunChecks = onRunChecks,
-            )
         }
     }
 }
@@ -308,7 +292,7 @@ private fun ServerButton(onClick: () -> Unit) {
         Spacer(Modifier.width(16.dp))
         Text("Серверы: нет данных", Modifier.weight(1f), color = PrimaryText, fontSize = 16.sp)
         Spacer(Modifier.width(8.dp))
-        SweepGlyph(SweepIcon.ChevronRight, SecondaryText)
+        SweepGlyph(SweepIcon.ChevronRight, Accent)
     }
 }
 
@@ -446,7 +430,26 @@ private fun ParameterGroup(
             val rows = values?.fields ?: fields.map { ParameterValue(it, "Нет данных") }
             for (field in rows) {
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Outline))
-                ParameterPair(field.label, field.value, Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp))
+                val fieldIcon = if (title == "Fragment") {
+                    when (field.label) {
+                        "Фрагментация" -> SweepIcon.Grid
+                        "Пакеты" -> SweepIcon.FileText
+                        "Длина" -> SweepIcon.ArrowLeftRight
+                        "Интервал" -> SweepIcon.Clock
+                        "Макс. частей" -> SweepIcon.Layers
+                        else -> null
+                    }
+                } else null
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (fieldIcon != null) {
+                        SweepGlyph(fieldIcon, Accent)
+                        Spacer(Modifier.width(12.dp))
+                    }
+                    ParameterPair(field.label, field.value, Modifier.weight(1f))
+                }
             }
         }
     }
@@ -475,61 +478,16 @@ private fun ParameterPair(label: String, value: String, modifier: Modifier = Mod
     }
 }
 
-@Composable
-private fun DiagnosticsPanel(
-    state: VpnState,
-    importing: Boolean,
-    importEnabled: Boolean,
-    message: String,
-    testing: Boolean,
-    checkResults: List<String>,
-    onImport: () -> Unit,
-    onRunChecks: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .border(1.dp, Outline, RoundedCornerShape(16.dp))
-            .background(PanelBackground, RoundedCornerShape(16.dp))
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text("Диагностика", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-        SweepButton(
-            text = if (importing) "Чтение…" else "Выбрать working.json",
-            onClick = onImport,
-            enabled = importEnabled,
-        )
-        if (message.isNotEmpty()) {
-            Text(message, color = PrimaryText, fontFamily = SweepMono, style = MaterialTheme.typography.bodyMedium)
-        }
-        SweepButton(
-            text = if (testing) "Проверка сети…" else "Проверить TCP, UDP и DNS",
-            onClick = onRunChecks,
-            enabled = state.phase == VpnPhase.RUNNING && !testing,
-        )
-        for (result in checkResults) {
-            Text(result, color = PrimaryText, fontFamily = SweepMono, style = MaterialTheme.typography.bodyMedium)
-        }
-        if (state.outboundDigest.isNotEmpty()) {
-            Text("Защищено сокетов: ${state.protectedSockets}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
-            Text("Ошибок защиты: ${state.protectionFailures}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
-            Text("Данные TUN → Xray: ${state.tunUplinkBytes} байт", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
-            Text("Данные Xray → TUN: ${state.tunDownlinkBytes} байт", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
-            Text("SHA-256 outbounds:\n${state.outboundDigest}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
-        } else {
-            Text("Счётчики пока недоступны", color = SecondaryText, fontSize = 14.sp)
-        }
-    }
-}
-
 private fun Modifier.focusRing(shape: Shape): Modifier = composed {
     var focused by remember { mutableStateOf(false) }
     onFocusChanged { focused = it.isFocused }
         .then(if (focused) Modifier.border(2.dp, Accent, shape) else Modifier)
 }
 
-private enum class SweepIcon { Power, Link, Server, Terminal, Fragment, Mux, Fingerprint, Noise, ChevronRight, ChevronDown }
+private enum class SweepIcon {
+    Power, Link, Server, Terminal, Fragment, Mux, Fingerprint, Noise, ChevronRight, ChevronDown,
+    Grid, FileText, ArrowLeftRight, Clock, Layers,
+}
 
 @Composable
 private fun SweepGlyph(icon: SweepIcon, color: Color, modifier: Modifier = Modifier.size(24.dp)) {
@@ -544,15 +502,29 @@ private fun SweepGlyph(icon: SweepIcon, color: Color, modifier: Modifier = Modif
                     line(12f, 2f, 12f, 12f)
                 }
                 SweepIcon.Link -> {
-                    drawArc(color, 135f, 180f, false, Offset(3f, 9f), Size(11f, 11f), style = Stroke(2f, cap = StrokeCap.Round))
-                    drawArc(color, 315f, 180f, false, Offset(10f, 3f), Size(11f, 11f), style = Stroke(2f, cap = StrokeCap.Round))
-                    line(8f, 16f, 16f, 8f)
+                    val links = Path().apply {
+                        moveTo(9.6f, 13.3f)
+                        cubicTo(10.9f, 14.6f, 13f, 14.6f, 14.3f, 13.3f)
+                        lineTo(17.1f, 10.5f)
+                        cubicTo(20.3f, 7.3f, 15.6f, 2.6f, 12.4f, 5.8f)
+                        lineTo(11.3f, 6.9f)
+                        moveTo(12.4f, 10.5f)
+                        cubicTo(11.1f, 9.2f, 9f, 9.2f, 7.7f, 10.5f)
+                        lineTo(4.9f, 13.3f)
+                        cubicTo(1.7f, 16.5f, 6.4f, 21.2f, 9.6f, 18f)
+                        lineTo(10.7f, 16.9f)
+                    }
+                    drawPath(links, color, style = Stroke(2f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    line(17f, 14f, 17f, 22f)
+                    line(13f, 18f, 21f, 18f)
                 }
                 SweepIcon.Server -> {
-                    drawRoundRect(color, Offset(3f, 4f), Size(18f, 7f), androidx.compose.ui.geometry.CornerRadius(2f), style = Stroke(2f))
-                    drawRoundRect(color, Offset(3f, 13f), Size(18f, 7f), androidx.compose.ui.geometry.CornerRadius(2f), style = Stroke(2f))
-                    drawCircle(color, 1f, Offset(7f, 7.5f))
-                    drawCircle(color, 1f, Offset(7f, 16.5f))
+                    for (top in listOf(3f, 9f, 15f)) {
+                        drawRoundRect(color, Offset(2f, top), Size(20f, 5f), androidx.compose.ui.geometry.CornerRadius(1.5f))
+                        for (x in listOf(5f, 8f, 11f)) {
+                            drawCircle(PanelBackground, 0.7f, Offset(x, top + 2.5f))
+                        }
+                    }
                 }
                 SweepIcon.Terminal -> {
                     drawRoundRect(color, Offset(3f, 4f), Size(18f, 16f), androidx.compose.ui.geometry.CornerRadius(2f), style = Stroke(2f))
@@ -561,24 +533,37 @@ private fun SweepGlyph(icon: SweepIcon, color: Color, modifier: Modifier = Modif
                     line(12f, 15f, 17f, 15f)
                 }
                 SweepIcon.Fragment -> {
-                    drawRoundRect(color, Offset(4f, 4f), Size(12f, 12f), androidx.compose.ui.geometry.CornerRadius(2f), style = Stroke(2f))
+                    val behind = Path().apply {
+                        moveTo(16f, 8f); lineTo(16f, 6f); quadraticTo(16f, 4f, 14f, 4f)
+                        lineTo(6f, 4f); quadraticTo(4f, 4f, 4f, 6f); lineTo(4f, 14f)
+                        quadraticTo(4f, 16f, 6f, 16f); lineTo(8f, 16f)
+                    }
+                    drawPath(behind, color, style = Stroke(2f, cap = StrokeCap.Round, join = StrokeJoin.Round))
                     drawRoundRect(color, Offset(8f, 8f), Size(12f, 12f), androidx.compose.ui.geometry.CornerRadius(2f), style = Stroke(2f))
                 }
                 SweepIcon.Mux -> {
                     drawCircle(color, 2.5f, Offset(7f, 5f), style = Stroke(2f))
                     drawCircle(color, 2.5f, Offset(7f, 19f), style = Stroke(2f))
-                    drawCircle(color, 2.5f, Offset(18f, 16f), style = Stroke(2f))
-                    line(7f, 8f, 7f, 16f)
-                    line(8f, 11f, 16f, 14f)
+                    drawCircle(color, 2.5f, Offset(18f, 19f), style = Stroke(2f))
+                    line(7f, 7.5f, 7f, 16.5f)
+                    val branch = Path().apply {
+                        moveTo(7f, 11f); cubicTo(7f, 14f, 18f, 11f, 18f, 16.5f)
+                    }
+                    drawPath(branch, color, style = Stroke(2f, cap = StrokeCap.Round))
                 }
                 SweepIcon.Fingerprint -> {
-                    drawArc(color, 180f, 180f, false, Offset(4f, 3f), Size(16f, 16f), style = Stroke(2f, cap = StrokeCap.Round))
-                    drawArc(color, 180f, 180f, false, Offset(8f, 7f), Size(8f, 8f), style = Stroke(2f, cap = StrokeCap.Round))
-                    line(4f, 11f, 4f, 17f)
-                    line(8f, 11f, 8f, 20f)
-                    line(12f, 11f, 12f, 21f)
-                    line(16f, 11f, 16f, 19f)
-                    line(20f, 11f, 20f, 16f)
+                    val fingerprint = Path().apply {
+                        moveTo(4f, 15f); lineTo(4f, 11f)
+                        cubicTo(4f, 6.6f, 7.6f, 3f, 12f, 3f)
+                        cubicTo(16.4f, 3f, 20f, 6.6f, 20f, 11f); lineTo(20f, 15f)
+                        moveTo(6f, 19f); cubicTo(7.3f, 16.8f, 7.5f, 14.7f, 7.5f, 11.5f)
+                        cubicTo(7.5f, 5.5f, 16.5f, 5.5f, 16.5f, 11.5f)
+                        cubicTo(16.5f, 15.1f, 16.8f, 17.7f, 18.5f, 20f)
+                        moveTo(9f, 21f); cubicTo(10.2f, 18.5f, 10.5f, 15.8f, 10.5f, 11.5f)
+                        cubicTo(10.5f, 9.5f, 13.5f, 9.5f, 13.5f, 11.5f)
+                        cubicTo(13.5f, 15.7f, 13.7f, 18.7f, 15f, 21f)
+                    }
+                    drawPath(fingerprint, color, style = Stroke(2f, cap = StrokeCap.Round, join = StrokeJoin.Round))
                 }
                 SweepIcon.Noise -> {
                     line(3f, 10f, 3f, 14f)
@@ -588,12 +573,44 @@ private fun SweepGlyph(icon: SweepIcon, color: Color, modifier: Modifier = Modif
                     line(19f, 10f, 19f, 14f)
                 }
                 SweepIcon.ChevronRight -> {
-                    line(9f, 5f, 16f, 12f)
-                    line(16f, 12f, 9f, 19f)
+                    line(9f, 6f, 15f, 12f)
+                    line(15f, 12f, 9f, 18f)
                 }
                 SweepIcon.ChevronDown -> {
-                    line(5f, 9f, 12f, 16f)
-                    line(12f, 16f, 19f, 9f)
+                    line(6f, 9f, 12f, 15f)
+                    line(12f, 15f, 18f, 9f)
+                }
+                SweepIcon.Grid -> {
+                    for (x in listOf(5f, 12f, 19f)) {
+                        for (y in listOf(5f, 12f, 19f)) drawCircle(color, 1.35f, Offset(x, y))
+                    }
+                }
+                SweepIcon.FileText -> {
+                    val file = Path().apply {
+                        moveTo(6f, 3f); lineTo(14f, 3f); lineTo(19f, 8f); lineTo(19f, 21f)
+                        lineTo(6f, 21f); close()
+                        moveTo(14f, 3f); lineTo(14f, 8f); lineTo(19f, 8f)
+                    }
+                    drawPath(file, color, style = Stroke(2f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    line(9f, 12f, 16f, 12f)
+                    line(9f, 16f, 16f, 16f)
+                }
+                SweepIcon.ArrowLeftRight -> {
+                    line(3f, 12f, 21f, 12f)
+                    line(3f, 12f, 7f, 8f); line(3f, 12f, 7f, 16f)
+                    line(21f, 12f, 17f, 8f); line(21f, 12f, 17f, 16f)
+                }
+                SweepIcon.Clock -> {
+                    drawCircle(color, 9f, Offset(12f, 12f), style = Stroke(2f))
+                    line(12f, 7f, 12f, 12f); line(12f, 12f, 16f, 14f)
+                }
+                SweepIcon.Layers -> {
+                    val layers = Path().apply {
+                        moveTo(12f, 2f); lineTo(22f, 7f); lineTo(12f, 12f); lineTo(2f, 7f); close()
+                        moveTo(2f, 12f); lineTo(12f, 17f); lineTo(22f, 12f)
+                        moveTo(2f, 17f); lineTo(12f, 22f); lineTo(22f, 17f)
+                    }
+                    drawPath(layers, color, style = Stroke(2f, cap = StrokeCap.Round, join = StrokeJoin.Round))
                 }
             }
         }

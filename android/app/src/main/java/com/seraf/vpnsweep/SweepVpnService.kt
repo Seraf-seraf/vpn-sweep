@@ -220,7 +220,7 @@ class SweepVpnService : VpnService() {
         )
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("VPN Sweep · проверка подключения")
+            .setContentTitle("VPN Sweep")
             .setContentText("Подключение и состояние — в приложении")
             .setContentIntent(open)
             .setOngoing(true)

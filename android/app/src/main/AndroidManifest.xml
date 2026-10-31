@@ -8,8 +8,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:allowBackup="false"
-        android:icon="@android:drawable/ic_lock_lock"
-        android:label="VPN Sweep · Проверка"
+        android:icon="@mipmap/ic_launcher"
+        android:label="VPN Sweep"
+        android:roundIcon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false">

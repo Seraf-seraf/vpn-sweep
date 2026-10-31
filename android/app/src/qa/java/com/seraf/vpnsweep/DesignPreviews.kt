@@ -12,15 +12,20 @@ import com.seraf.vpnsweep.ui.SubscriptionDialogStatus
 import com.seraf.vpnsweep.ui.SweepColors
 import com.seraf.vpnsweep.ui.SweepTheme
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 
@@ -82,6 +87,46 @@ private fun HomePreview(state: VpnState, selected: Boolean) {
 
 @Preview(name = "PREVIEW · крупный шрифт", widthDp = 320, heightDp = 640, fontScale = 2f)
 @Composable private fun PreviewLargeText() = HomePreview(VpnState(), selected = false)
+
+@Preview(name = "PREVIEW · значок приложения", widthDp = 160, heightDp = 160)
+@Composable
+private fun PreviewLauncherIcon() {
+    Box(Modifier.fillMaxSize().background(SweepColors.background), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(108.dp).clip(CircleShape).background(SweepColors.background)) {
+            Image(painterResource(R.drawable.ic_launcher_foreground), contentDescription = null, modifier = Modifier.fillMaxSize())
+        }
+    }
+}
+
+@Preview(name = "PREVIEW · короткая подписка", widthDp = 320, heightDp = 120)
+@Preview(name = "PREVIEW · короткая подписка, крупный шрифт", widthDp = 320, heightDp = 120, fontScale = 2f)
+@Composable
+private fun PreviewShortSubscription() {
+    SweepTheme { SubscriptionDialogContent("", SubscriptionDialogStatus.Empty, {}, {}, {}) }
+}
+
+@Preview(name = "PREVIEW · подписка ниже высоты кнопок", widthDp = 320, heightDp = 79)
+@Preview(name = "PREVIEW · подписка равна высоте кнопок", widthDp = 320, heightDp = 80)
+@Preview(name = "PREVIEW · подписка выше высоты кнопок", widthDp = 320, heightDp = 81)
+@Preview(name = "PREVIEW · подписка ниже минимума тела", widthDp = 320, heightDp = 135)
+@Preview(name = "PREVIEW · подписка равна минимуму тела", widthDp = 320, heightDp = 136)
+@Preview(name = "PREVIEW · подписка выше минимума тела", widthDp = 320, heightDp = 137)
+@Composable
+private fun PreviewSubscriptionFooterBoundary() {
+    SweepTheme { SubscriptionDialogContent("", SubscriptionDialogStatus.Empty, {}, {}, {}) }
+}
+
+@Preview(name = "PREVIEW · короткий список серверов", widthDp = 320, heightDp = 180)
+@Preview(name = "PREVIEW · короткий список со сводкой", widthDp = 320, heightDp = 250)
+@Preview(name = "PREVIEW · короткий список, крупный шрифт", widthDp = 320, heightDp = 340, fontScale = 2f)
+@Composable
+private fun PreviewShortServers() {
+    SweepTheme {
+        Box(Modifier.fillMaxSize().background(SweepColors.background)) {
+            ServerSelectionDialogContent(emptyList(), emptySet(), {}, {})
+        }
+    }
+}
 
 @Preview(name = "PREVIEW · параметры", widthDp = 360, heightDp = 720)
 @Composable

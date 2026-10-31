@@ -28,13 +28,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.selection.triStateToggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -152,18 +150,8 @@ internal fun ServerSelectionDialogContent(
             val listState = rememberLazyListState()
             BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 val actions = dialogActionsLayout(maxWidth, horizontalPadding = 12.dp, outerPadding = 6.dp)
-                val actionHeight = maxOf(48.dp, with(LocalDensity.current) { 22.sp.toDp() } + 16.dp) + 6.dp
-                val footerHeight = if (actions.stacked) actionHeight * 2 + 8.dp else actionHeight
-                val scrollEntireDialog = maxHeight < footerHeight + 48.dp
-                Column(
-                    modifier = Modifier.fillMaxWidth().then(
-                        if (scrollEntireDialog) Modifier.verticalScroll(rememberScrollState()) else Modifier,
-                    ),
-                ) {
-                    Column(
-                        modifier = if (scrollEntireDialog) Modifier else
-                            Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
-                    ) {
+                DialogBodyFooter(
+                    body = {
                         ServerDialogHeader()
                         Spacer(Modifier.height(16.dp))
                         ServerSearch(search, { search = it })
@@ -212,15 +200,21 @@ internal fun ServerSelectionDialogContent(
                             }
                             ServerListScrollbar(listState, Modifier.matchParentSize())
                         }
-                        ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
-                    }
-                    ServerDialogFooter(
-                        selectedCount = selected.size,
-                        onDismiss = onDismiss,
-                        onConfirm = { onConfirm(selected.toSet()) },
-                        layout = actions,
-                    )
-                }
+                    },
+                    footerLeading = {
+                        Column(Modifier.fillMaxWidth()) {
+                            ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
+                        }
+                    },
+                    footer = {
+                        ServerDialogFooter(
+                            selectedCount = selected.size,
+                            onDismiss = onDismiss,
+                            onConfirm = { onConfirm(selected.toSet()) },
+                            layout = actions,
+                        )
+                    },
+                )
             }
         }
     }
