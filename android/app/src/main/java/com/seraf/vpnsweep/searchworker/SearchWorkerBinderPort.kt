@@ -57,6 +57,7 @@ internal class SearchWorkerBinderPort(
     private val provenReplyBound: Int,
 ) : DeadlineWorkerPort {
     private enum class State { NEW, OPENING, READY, CLOSING, RETIRED, QUARANTINED }
+    private enum class CallDisposition { ACCEPT, DEADLINE, CANCELLED, UNKNOWN }
     private val lock = Any()
     private var state = State.NEW
     private var cancelled = false
@@ -223,49 +224,50 @@ internal class SearchWorkerBinderPort(
                 }
             }
         } ?: return WorkerReplyV1.Quarantined
-        val now = SystemClock.elapsedRealtime()
-        if (now < 0) {
+        if (SystemClock.elapsedRealtime() < 0) {
             discardReplyAsync(reply)
             return WorkerReplyV1.Quarantined.also { failClosed() }
         }
-        if (now >= operationDeadline) {
-            val budget = synchronized(lock) { cleanupBudgetMillis }
-            if (budget <= 0 || operationDeadline > Long.MAX_VALUE - budget) {
-                discardReplyAsync(reply)
-                return WorkerReplyV1.Quarantined.also { failClosed() }
+        var disposed: WorkerReplyV1 = reply
+        while (true) {
+            val finishedAt = SystemClock.elapsedRealtime()
+            val disposition = synchronized(lock) {
+                val overflow = finishedAt >= operationDeadline &&
+                    (cleanupBudgetMillis <= 0 || operationDeadline > Long.MAX_VALUE - cleanupBudgetMillis)
+                if (finishedAt >= operationDeadline && !overflow) {
+                    tightenCleanupDeadline(operationDeadline + cleanupBudgetMillis)
+                }
+                when {
+                    finishedAt < 0 || overflow || state != State.READY || disposed == WorkerReplyV1.Quarantined ||
+                        (cleanupDeadline != null && finishedAt >= cleanupDeadline!!) -> {
+                        state = State.QUARANTINED
+                        ownerLease.quarantine()
+                        CallDisposition.UNKNOWN
+                    }
+                    disposed is WorkerReplyV1.Complete && cancelled -> CallDisposition.CANCELLED
+                    disposed is WorkerReplyV1.Complete && finishedAt >= operationDeadline -> CallDisposition.DEADLINE
+                    else -> {
+                        inFlight = false
+                        CallDisposition.ACCEPT
+                    }
+                }
             }
-            synchronized(lock) { tightenCleanupDeadline(operationDeadline + budget) }
-        }
-        val dispositionState = synchronized(lock) { Triple(state, cancelled, cleanupDeadline) }
-        if (dispositionState.first != State.READY || (dispositionState.third != null && now >= dispositionState.third!!)) {
-            discardReplyAsync(reply)
-            return WorkerReplyV1.Quarantined.also { failClosed() }
-        }
-        val cancelledBeforeDisposition = dispositionState.second
-        val disposed = if (reply is WorkerReplyV1.Complete && (now >= operationDeadline || cancelledBeforeDisposition)) {
-            val closed = awaitCall(operationDeadline, {}) { reply.result.close(); true }
-            if (closed != true) return WorkerReplyV1.Quarantined
-            WorkerReplyV1.Interrupted(if (cancelledBeforeDisposition) WorkerInterruptedV2.CANCELLED else WorkerInterruptedV2.DEADLINE)
-        } else reply
-        val finishedAt = SystemClock.elapsedRealtime()
-        val accepted = synchronized(lock) {
-            if (state != State.READY || disposed == WorkerReplyV1.Quarantined || finishedAt < 0 ||
-                (cleanupDeadline != null && finishedAt >= cleanupDeadline!!)
-            ) {
-                state = State.QUARANTINED
-                ownerLease.quarantine()
-                false
-            } else {
-                inFlight = false
-                true
+            when (disposition) {
+                CallDisposition.ACCEPT -> return disposed
+                CallDisposition.UNKNOWN -> {
+                    discardReplyAsync(disposed)
+                    return WorkerReplyV1.Quarantined.also { failClosed() }
+                }
+                CallDisposition.DEADLINE, CallDisposition.CANCELLED -> {
+                    val input = (disposed as WorkerReplyV1.Complete).result
+                    val closed = awaitCall(operationDeadline, {}) { input.close(); true }
+                    if (closed != true) return WorkerReplyV1.Quarantined
+                    disposed = WorkerReplyV1.Interrupted(
+                        if (disposition == CallDisposition.CANCELLED) WorkerInterruptedV2.CANCELLED else WorkerInterruptedV2.DEADLINE,
+                    )
+                }
             }
         }
-        if (!accepted) {
-            discardReplyAsync(disposed)
-            failClosed()
-            return WorkerReplyV1.Quarantined
-        }
-        return disposed
     }
 
     override fun cancelUntil(identity: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): Unit {
