@@ -13,12 +13,14 @@ import java.util.zip.ZipFile
 
 private const val CORE_LIBRARY_NAME = "libgojni.so"
 private const val CORE_APK_ENTRY = "lib/arm64-v8a/libgojni.so"
+private const val GO_SEQ_CLASS = "go.Seq"
 private const val READ_BUFFER_BYTES = 64 * 1024
 
-// This only resolves and hashes the installed file; it does not load gomobile.
+// Call only after acquiring the native owner lease. The class lookup does not initialize go.Seq.
 internal fun installedCoreSha256(context: Context): String? {
     return try {
         val loader = context.classLoader as? BaseDexClassLoader ?: return null
+        if (!classIsDefinedBy(loader, GO_SEQ_CLASS)) return null
         val resolved = loader.findLibrary("gojni") ?: return null
         val info = context.applicationInfo ?: return null
         val packages = mutableListOf<File>()
@@ -30,6 +32,14 @@ internal fun installedCoreSha256(context: Context): String? {
     } catch (_: LinkageError) {
         null
     }
+}
+
+internal fun classIsDefinedBy(loader: ClassLoader, className: String): Boolean = try {
+    Class.forName(className, false, loader).classLoader === loader
+} catch (_: Exception) {
+    false
+} catch (_: LinkageError) {
+    false
 }
 
 internal fun sha256ResolvedCoreLibrary(resolved: String, packages: List<File>, nativeLibraryDir: File?): String? {

@@ -6,13 +6,27 @@ import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 class InstalledCoreIdentityTest {
     @get:Rule val folder = TemporaryFolder()
+
+    @Test
+    fun acceptsOnlyTheDefiningLoaderWithoutInitializingTheClass(): Unit {
+        LoaderProbeState.initialized = false
+        val probe = LoaderProbe::class.java
+        val definingLoader = requireNotNull(probe.classLoader)
+        val delegatingLoader = object : ClassLoader(definingLoader) {}
+        assertTrue(classIsDefinedBy(definingLoader, probe.name))
+        assertFalse(classIsDefinedBy(delegatingLoader, probe.name))
+        assertFalse(classIsDefinedBy(definingLoader, "synthetic.missing.LoaderProbe"))
+        assertFalse(LoaderProbeState.initialized)
+    }
 
     @Test
     fun hashesExactStoredEntryInAnInstalledApk(): Unit {
@@ -75,3 +89,8 @@ class InstalledCoreIdentityTest {
 private const val APK_ENTRY = "lib/arm64-v8a/libgojni.so"
 private val LIBRARY_BYTES = "synthetic-native-library".toByteArray()
 private const val EXPECTED_SHA256 = "dfaacd1e61ed5381dec722559694f8ade506b949613f3f8eb0c631d48b744d16"
+
+private object LoaderProbeState { var initialized: Boolean = false }
+private class LoaderProbe {
+    companion object { init { LoaderProbeState.initialized = true } }
+}
