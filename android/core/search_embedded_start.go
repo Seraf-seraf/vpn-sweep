@@ -87,10 +87,6 @@ func (d searchReadinessDialer) DialTCP(ctx context.Context, address string) (net
 	return tracked, nil
 }
 
-func (d searchReadinessDialer) DialUDP(ctx context.Context, address *net.UDPAddr) (socks.UDPConn, error) {
-	return d.base.DialUDP(ctx, address)
-}
-
 func negotiateTrackedSearchReadiness(ctx context.Context, probes *SearchWorkerProbes) (net.Conn, error) {
 	if probes == nil || probes.proxy.SocketDialer == nil {
 		return nil, errors.New("search_socket_unavailable")
