@@ -28,6 +28,8 @@ import com.seraf.vpnsweep.vpn.VpnRunRegistry
 import com.seraf.vpnsweep.vpn.VpnServiceLifecycle
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -41,6 +43,41 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VpnRegistryActivationTest {
+    @Test
+    fun admissionsRemainClosedWhileVpnStopIsInProgress(): Unit = runBlocking {
+        val fixture = Fixture()
+        val admission = fixture.admit()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val operations = Operations(fixture.lifecycle, onStop = {
+            entered.countDown()
+            check(release.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        })
+        val job = admission.reservation.launch(CoroutineScope(coroutineContext + Dispatchers.IO), operations)
+        try {
+            assertTrue(entered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            assertEquals(listOf("start", "stop"), operations.events)
+            assertTrue(admission.reservation.isActive())
+            assertFalse(fixture.registry.available())
+            assertEquals(MarkerState.CLEAR, fixture.marker.state)
+            fixture.assertSearchBusy()
+            fixture.assertPowerUnavailable()
+            assertEquals(0, fixture.port.starts)
+        } finally {
+            release.countDown()
+            withTimeout(TIMEOUT_MS) { job.join() }
+        }
+        assertNull(operations.failure)
+        assertTrue(fixture.registry.available())
+        val profiles = Input()
+        val preparation = fixture.activation.reserveSearch(1, 2, profiles) as SearchStartPreparation.Reserved
+        assertEquals(SearchStartV3.ACCEPTED, preparation.dispatch())
+        assertTrue(profiles.closed)
+        fixture.controller.cancel()
+        fixture.port.finishCancellation()
+        assertEquals(MarkerState.CLEAR, fixture.marker.state)
+    }
+
     @Test
     fun searchWaitsForConfirmedVpnCleanupAndRegistryRelease(): Unit = runBlocking {
         val fixture = Fixture()
@@ -139,6 +176,7 @@ class VpnRegistryActivationTest {
     private class Operations(
         private val lifecycle: VpnServiceLifecycle,
         private val failedPhase: String? = null,
+        private val onStop: () -> Unit = {},
     ) : VpnRunOperations<String, String> {
         val events = mutableListOf<String>()
         var failure: VpnRunFailure? = null
@@ -151,6 +189,7 @@ class VpnRegistryActivationTest {
 
         override fun stop(): Unit {
             events.add("stop")
+            onStop()
             if (failedPhase == "stop") throw IOException("synthetic")
         }
 
