@@ -300,10 +300,11 @@ internal class SearchEngineWorkerAdapter(
     }
 
     override fun close(generation: Long, cleanupMillis: Long): Long {
+        val started = nowNanos()
         val current = synchronized(lock) {
             val value = active
             if (value == null || value.identity.workerGeneration != generation || value.state != State.READY) return Mobile.SearchWorkerCleanupIncomplete
-            recordCleanupStart(value)
+            recordCleanupStart(value, started)
             if (cleanupMillis == this.cleanupMillis && !value.inFlight && fatal == null) value.state = State.CLOSING
             value
         }
@@ -316,6 +317,7 @@ internal class SearchEngineWorkerAdapter(
     }
 
     override fun cancel(generation: Long): Unit {
+        val started = nowNanos()
         val current = synchronized(lock) {
             if (generation <= 0) return
             val value = active
@@ -327,7 +329,7 @@ internal class SearchEngineWorkerAdapter(
                 return
             }
             value.cancelled = true
-            recordCleanupStart(value)
+            recordCleanupStart(value, started)
             value.openingWake?.countDown()
             value.callWake?.countDown()
             if (!value.dispatched || value.state == State.CLOSING || value.state == State.RETIRING || value.cancelling != null) return
@@ -344,15 +346,24 @@ internal class SearchEngineWorkerAdapter(
             if (value.identity.workerGeneration != generation) return
             if (fatal == null) fatal = fatalCode(reason)
             value.cancelled = true
-            recordCleanupStart(value)
             value.openingWake?.countDown()
             value.callWake?.countDown()
             val shouldCancel = value.dispatched && value.state != State.CLOSING && value.cancelling == null
             if (shouldCancel) value.cancelling = CountDownLatch(1)
             value to shouldCancel
         }
-        if (pending.second) dispatchCancel(pending.first)
-        scheduleCleanup(pending.first)
+        try {
+            Thread({
+                try {
+                    val started = nowNanos()
+                    synchronized(lock) { recordCleanupStart(pending.first, started) }
+                    if (pending.second) dispatchCancel(pending.first)
+                    scheduleCleanup(pending.first)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (_: Exception) { } catch (_: LinkageError) { }
+            }, "search-revoke-cleanup").apply { isDaemon = true }.start()
+        } catch (_: Exception) { } catch (_: LinkageError) { }
     }
 
     override fun progress(kind: Long, outcome: Long, attempt: Long, profile: Long, round: Long, probe: Long, bytes: Long, durationMillis: Long): Unit {
@@ -402,13 +413,13 @@ internal class SearchEngineWorkerAdapter(
         }
     }
 
-    private fun recordCleanupStart(round: Round): Long =
-        round.cleanupStarted ?: nowNanos().also { round.cleanupStarted = it }
+    private fun recordCleanupStart(round: Round, started: Long): Long =
+        round.cleanupStarted ?: started.also { round.cleanupStarted = it }
 
     private fun cleanupStart(round: Round): Long {
         synchronized(lock) { round.cleanupStarted }?.let { return it }
         val sampled = nowNanos()
-        return synchronized(lock) { round.cleanupStarted ?: sampled.also { round.cleanupStarted = it } }
+        return synchronized(lock) { recordCleanupStart(round, sampled) }
     }
 
     private fun remainingMillis(start: Long, budget: Long): Long {
@@ -574,7 +585,6 @@ internal class SearchEngineWorkerAdapter(
         val shouldCancel = synchronized(lock) {
             if (fatal == null) fatal = code
             round.cancelled = true
-            recordCleanupStart(round)
             round.openingWake?.countDown()
             round.callWake?.countDown()
             if (!round.dispatched || round.cancelling != null) false else {
@@ -582,6 +592,8 @@ internal class SearchEngineWorkerAdapter(
                 true
             }
         }
+        val started = nowNanos()
+        synchronized(lock) { recordCleanupStart(round, started) }
         if (shouldCancel) dispatchCancel(round)
         scheduleCleanup(round)
         return synchronized(lock) { fatal ?: code }
