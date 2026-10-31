@@ -132,28 +132,6 @@ func (d searchSocketDialer) DialTCP(ctx context.Context, address string) (net.Co
 	return d.factory.DialContext(ctx, "tcp", address, searchControl(d.owner, SearchRoleSOCKSControl))
 }
 
-func (d searchSocketDialer) DialUDP(ctx context.Context, relay *net.UDPAddr) (socks.UDPConn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if relay == nil || !relay.IP.IsLoopback() || d.owner == nil || d.factory == nil ||
-		!searchCurrent(d.owner) {
-		return nil, errors.New("search_socket_denied")
-	}
-	conn, err := d.factory.DialContext(ctx, "udp", relay.String(), searchControl(d.owner, SearchRoleSOCKSRelay))
-	if err != nil {
-		return nil, err
-	}
-	udp, ok := conn.(socks.UDPConn)
-	if !ok {
-		if conn != nil {
-			_ = conn.Close()
-		}
-		return nil, errors.New("search_socket_unavailable")
-	}
-	return udp, nil
-}
-
 func searchProxy(owner *protection, address, user, password string) (socks.Endpoint, error) {
 	if !searchCurrent(owner) {
 		return socks.Endpoint{}, errors.New("search_network_unavailable")

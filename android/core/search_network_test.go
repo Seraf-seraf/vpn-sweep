@@ -97,11 +97,8 @@ func TestAndroidSearchSocketRolesUseOneOwner(t *testing.T) {
 	if _, err := dialer.DialTCP(context.Background(), "127.0.0.1:1080"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dialer.DialUDP(context.Background(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1080}); err != nil {
-		t.Fatal(err)
-	}
-	want := []int{SearchRoleXrayDial, SearchRoleXrayListener, SearchRoleDNS, SearchRoleSOCKSReservation, SearchRoleSOCKSControl, SearchRoleSOCKSRelay}
-	if !reflect.DeepEqual(owner.roles, want) || !reflect.DeepEqual(factory.networks, []string{"tcp", "udp"}) {
+	want := []int{SearchRoleXrayDial, SearchRoleXrayListener, SearchRoleDNS, SearchRoleSOCKSReservation, SearchRoleSOCKSControl}
+	if !reflect.DeepEqual(owner.roles, want) || !reflect.DeepEqual(factory.networks, []string{"tcp"}) {
 		t.Fatalf("roles=%v networks=%v", owner.roles, factory.networks)
 	}
 }
@@ -184,7 +181,7 @@ func TestAndroidSearchSocketFactoryRejectsNoOwnerAndNoFallback(t *testing.T) {
 		t.Fatal("non-loopback proxy accepted")
 	}
 	owner.current = false
-	if _, err := dialer.DialUDP(context.Background(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1080}); err == nil {
+	if _, err := dialer.DialTCP(context.Background(), "127.0.0.1:1080"); err == nil {
 		t.Fatal("stale network accepted")
 	}
 	if len(factory.networks) != 0 {
