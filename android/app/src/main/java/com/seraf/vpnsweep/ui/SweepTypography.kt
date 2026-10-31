@@ -1,5 +1,6 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.ui
 
+import com.seraf.vpnsweep.R
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily

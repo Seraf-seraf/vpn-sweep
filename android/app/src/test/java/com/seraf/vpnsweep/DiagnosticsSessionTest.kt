@@ -1,5 +1,8 @@
 package com.seraf.vpnsweep
 
+import com.seraf.vpnsweep.diagnostics.DiagnosticsCoordinator
+import com.seraf.vpnsweep.vpn.VpnRunRegistry
+import com.seraf.vpnsweep.vpn.VpnServiceLifecycle
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit

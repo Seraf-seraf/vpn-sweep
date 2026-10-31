@@ -1,4 +1,4 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.vpn
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope

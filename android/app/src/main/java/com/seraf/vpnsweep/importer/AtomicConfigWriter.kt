@@ -1,4 +1,4 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.importer
 
 import android.util.AtomicFile
 

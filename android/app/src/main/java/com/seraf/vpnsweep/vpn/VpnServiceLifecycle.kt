@@ -1,4 +1,4 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.vpn
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher

@@ -1,5 +1,7 @@
 package com.seraf.vpnsweep
 
+import com.seraf.vpnsweep.ui.isValidSubscriptionUrl
+import com.seraf.vpnsweep.ui.updateVisibleSelection
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

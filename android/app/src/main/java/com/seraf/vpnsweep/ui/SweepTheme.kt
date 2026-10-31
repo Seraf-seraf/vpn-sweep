@@ -1,4 +1,4 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.ui
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme

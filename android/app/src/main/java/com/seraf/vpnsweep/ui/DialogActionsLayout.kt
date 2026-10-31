@@ -1,4 +1,4 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.ui
 
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalDensity

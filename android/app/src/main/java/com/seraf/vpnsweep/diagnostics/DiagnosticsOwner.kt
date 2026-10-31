@@ -1,4 +1,4 @@
-package com.seraf.vpnsweep
+package com.seraf.vpnsweep.diagnostics
 
 import java.util.ArrayDeque
 import kotlinx.coroutines.CoroutineScope
