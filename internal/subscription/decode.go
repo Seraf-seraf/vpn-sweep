@@ -146,11 +146,11 @@ func ParseSubscription(ctx context.Context, data []byte, limits DecodeLimits) (B
 		}
 		if !safe {
 			rec.Reason = "unsupported_record"
-		} else if result, err := importer.Parse(line, "uri"); err != nil || len(result.Profiles) != 1 {
+		} else if profile, ok := convertSubscriptionRecord(string(line)); !ok {
 			rec.Reason = "unsupported_record"
 		} else {
 			rec.Supported = true
-			batch.profiles[id] = result.Profiles[0]
+			batch.profiles[id] = profile
 		}
 		if ctx.Err() != nil {
 			return fail(contextErrorCode(ctx))
@@ -176,6 +176,12 @@ func safeURI(raw string) bool {
 	}
 	if strings.HasPrefix(raw, "vmess://") {
 		encoded := strings.SplitN(strings.TrimPrefix(raw, "vmess://"), "#", 2)[0]
+		if prefix, query, ok := strings.Cut(encoded, "?"); ok {
+			if _, err := url.ParseQuery(query); err != nil {
+				return false
+			}
+			encoded = prefix
+		}
 		var b []byte
 		var err error
 		for _, enc := range []*base64.Encoding{base64.StdEncoding.Strict(), base64.RawStdEncoding.Strict(), base64.URLEncoding.Strict(), base64.RawURLEncoding.Strict()} {
@@ -224,8 +230,15 @@ func safeURI(raw string) bool {
 		}
 		return true
 	}
-	if strings.HasPrefix(raw, "ss://") && !strings.Contains(raw, "@") {
-		encoded := strings.SplitN(strings.TrimPrefix(raw, "ss://"), "#", 2)[0]
+	beforeFragment, _, _ := strings.Cut(raw, "#")
+	authority, query, hasQuery := strings.Cut(beforeFragment, "?")
+	if strings.HasPrefix(raw, "ss://") && !strings.Contains(authority, "@") {
+		if hasQuery {
+			if _, err := url.ParseQuery(query); err != nil {
+				return false
+			}
+		}
+		encoded := strings.TrimPrefix(authority, "ss://")
 		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
 			if b, err := enc.DecodeString(encoded); err == nil {
 				decoded, err := url.PathUnescape(string(b))
@@ -317,4 +330,42 @@ func validSurrogates(data []byte) bool {
 		}
 	}
 	return true
+}
+
+func stripProviderHints(raw string) string {
+	beforeFragment, fragment, hasFragment := strings.Cut(raw, "#")
+	base, query, hasQuery := strings.Cut(beforeFragment, "?")
+	if !hasQuery {
+		return raw
+	}
+	if _, err := url.ParseQuery(query); err != nil {
+		return raw
+	}
+	kept := make([]string, 0)
+	removed := false
+	for _, part := range strings.Split(query, "&") {
+		if part == "" {
+			continue
+		}
+		key, _, _ := strings.Cut(part, "=")
+		name, err := url.QueryUnescape(key)
+		if err != nil {
+			return raw
+		}
+		if strings.HasPrefix(name, "x-durev-") {
+			removed = true
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if !removed {
+		return raw
+	}
+	if len(kept) > 0 {
+		base += "?" + strings.Join(kept, "&")
+	}
+	if hasFragment {
+		base += "#" + fragment
+	}
+	return base
 }

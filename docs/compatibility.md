@@ -23,3 +23,15 @@ Advanced fragmentation, array/RandRange and IP-preference mapping are unsupporte
 Full JSON passthrough does not imply UI settings are applied.
 
 Android device acceptance and actual target-core config validation remain separate from compile-time support.
+
+## Imported fragment baseline and private state
+
+Private runs without an imported fragment baseline retain manifest schema version 1 and
+their existing profile serialization and identities. New runs that store an imported
+fragment baseline declare manifest schema version 2. The current reader supports both;
+it does not rewrite existing runs. The independent search algorithm version is unchanged.
+
+An older strict reader cannot resume a version 2 run and rejects it instead of silently
+dropping the baseline. This is not a transparent rollback. Keep existing state and last
+verified results; use a compatible version to read the new run, or start a new search
+with a new state directory. No data deletion or automatic migration is required.

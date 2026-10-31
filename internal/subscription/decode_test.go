@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 )
 
@@ -213,6 +214,73 @@ func TestSubscriptionContextClassificationPure(t *testing.T) {
 		_, err := ParseSubscription(tc.ctx, []byte("socks5://node.invalid:1"), decodeLimits())
 		if model.Code(err) != tc.code {
 			t.Fatal("context classification")
+		}
+	}
+}
+
+func TestSubscriptionProviderHintsPure(t *testing.T) {
+	for _, raw := range []string{
+		"vless://synthetic-id@node.invalid:443?security=tls&x-durev-flag=synthetic-marker",
+		"vless://synthetic-id@node.invalid:443?security=tls&x%2Ddurev%2Dflag=synthetic-marker&x-durev-flag=synthetic-marker",
+	} {
+		batch, err := ParseSubscription(context.Background(), []byte(raw), decodeLimits())
+		if err != nil || len(batch.Records) != 1 || !batch.Records[0].Supported {
+			t.Fatal("provider hint rejected")
+		}
+		b, _ := json.Marshal(batch)
+		if strings.Contains(string(b), "synthetic-marker") || strings.Contains(fmt.Sprintf("%#v", batch), "synthetic-marker") {
+			t.Fatal("hint leaked")
+		}
+		p, ok := batch.Profile(batch.Records[0].ID)
+		if !ok {
+			t.Fatal("missing profile")
+		}
+		b, _ = json.Marshal(p)
+		if strings.Contains(string(b), "synthetic-marker") {
+			t.Fatal("hint retained in profile")
+		}
+		if _, err := importer.Parse([]byte(raw), "uri"); err == nil {
+			t.Fatal("CLI importer contract changed")
+		}
+	}
+	for _, raw := range []string{
+		"vless://synthetic-id@node.invalid:443?security=tls&X-durev-flag=x",
+		"vless://synthetic-id@node.invalid:443?security=tls&x-durev-flag=x&unknown=x",
+		"vless://synthetic-id@node.invalid:443?security=tls&security=tls&x-durev-flag=x",
+		"vless://synthetic-id@node.invalid:443?security=tls&x-durev-flag=%FF",
+		"vless://synthetic-id@node.invalid:443?security=tls&x-durev-flag=%ZZ",
+	} {
+		if _, err := ParseSubscription(context.Background(), []byte(raw), decodeLimits()); model.Code(err) != "no_supported_profiles" {
+			t.Fatal("invalid hint input accepted")
+		}
+	}
+	raw := "socks5://node.invalid:1?x-durev-flag=a\nsocks5://node.invalid:1?x-durev-flag=b"
+	batch, err := ParseSubscription(context.Background(), []byte(raw), decodeLimits())
+	if err != nil || len(batch.Records) != 2 || batch.Records[0].ID == batch.Records[1].ID {
+		t.Fatal("hints deduplicated")
+	}
+}
+
+func TestSubscriptionFullBase64SSHintsPure(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte("aes-128-gcm:synthetic-password@node.invalid:8388"))
+	base := "ss://" + encoded
+	for _, suffix := range []string{"", "?x-durev-flag=synthetic-marker", "?x%2Ddurev%2Dflag=synthetic-marker&x-durev-flag=other"} {
+		batch, err := ParseSubscription(context.Background(), []byte(base+suffix), decodeLimits())
+		if err != nil || len(batch.Records) != 1 || !batch.Records[0].Supported {
+			t.Fatal("full Base64 SS hint rejected")
+		}
+		profile, ok := batch.Profile(batch.Records[0].ID)
+		if !ok {
+			t.Fatal("missing SS profile")
+		}
+		b, _ := json.Marshal(profile)
+		if strings.Contains(string(b), "synthetic-marker") {
+			t.Fatal("hint retained")
+		}
+	}
+	for _, suffix := range []string{"?unknown=x", "?x-durev-flag=x&unknown=x", "?x-durev-flag=%FF", "?x-durev-flag=%ZZ", "?x-durev-flag=x&security=tls&security=tls"} {
+		if _, err := ParseSubscription(context.Background(), []byte(base+suffix), decodeLimits()); model.Code(err) != "no_supported_profiles" {
+			t.Fatal("invalid SS query accepted")
 		}
 	}
 }

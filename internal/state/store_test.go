@@ -115,7 +115,7 @@ func TestIntegrityAndVersions(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if s.SaveManifest(model.Manifest{Version: 2}, nil, nil) == nil {
+	if s.SaveManifest(model.Manifest{Version: model.FragmentProfileSchemaVersion + 1}, nil, nil) == nil {
 		t.Fatal("unknown version accepted")
 	}
 	s.Close()

@@ -12,6 +12,7 @@ import (
 )
 
 const SchemaVersion = 1
+const FragmentProfileSchemaVersion = 2
 const SearchVersion = 3
 const LegacySearchVersion = 2
 const TargetCommit = "ac5d8a83ba798c390cd89f235c3d4c35c77c1586"
@@ -32,9 +33,31 @@ func Code(err error) string {
 	return "internal_error"
 }
 
-type Profile struct {
-	Outbound map[string]any `json:"outbound"`
+type FragmentBaseline struct {
+	Length   string  `json:"length"`
+	Interval string  `json:"interval"`
+	Packets  string  `json:"packets"`
+	MaxSplit *string `json:"maxSplit,omitempty"`
 }
+
+type Profile struct {
+	Outbound map[string]any    `json:"outbound"`
+	Fragment *FragmentBaseline `json:"fragment,omitempty"`
+}
+
+func ProfileSchemaVersion(profiles []Profile) int {
+	for _, p := range profiles {
+		if p.Fragment != nil {
+			return FragmentProfileSchemaVersion
+		}
+	}
+	return SchemaVersion
+}
+
+func SupportsProfileSchemaVersion(version int, profiles []Profile) bool {
+	return (version == SchemaVersion || version == FragmentProfileSchemaVersion) && version >= ProfileSchemaVersion(profiles)
+}
+
 type Candidate struct {
 	Profile int            `json:"profile"`
 	Params  map[string]any `json:"params"`
