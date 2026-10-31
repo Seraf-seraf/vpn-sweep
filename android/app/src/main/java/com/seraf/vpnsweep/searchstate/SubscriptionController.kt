@@ -35,7 +35,12 @@ internal class SubscriptionController(
     private val commitSource: (SubscriptionSnapshotV1) -> ResultRevision,
     private val commitSelection: (Set<String>) -> ResultRevision,
 ) : SubscriptionObserverV1 {
-    private class Request(val generation: Long, var cancelled: Boolean = false, var dispatching: Boolean = true)
+    private class Request(
+        val generation: Long,
+        var cancelled: Boolean = false,
+        var dispatching: Boolean = true,
+        var callbackProcessed: Boolean = false,
+    )
     private val mutableState = MutableStateFlow(SubscriptionUiState())
     val state: StateFlow<SubscriptionUiState> = mutableState.asStateFlow()
     private var nextGeneration = 0L
@@ -88,15 +93,24 @@ internal class SubscriptionController(
         val result = try {
             port.start(current.generation, input, this)
         } catch (failure: Throwable) {
-            synchronized(this) {
+            val callbackProcessed = synchronized(this) {
                 current.dispatching = false
-                if (request === current) {
-                    request = null
-                    mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                if (current.callbackProcessed) {
+                    true
+                } else {
+                    if (request === current) {
+                        request = null
+                        mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                    }
+                    false
                 }
             }
             if (failure !is Exception) throw failure
-            return SubscriptionLoadResult(SubscriptionStartV1.REJECTED)
+            return if (callbackProcessed) {
+                SubscriptionLoadResult(SubscriptionStartV1.ACCEPTED, current.generation)
+            } else {
+                SubscriptionLoadResult(SubscriptionStartV1.REJECTED)
+            }
         }
         val sendCancel = synchronized(this) {
             current.dispatching = false
@@ -132,6 +146,7 @@ internal class SubscriptionController(
             closeResource(snapshot)
             return
         }
+        current.callbackProcessed = true
         request = null
         if (pendingClose.isNotEmpty()) {
             closeResource(snapshot)
@@ -182,7 +197,9 @@ internal class SubscriptionController(
 
     @Synchronized
     override fun onFailure(generation: Long, failure: SubscriptionFailureV1): Unit {
-        if (request?.generation != generation) return
+        val current = request
+        if (current == null || current.generation != generation) return
+        current.callbackProcessed = true
         request = null
         if (pendingClose.isNotEmpty()) {
             mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)

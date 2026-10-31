@@ -308,6 +308,48 @@ class SubscriptionControllerTest {
     }
 
     @Test
+    fun startExceptionAfterSynchronousFailurePreservesAcceptedReceipt(): Unit {
+        val port = FakeSubscriptionPort()
+        port.onStart = { generation, observer ->
+            observer.onFailure(generation, SubscriptionFailureV1.TIMEOUT)
+            throw IllegalStateException("synthetic")
+        }
+        val controller = legacyController(port, search(), { true }, { true }, { ResultRevision("1", "2") })
+
+        val result = controller.loadWithReceipt("synthetic")
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, result.status)
+        assertEquals(1L, result.generation)
+        assertEquals(SubscriptionPhase.FAILED, controller.state.value.phase)
+        assertEquals(SubscriptionFailureV1.TIMEOUT, controller.state.value.failure)
+        assertFalse(controller.state.value.requestActive)
+        assertEquals(1L, controller.state.value.generation)
+    }
+
+    @Test
+    fun startExceptionAfterSynchronousParsedResultPreservesCommittedReceipt(): Unit {
+        val port = FakeSubscriptionPort()
+        var sourceCommits = 0
+        val controller = legacyController(port, search(), { sourceCommits++; true }, { true }, { ResultRevision("1", "2") })
+        val snapshot = Snapshot(listOf(record("accepted", true)))
+        port.onStart = { generation, observer ->
+            observer.onParsed(generation, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+            throw IllegalStateException("synthetic")
+        }
+
+        val result = controller.loadWithReceipt("synthetic")
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, result.status)
+        assertEquals(1L, result.generation)
+        assertEquals(1, sourceCommits)
+        assertEquals(SubscriptionPhase.READY, controller.state.value.phase)
+        assertEquals(listOf("accepted"), controller.state.value.records.map { it.id })
+        assertFalse(snapshot.closed)
+        assertFalse(controller.state.value.requestActive)
+        assertEquals(1L, controller.state.value.generation)
+    }
+
+    @Test
     fun selectionCommitAndSearchReadRevisionsUnderSameGuard(): Unit {
         val port = FakeSubscriptionPort()
         val runtime = FakeSearchPort()
