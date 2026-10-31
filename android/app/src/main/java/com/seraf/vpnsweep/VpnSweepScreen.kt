@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,8 +19,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -48,7 +51,9 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.platform.LocalDensity
@@ -82,6 +87,8 @@ fun VpnSweepScreen(
     onRunChecks: () -> Unit,
     onSubscription: () -> Unit,
     onServers: () -> Unit,
+    permissionMessage: String = "",
+    contentWindowInsets: WindowInsets = WindowInsets.safeDrawing,
 ) {
     val busy = state.phase in setOf(VpnPhase.CONNECTING, VpnPhase.RUNNING, VpnPhase.STOPPING)
     val powerEnabled = selected && !importing && state.phase != VpnPhase.STOPPING
@@ -103,6 +110,7 @@ fun VpnSweepScreen(
     Box(Modifier.fillMaxSize().background(ScreenBackground), contentAlignment = Alignment.TopCenter) {
         Column(
             modifier = Modifier
+                .windowInsetsPadding(contentWindowInsets)
                 .widthIn(max = 600.dp)
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
@@ -140,6 +148,16 @@ fun VpnSweepScreen(
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center,
             )
+            if (permissionMessage.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = permissionMessage,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    color = SweepColors.error,
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center,
+                )
+            }
             Spacer(Modifier.height(20.dp))
             SweepButton(
                 text = "Добавить подписку",

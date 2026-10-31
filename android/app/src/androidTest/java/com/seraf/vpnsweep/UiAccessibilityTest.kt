@@ -2,8 +2,10 @@ package com.seraf.vpnsweep
 
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
@@ -12,7 +14,9 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -21,6 +25,7 @@ import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -70,6 +75,43 @@ class UiAccessibilityTest {
             }
         }
         compose.onNodeWithContentDescription("Подключить VPN").assertIsNotEnabled()
+    }
+
+    @Test
+    fun permissionFailureIsAnnouncedNearPower(): Unit {
+        compose.setContent {
+            SweepTheme {
+                VpnSweepScreen(
+                    state = VpnState(), selected = true, importing = false, message = "",
+                    testing = false, checkResults = emptyList(),
+                    onPower = {}, onImport = {}, onRunChecks = {}, onSubscription = {}, onServers = {},
+                    permissionMessage = "Подключение VPN не разрешено",
+                )
+            }
+        }
+        compose.onNodeWithText("Подключение VPN не разрешено")
+            .assertIsDisplayed()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.LiveRegion, LiveRegionMode.Polite))
+    }
+
+    @Test
+    fun screenKeepsContentWithinSafeInsets(): Unit {
+        compose.setContent {
+            SweepTheme {
+                VpnSweepScreen(
+                    state = VpnState(), selected = false, importing = false, message = "",
+                    testing = false, checkResults = emptyList(),
+                    onPower = {}, onImport = {}, onRunChecks = {}, onSubscription = {}, onServers = {},
+                    contentWindowInsets = WindowInsets(left = 0.dp, top = 64.dp, right = 0.dp, bottom = 96.dp),
+                )
+            }
+        }
+        val titleTop = compose.onNodeWithText("VPN Sweep").getUnclippedBoundsInRoot().top
+        assertTrue(titleTop >= 64.dp)
+        val lastButton = compose.onNodeWithText("Проверить TCP, UDP и DNS").performScrollTo()
+        val buttonBottom = lastButton.getUnclippedBoundsInRoot().bottom
+        val rootBottom = compose.onRoot().getUnclippedBoundsInRoot().bottom
+        assertTrue(buttonBottom <= rootBottom - 96.dp)
     }
 
     @Test

@@ -33,18 +33,28 @@ class MainActivity : ComponentActivity() {
             var selected by remember { mutableStateOf(File(noBackupFilesDir, SweepVpnService.CONFIG_NAME).exists()) }
             var importing by remember { mutableStateOf(false) }
             var message by remember { mutableStateOf("") }
+            var permissionMessage by remember { mutableStateOf("") }
             var testing by remember { mutableStateOf(false) }
             var checkResults by remember { mutableStateOf(emptyList<String>()) }
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
             val busy = state.phase in setOf(VpnPhase.CONNECTING, VpnPhase.RUNNING, VpnPhase.STOPPING)
             val permission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-                if (result.resultCode == RESULT_OK) startVpn()
-                else message = "Подключение VPN не разрешено"
+                if (result.resultCode == RESULT_OK) {
+                    permissionMessage = ""
+                    startVpn()
+                } else {
+                    permissionMessage = "Подключение VPN не разрешено"
+                }
             }
             val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
                 val intent = VpnService.prepare(this@MainActivity)
-                if (intent == null) startVpn() else permission.launch(intent)
+                if (intent == null) {
+                    permissionMessage = ""
+                    startVpn()
+                } else {
+                    permission.launch(intent)
+                }
             }
             val document = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 if (uri != null) {
@@ -116,6 +126,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onSubscription = { subscriptionOpen = true },
                     onServers = { serversOpen = true },
+                    permissionMessage = permissionMessage,
                 )
                 if (subscriptionOpen) {
                     SubscriptionDialog(onDismiss = { subscriptionOpen = false })
