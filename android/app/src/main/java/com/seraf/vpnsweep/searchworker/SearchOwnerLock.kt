@@ -3,6 +3,7 @@ package com.seraf.vpnsweep.searchworker
 import android.content.Context
 import android.os.ParcelFileDescriptor
 import com.seraf.vpnsweep.searchprotocol.SearchLeaseDuplicateV1
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal sealed interface OwnerAcquisition {
     class Acquired(val lease: SearchOwnerLease) : OwnerAcquisition
@@ -76,30 +77,45 @@ internal object SearchOwnerLock {
     private external fun nativeWorkerFileAndEnvironmentValid(directory: String, fd: Int): Boolean
 }
 
-internal class SearchOwnerLease internal constructor(private var fd: Int) : AutoCloseable {
-    private var workerOutstanding = false
+internal class SearchOwnerLease internal constructor(private var fd: Int) : AutoCloseable, CoordinatorLease {
+    private val workerOutstanding = AtomicBoolean()
+    private val quarantined = AtomicBoolean()
+    private var duplicateIssued = false
 
     @Synchronized
-    fun duplicate(): WorkerLeaseDuplicate? {
-        if (fd < 0 || workerOutstanding) return null
+    fun reserveWorker(): Boolean {
+        if (fd < 0 || workerOutstanding.get() || quarantined.get()) return false
+        workerOutstanding.set(true)
+        duplicateIssued = false
+        return true
+    }
+
+    @Synchronized
+    override fun duplicate(): WorkerLeaseDuplicate? {
+        if (fd < 0 || !workerOutstanding.get() || duplicateIssued || quarantined.get()) return null
         val duplicate = SearchOwnerLock.duplicate(fd) ?: return null
-        workerOutstanding = true
+        duplicateIssued = true
         return duplicate
     }
 
     @Synchronized
-    fun mayLoadMobile(): Boolean = fd >= 0 && SearchOwnerLock.ownerMayLoad(fd)
+    fun mayLoadMobile(): Boolean = !quarantined.get() && fd >= 0 && SearchOwnerLock.ownerMayLoad(fd) && !quarantined.get()
 
     @Synchronized
-    fun anchorHeldForWorker(): Boolean = workerOutstanding && fd >= 0 && SearchOwnerLock.ownerMayLoad(fd)
+    override fun anchorHeldForWorker(): Boolean = !quarantined.get() && workerOutstanding.get() && fd >= 0 &&
+        SearchOwnerLock.ownerMayLoad(fd) && !quarantined.get()
 
-    @Synchronized
-    fun workerDeathConfirmed(): Unit { workerOutstanding = false }
+    override fun workerDeathConfirmed(): Unit {
+        check(!quarantined.get() && workerOutstanding.compareAndSet(true, false)) { "worker_death_not_releasable" }
+    }
+
+    override fun quarantine(): Unit { quarantined.set(true) }
 
     @Synchronized
     override fun close(): Unit {
         if (fd < 0) return
-        check(!workerOutstanding) { "worker_death_unconfirmed" }
+        check(!quarantined.get()) { "owner_quarantined" }
+        check(!workerOutstanding.get()) { "worker_death_unconfirmed" }
         val original = fd
         fd = -1
         check(SearchOwnerLock.close(original)) { "owner_lock_close_failed" }
