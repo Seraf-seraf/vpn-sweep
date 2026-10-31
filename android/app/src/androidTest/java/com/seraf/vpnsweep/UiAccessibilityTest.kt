@@ -47,7 +47,9 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextInputSelection
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -169,6 +171,54 @@ class UiAccessibilityTest {
         compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().performClick()
         compose.onNodeWithContentDescription("Ссылка").assertTextContains("https://example.com/sub")
         compose.onNodeWithText("Введите корректную ссылку").assertDoesNotExist()
+    }
+
+    @Test
+    fun emptyUrlHintStaysSingleLineAndEditingRemainsAccessible(): Unit {
+        var width by mutableStateOf(312.dp)
+        val clipboard = TestClipboard(AnnotatedString("https://example.com/other"))
+        compose.setContent {
+            var link by remember { mutableStateOf("") }
+            val density = LocalDensity.current
+            val status = when {
+                link.isEmpty() -> SubscriptionDialogStatus.Empty
+                link == "invalid" -> SubscriptionDialogStatus.InvalidUrl
+                else -> SubscriptionDialogStatus.Input
+            }
+            CompositionLocalProvider(
+                LocalDensity provides Density(density.density, fontScale = 1f),
+                LocalClipboardManager provides clipboard,
+            ) {
+                SweepTheme {
+                    Box(Modifier.size(width = width, height = 640.dp)) {
+                        SubscriptionDialogContent(link, status, { link = it }, {}, {})
+                    }
+                }
+            }
+        }
+        val field = compose.onNodeWithContentDescription("Ссылка")
+        for (nextWidth in listOf(312.dp, 272.dp)) {
+            compose.runOnIdle { width = nextWidth }
+            field.assertIsDisplayed().assertHeightIsAtLeast(56.dp)
+            val bounds = field.getUnclippedBoundsInRoot()
+            assertTrue(bounds.bottom - bounds.top <= 57.dp)
+            compose.onNodeWithText("https://example.com/sub/...", useUnmergedTree = true).assertExists()
+            compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().assertHeightIsAtLeast(48.dp)
+        }
+        field.performTextInput("invalid")
+        field.assert(SemanticsMatcher.expectValue(SemanticsProperties.Error, "Введите корректную ссылку"))
+        compose.onNodeWithText("Введите корректную ссылку").assertIsDisplayed()
+        field.performTextInputSelection(TextRange(0, 7))
+        field.assert(SemanticsMatcher.expectValue(SemanticsProperties.TextSelectionRange, TextRange(0, 7)))
+        field.performTextInput("https://example.com/sub")
+        field.assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("https://example.com/sub")),
+        )
+        compose.onNodeWithText("Введите корректную ссылку").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().performClick()
+        field.assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("https://example.com/other")),
+        )
     }
 
     @Test
