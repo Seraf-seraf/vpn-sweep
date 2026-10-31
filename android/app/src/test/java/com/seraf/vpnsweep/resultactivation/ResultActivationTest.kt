@@ -1,6 +1,7 @@
 package com.seraf.vpnsweep.resultactivation
 
 import com.seraf.vpnsweep.importer.MAX_CONFIG_BYTES
+import com.seraf.vpnsweep.SearchLeaseReceiptV1
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
 import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
@@ -51,7 +52,7 @@ class ResultActivationTest {
     @Test
     fun onlyVerifiedCurrentBytesAreAdmittedAndVpnStateBlocksSearch(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         assertTrue(f.activation.ready())
         val token = Any()
         val result = f.activation.admitVpn {
@@ -71,9 +72,9 @@ class ResultActivationTest {
     }
 
     @Test
-    fun mismatchedRevisionsAndUnusableRecordsFailClosedWithoutDiscardingPrevious(): Unit {
+    fun mismatchedRevisionsAndMissingLastGoodGenerationFailClosedWithoutDiscardingPrevious(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         for (next in listOf(ResultRevision("3", "2"), ResultRevision("1", "4"))) {
             assertTrue(f.activation.withSourceMutation { f.revisions.update(next) })
             assertFalse(f.activation.ready())
@@ -85,11 +86,13 @@ class ResultActivationTest {
         assertUnavailable(f)
         f.revisionStorage.failRead = false
         f.storage.failManifestRead = true
-        assertUnavailable(f)
+        assertTrue(f.activation.ready())
+        assertArrayEquals(previous, (f.activation.admitVpn { f.vpnBusy = true; Any() } as VpnAdmission.Admitted).bytes)
+        f.vpnBusy = false
         f.storage.failManifestRead = false
         val saved = f.storage.manifest!!
         f.storage.manifest = null
-        assertUnavailable(f)
+        assertTrue(f.activation.ready())
         f.storage.manifest = saved
         val data = f.storage.generations.remove(saved.generation)!!
         assertUnavailable(f)
@@ -101,7 +104,7 @@ class ResultActivationTest {
     @Test
     fun checksExactBytesAndMetadataAgainAfterStoreResolution(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val alterations: List<(Data) -> Data?> = listOf(
             { it.copy(bytes = "different".toByteArray()) },
             { it.copy(revision = ResultRevision("other", "2")) },
@@ -110,7 +113,7 @@ class ResultActivationTest {
         )
         for (alter in alterations) {
             f.storage.reads = 0
-            f.storage.transformRead = { count, data -> if (count == 2) alter(data) else data }
+            f.storage.transformRead = { count, data -> if (count == 1) alter(data) else data }
             assertUnavailable(f)
         }
         f.storage.transformRead = { _, data -> data }
@@ -119,19 +122,19 @@ class ResultActivationTest {
     }
 
     @Test
-    fun closesBothStoreReadStreamsAndDeniesWhenTheActivationReadCannotClose(): Unit {
+    fun closesSavedGenerationStreamAndDeniesWhenTheActivationReadCannotClose(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         f.storage.reads = 0
         f.storage.closes = 0
         assertTrue(f.activation.ready())
-        assertEquals(2, f.storage.reads)
-        assertEquals(2, f.storage.closes)
+        assertEquals(1, f.storage.reads)
+        assertEquals(1, f.storage.closes)
         f.storage.reads = 0
         f.storage.closes = 0
-        f.storage.failCloseAt = 2
+        f.storage.failCloseAt = 1
         assertUnavailable(f)
-        assertEquals(2, f.storage.closes)
+        assertEquals(1, f.storage.closes)
     }
 
     @Test
@@ -139,7 +142,7 @@ class ResultActivationTest {
         for (size in listOf(0, 1, MAX_CONFIG_BYTES - 1, MAX_CONFIG_BYTES, MAX_CONFIG_BYTES + 1)) {
             val f = Fixture()
             val bytes = ByteArray(size) { (it % 251).toByte() }
-            f.publish(bytes)
+            f.publishClean(bytes)
             assertEquals(size in 1..MAX_CONFIG_BYTES, f.activation.ready())
             var called = false
             val outcome = f.activation.admitVpn {
@@ -156,7 +159,7 @@ class ResultActivationTest {
     @Test
     fun markerIsReadAtEachAdmissionAndUnknownNeverMeansClear(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         for (state in listOf(MarkerState.ACTIVE, MarkerState.UNKNOWN)) {
             f.marker.value = state
             assertFalse(f.activation.ready())
@@ -172,7 +175,7 @@ class ResultActivationTest {
     }
 
     @Test
-    fun uncertainClearRecoversOnlyAfterVerifiedMarkerRevisionAndHash(): Unit {
+    fun stoppedTerminalCannotRestoreReadinessWithoutCleanCompleteReceipt(): Unit {
         for (failureAfterWrite in listOf(false, true)) {
             val f = Fixture()
             f.publish(previous)
@@ -195,7 +198,14 @@ class ResultActivationTest {
             val recoveryPort = Port()
             val recoveredStore = ResultStore(f.storage)
             val recoveredController = SearchController(recoveryPort, recoveredStore, f.marker)
-            val recovered = ResultActivation(recoveredController, recoveredStore, f.storage, f.revisions, f.marker) { true }
+            val recovered = ResultActivation(
+                recoveredController,
+                f.storage,
+                f.revisions,
+                f.marker,
+                { true },
+                f.completionReceipts,
+            )
             if (!failureAfterWrite) {
                 assertEquals(SearchPhase.INTERRUPTED, recoveredController.state.value.phase)
                 assertFalse(recovered.ready())
@@ -204,7 +214,7 @@ class ResultActivationTest {
 
             assertEquals(SearchPhase.IDLE, recoveredController.state.value.phase)
             assertEquals(0, recoveryPort.starts)
-            assertTrue(recovered.ready())
+            assertFalse(recovered.ready())
             assertEquals(0, recoveryPort.starts)
             f.revisionStorage.value = ResultRevision("3", "2")
             assertFalse(recovered.ready())
@@ -219,7 +229,7 @@ class ResultActivationTest {
     @Test
     fun ambiguousReservationPermanentlyBlocksThisCoordinator(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val outcome = f.activation.admitVpn<Any> {
             f.vpnBusy = true
             throw IOException("synthetic")
@@ -234,7 +244,7 @@ class ResultActivationTest {
     @Test
     fun reservationContradictingStateReturnsOnlyCleanupHandle(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val handle = Any()
         val outcome = f.activation.admitVpn { handle }
         assertSame(handle, (outcome as VpnAdmission.Unknown).cleanupReservation)
@@ -245,7 +255,7 @@ class ResultActivationTest {
     @Test
     fun unreadableVpnStateAfterReservationReturnsOnlyCleanupHandle(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val handle = Any()
         val outcome = f.activation.admitVpn {
             f.vpnBusy = true
@@ -262,7 +272,7 @@ class ResultActivationTest {
     @Test
     fun searchReadsVpnStateAfterConcurrentPowerReservation(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val admission = async {
@@ -287,7 +297,7 @@ class ResultActivationTest {
     @Test
     fun concurrentPowerRequestsCannotBothReserve(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val first = async {
@@ -311,7 +321,7 @@ class ResultActivationTest {
     @Test
     fun reentrantSearchDuringReservationCannotUseDisconnectedSnapshot(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val admission = f.activation.admitVpn {
             assertEquals(SearchStartV3.BUSY, denied(f.activation.reserveSearch(1, 2, Input())))
             f.vpnBusy = true
@@ -324,7 +334,7 @@ class ResultActivationTest {
     @Test
     fun reentrantAdmissionDuringSourceMutationCannotUsePartialState(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         assertTrue(f.activation.withSourceMutation {
             assertTrue(f.revisions.update(ResultRevision("1", "changing")))
             assertUnavailable(f)
@@ -337,7 +347,7 @@ class ResultActivationTest {
     @Test
     fun reentrantAdmissionDuringVpnStateReadIsDenied(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         f.onVpnRead = {
             assertUnavailable(f)
             assertEquals(SearchStartV3.BUSY, denied(f.activation.reserveSearch(1, 2, Input())))
@@ -349,7 +359,7 @@ class ResultActivationTest {
     @Test
     fun uncertainSourceMutationPreservesCauseAndBlocksAdmission(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val failure = IOException("synthetic")
         try {
             f.activation.withSourceMutation { throw failure }
@@ -364,7 +374,7 @@ class ResultActivationTest {
     @Test
     fun sourceMutationAndPowerCheckUseSameGuard(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val mutation = async {
@@ -387,7 +397,7 @@ class ResultActivationTest {
     @Test
     fun profileTooLargeWithConfirmedCleanupPreservesAndAdmitsPreviousGood(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         val saved = f.storage.manifest!!
         val stored = f.storage.generations[saved.generation]!!
         assertEquals(current, saved.revision)
@@ -424,7 +434,7 @@ class ResultActivationTest {
         )
         for ((resources, fence) in cleanupOutcomes) {
             val f = Fixture()
-            f.publish(previous)
+            f.publishClean(previous)
             val saved = f.storage.manifest!!
             f.startSearch()
             f.port.stopped(resources, fence)
@@ -445,7 +455,7 @@ class ResultActivationTest {
     @Test
     fun cancellationBeforeCommitKeepsAndAdmitsPreviousGood(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         f.startSearch()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -472,7 +482,7 @@ class ResultActivationTest {
     @Test
     fun committedResultWinsOverLaterCancelButWaitsForTerminalFence(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         f.startSearch()
         val offered = Input("replacement".toByteArray())
         assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, f.port.offer(offered))
@@ -481,6 +491,7 @@ class ResultActivationTest {
         f.controller.cancel()
         assertUnavailable(f)
         f.port.complete()
+        f.recordCleanCompletion()
         assertEquals(SearchPhase.COMPLETE, f.controller.state.value.phase)
         val admission = f.activation.admitVpn {
             f.vpnBusy = true
@@ -492,7 +503,7 @@ class ResultActivationTest {
     @Test
     fun cancelRacingAnAdmittedCommitCannotReportCancelled(): Unit {
         val f = Fixture()
-        f.publish(previous)
+        f.publishClean(previous)
         f.startSearch()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -505,6 +516,7 @@ class ResultActivationTest {
         assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, publication.get(10, TimeUnit.SECONDS))
         cancel.get(10, TimeUnit.SECONDS)
         f.port.complete()
+        f.recordCleanCompletion()
         assertEquals(SearchPhase.COMPLETE, f.controller.state.value.phase)
         val admission = f.activation.admitVpn { f.vpnBusy = true; Any() }
         assertArrayEquals("replacement".toByteArray(), (admission as VpnAdmission.Admitted).bytes)
@@ -514,7 +526,7 @@ class ResultActivationTest {
     fun uncertainPublicationOrUnconfirmedCleanupRetainMarkerAndBlockPower(): Unit {
         for (case in 0..4) {
             val f = Fixture()
-            f.publish(previous)
+            f.publishClean(previous)
             f.startSearch()
             val offered = Input("replacement".toByteArray(), failClose = case == 1)
             if (case == 0) f.storage.unknownPublish = true
@@ -538,11 +550,12 @@ class ResultActivationTest {
     fun lateOfferCannotReplayAndFailedCloseBlocksAdmission(): Unit {
         for (closeFails in listOf(false, true)) {
             val f = Fixture()
-            f.publish(previous)
+            f.publishClean(previous)
             f.startSearch()
             assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, f.port.offer(Input("new".toByteArray())))
             val old = f.port.observer!!
             f.port.complete()
+            f.recordCleanCompletion()
             val committed = f.storage.manifest
             val late = Input("stale".toByteArray(), failClose = closeFails)
             val receipt = old.onResult(SearchResultOfferV3(f.port.generation, f.port.phase, 1, 2, digest(late.bytes.inputStream()), late))
@@ -591,20 +604,47 @@ class ResultActivationTest {
         val marker = Marker()
         val port = Port()
         val controller = SearchController(port, store, marker)
+        val completionReceipts = MemorySearchCompletionReceiptStorage()
         @Volatile var vpnBusy = false
         @Volatile var vpnReadFailed = false
         var onVpnRead: () -> Unit = {}
-        val activation = ResultActivation(controller, store, storage, revisions, marker) {
-            onVpnRead()
-            if (vpnReadFailed) throw IOException("synthetic")
-            !vpnBusy
-        }
+        val activation = ResultActivation(
+            controller,
+            storage,
+            revisions,
+            marker,
+            {
+                onVpnRead()
+                if (vpnReadFailed) throw IOException("synthetic")
+                !vpnBusy
+            },
+            completionReceipts,
+        )
 
         init { assertTrue(revisions.update(current)) }
 
         fun publish(bytes: ByteArray): Unit {
             val result = store.publish(store.begin(current)!!, bytes.inputStream(), digest(bytes.inputStream()))
             assertEquals(Publication.SUCCESS, result)
+        }
+
+        fun publishClean(bytes: ByteArray): Unit {
+            publish(bytes)
+            val manifest = checkNotNull(storage.manifest)
+            val searched = SearchLeaseReceiptV1(11L, 21L, 1L, 2L, "00000000-0000-0000-0000-000000000021")
+            assertTrue(completionReceipts.write(SearchCompletionReceiptV1.cleanComplete(searched, manifest)))
+        }
+
+        fun recordCleanCompletion(): Unit {
+            val manifest = checkNotNull(storage.manifest)
+            val searched = SearchLeaseReceiptV1(
+                11L,
+                port.generation,
+                1L,
+                2L,
+                "00000000-0000-0000-0000-000000000021",
+            )
+            assertTrue(completionReceipts.write(SearchCompletionReceiptV1.cleanComplete(searched, manifest)))
         }
 
         fun startSearch(): Unit {
@@ -660,7 +700,7 @@ class ResultActivationTest {
         var onPublish: () -> Unit = {}
         var transformRead: (Int, Data) -> Data? = { _, data -> data }
         override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String {
-            val id = (next++).toString()
+            val id = "00000000-0000-0000-0000-${(next++).toString().padStart(12, '0')}"
             generations[id] = Data(revision, sha256, input.readBytes())
             onPrepare()
             return id

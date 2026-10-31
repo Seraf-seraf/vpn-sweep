@@ -1,5 +1,6 @@
 package com.seraf.vpnsweep.resultactivation
 
+import com.seraf.vpnsweep.SearchLeaseReceiptV1
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
 import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
@@ -136,12 +137,16 @@ class VpnRegistryActivationTest {
         val controller = SearchController(port, store, marker)
         val registry = VpnRunRegistry()
         val lifecycle = VpnServiceLifecycle()
-        val activation = ResultActivation(controller, store, storage, revisions, marker, registry::available)
+        val completionReceipts = MemorySearchCompletionReceiptStorage()
+        val activation = ResultActivation(controller, storage, revisions, marker, registry::available, completionReceipts)
 
         init {
             check(revisions.update(revision))
             val token = checkNotNull(store.begin(revision))
             check(store.publish(token, result.inputStream(), digest(result.inputStream())) == Publication.SUCCESS)
+            val manifest = checkNotNull(storage.readManifest())
+            val searched = SearchLeaseReceiptV1(11L, 21L, 1L, 2L, "00000000-0000-0000-0000-000000000021")
+            check(completionReceipts.write(SearchCompletionReceiptV1.cleanComplete(searched, manifest)))
             lifecycle.started(1)
         }
 
@@ -227,11 +232,11 @@ class VpnRegistryActivationTest {
 
         override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String {
             stored = Stored(revision, sha256, input.readBytes())
-            return "generation"
+            return "00000000-0000-0000-0000-000000000001"
         }
 
         override fun readGeneration(generation: String): StoredResult? {
-            if (generation != "generation") return null
+            if (generation != "00000000-0000-0000-0000-000000000001") return null
             val value = stored ?: return null
             return StoredResult(value.revision, value.sha256, value.bytes.inputStream())
         }

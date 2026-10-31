@@ -235,12 +235,31 @@ class SearchControllerTest {
         val storage = FakeStorage()
         val controller = SearchController(runtime, ResultStore(storage), marker)
         assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input("profiles"), true))
+        runtime.onTerminalCommit = {
+            assertEquals(MarkerState.CLEAR, marker.state)
+            true
+        }
         val result = Input("result")
         runtime.complete(1, 1, 2, result)
         assertEquals(SearchPhase.COMPLETE, controller.state.value.phase)
         assertEquals(MarkerState.CLEAR, marker.state)
+        assertEquals(1, runtime.terminalCommits)
         assertEquals("one", storage.manifest?.generation)
         assertEquals(SearchPhase.IDLE, SearchController(FakeSession(), ResultStore(FakeStorage()), marker).state.value.phase)
+    }
+
+    @Test
+    fun visibleClearAfterFailedMarkerSyncDoesNotCommitCleanCompletion(): Unit {
+        val marker = FakeMarker().also { it.clearFailureAfterWrite = true }
+        val runtime = FakeSession()
+        val controller = SearchController(runtime, ResultStore(FakeStorage()), marker)
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input("profiles"), true))
+
+        runtime.complete(1, 1, 2, Input("result"))
+
+        assertEquals(MarkerState.CLEAR, marker.state)
+        assertEquals(0, runtime.terminalCommits)
+        assertEquals(SearchPhase.INTERRUPTED, controller.state.value.phase)
     }
 
     @Test
@@ -295,6 +314,7 @@ class SearchControllerTest {
         var state = MarkerState.CLEAR
         var writeFailure = false
         var clearFailure = false
+        var clearFailureAfterWrite = false
         override fun read(): MarkerState = state
         override fun markActive(): Boolean {
             if (writeFailure) { state = MarkerState.UNKNOWN; return false }
@@ -304,7 +324,7 @@ class SearchControllerTest {
         override fun markClear(): Boolean {
             if (clearFailure) { state = MarkerState.UNKNOWN; return false }
             state = MarkerState.CLEAR
-            return true
+            return !clearFailureAfterWrite
         }
     }
 
@@ -319,8 +339,14 @@ class SearchControllerTest {
         override fun close(): Unit { closed = true }
     }
 
-    private class FakeSession : SearchSessionPortV4 {
+    private class FakeSession : SearchSessionPortV4, SearchTerminalCommitterV1 {
         override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
+        var terminalCommits = 0
+        var onTerminalCommit: (SearchTerminalV3) -> Boolean = { true }
+        override fun commitTerminal(terminal: SearchTerminalV3): Boolean {
+            terminalCommits++
+            return onTerminalCommit(terminal)
+        }
         var observer: SearchSessionObserverV3? = null
         var phase = 1L
         var onStart: () -> Unit = {}

@@ -8,6 +8,8 @@ import com.seraf.vpnsweep.core.mobile.SearchEngineWorker
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressV1
+import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
+import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV4
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
@@ -15,6 +17,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
 import com.seraf.vpnsweep.searchstate.MarkerState
 import com.seraf.vpnsweep.searchstate.SearchPhase
+import com.seraf.vpnsweep.searchstate.SearchTerminalCommitterV1
 import com.seraf.vpnsweep.searchstate.SessionMarker
 import com.seraf.vpnsweep.searchstorage.ResultRevision
 import com.seraf.vpnsweep.searchworker.NetworkOwnerOpen
@@ -61,6 +64,7 @@ internal class AppComposition(context: Context) {
     private var acceptedSnapshot: AcceptedSubscriptionReceiptV1? = null
     private var activeSearch: SearchLeaseReceiptV1? = null
     private var completedSearch: SearchLeaseReceiptV1? = null
+    private var restoredCompletedSearch: SearchLeaseReceiptV1? = null
     private val startGate = VpnStartGateV1()
     private val workerTransportLimits = SearchWorkerTransportLimits.production()
     private val marker = PrivateSessionMarker(File(app.noBackupFilesDir, "session-state"))
@@ -101,7 +105,7 @@ internal class AppComposition(context: Context) {
             searched.requestGeneration == imported.requestGeneration &&
             searched.sourceRevision.toString() == revision.source &&
             searched.selectionRevision.toString() == revision.selection &&
-            searchState.value.phase == SearchPhase.COMPLETE && searchState.value.resultCommitted &&
+            hasCleanCompletion(searched) &&
             AppVpnRegistry.instance.available()
     }
 
@@ -137,8 +141,8 @@ internal class AppComposition(context: Context) {
             imported,
             searched,
             revision,
-            searchComplete = searchState.value.phase == SearchPhase.COMPLETE,
-            resultCommitted = searchState.value.resultCommitted,
+            searchComplete = hasCleanCompletion(searched),
+            resultCommitted = hasCleanCompletion(searched),
             vpnLeaseIdentity = UUID.randomUUID().toString(),
         ) ?: return null
         if (!activation.activation.ready() || !AppVpnRegistry.instance.available()) return null
@@ -156,8 +160,8 @@ internal class AppComposition(context: Context) {
                     imported,
                     searched,
                     revision,
-                    searchComplete = searchState.value.phase == SearchPhase.COMPLETE,
-                    resultCommitted = searchState.value.resultCommitted,
+                    searchComplete = hasCleanCompletion(searched),
+                    resultCommitted = hasCleanCompletion(searched),
                     vpnLeaseIdentity = pendingIdentity.vpnLeaseIdentity,
                 )
             } else null
@@ -231,11 +235,18 @@ internal class AppComposition(context: Context) {
             imported,
             searched,
             revision,
-            searchComplete = searchState.value.phase == SearchPhase.COMPLETE,
-            resultCommitted = searchState.value.resultCommitted,
+            searchComplete = hasCleanCompletion(searched),
+            resultCommitted = hasCleanCompletion(searched),
             vpnLeaseIdentity = identity.vpnLeaseIdentity,
         ) ?: return false
         return current == identity
+    }
+
+    private fun hasCleanCompletion(searched: SearchLeaseReceiptV1): Boolean {
+        val restored = synchronized(lock) { restoredCompletedSearch == searched }
+        val state = searchState.value
+        if (restored) return state.phase == SearchPhase.IDLE
+        return state.phase == SearchPhase.COMPLETE && state.resultCommitted
     }
 
     private fun commitSource(snapshot: SubscriptionSnapshotV1): ResultRevision {
@@ -248,6 +259,7 @@ internal class AppComposition(context: Context) {
             synchronized(lock) {
                 acceptedSnapshot = receipt
                 completedSearch = null
+                restoredCompletedSearch = null
                 activeSearch = null
             }
             return revision
@@ -265,6 +277,7 @@ internal class AppComposition(context: Context) {
                     current.copy(sourceRevision = revision.source, selectionRevision = revision.selection)
                 }
                 completedSearch = null
+                restoredCompletedSearch = null
                 activeSearch = null
             }
             return revision
@@ -296,10 +309,13 @@ internal class AppComposition(context: Context) {
                 recovered.requestGeneration,
             )
         ) return
+        val completed = activation.loadCleanComplete(receipt)
+            ?.takeIf { activation.activation.ready() }
         synchronized(lock) {
             acceptedSnapshot = receipt
             activeSearch = null
-            completedSearch = null
+            completedSearch = completed
+            restoredCompletedSearch = completed
         }
     }
 
@@ -315,7 +331,7 @@ internal class AppComposition(context: Context) {
         override fun cancel(generation: Long): Unit = delegate.cancel(generation)
     }
 
-    private inner class ProductionSearchPort : SearchSessionPortV4 {
+    private inner class ProductionSearchPort : SearchSessionPortV4, SearchTerminalCommitterV1 {
         private val lock = Any()
         private val identities = LinkedHashMap<Long, SearchLeaseReceiptV1>()
         private val producer = SearchSessionProducer(
@@ -356,6 +372,7 @@ internal class AppComposition(context: Context) {
                 synchronized(this@AppComposition.lock) {
                     activeSearch = receipt
                     completedSearch = null
+                    restoredCompletedSearch = null
                 }
                 val result = producer.start(snapshot, phaseEpoch, observer)
                 if (result != SearchStartV3.ACCEPTED) {
@@ -377,13 +394,52 @@ internal class AppComposition(context: Context) {
         override fun acceptTerminal(terminal: SearchTerminalV3): Boolean {
             val receipt = synchronized(lock) { identities[terminal.sessionGeneration] } ?: return false
             if (!producer.acceptTerminal(terminal)) return false
+            if (terminal is SearchTerminalV3.Complete) {
+                if (terminal.resources != SearchResourceStateV2.RELEASED ||
+                    terminal.resultFence != SearchResultFenceV3.CONFIRMED
+                ) return false
+                val accepted = synchronized(this@AppComposition.lock) {
+                    if (activeSearch != receipt) return false
+                    acceptedSnapshot
+                } ?: return false
+                if (!activation.prepareCleanComplete(accepted, receipt)) return false
+            }
             synchronized(lock) {
                 if (identities[terminal.sessionGeneration] != receipt) return false
-                identities.remove(terminal.sessionGeneration)
                 synchronized(this@AppComposition.lock) {
                     if (activeSearch != receipt) return false
+                    if (terminal !is SearchTerminalV3.Complete) {
+                        identities.remove(terminal.sessionGeneration)
+                        activeSearch = null
+                        completedSearch = null
+                        restoredCompletedSearch = null
+                    }
+                }
+            }
+            return true
+        }
+
+        override fun commitTerminal(terminal: SearchTerminalV3): Boolean {
+            if (terminal !is SearchTerminalV3.Complete ||
+                terminal.resources != SearchResourceStateV2.RELEASED ||
+                terminal.resultFence != SearchResultFenceV3.CONFIRMED
+            ) return false
+            val receipt = synchronized(lock) { identities[terminal.sessionGeneration] } ?: return false
+            val accepted = synchronized(this@AppComposition.lock) {
+                if (activeSearch != receipt) return false
+                acceptedSnapshot
+            } ?: return false
+            if (accepted.requestGeneration != receipt.requestGeneration ||
+                !activation.commitCleanComplete()
+            ) return false
+            synchronized(lock) {
+                if (identities[terminal.sessionGeneration] != receipt) return false
+                synchronized(this@AppComposition.lock) {
+                    if (activeSearch != receipt || acceptedSnapshot != accepted) return false
+                    identities.remove(terminal.sessionGeneration)
                     activeSearch = null
                     completedSearch = receipt
+                    restoredCompletedSearch = null
                 }
             }
             return true

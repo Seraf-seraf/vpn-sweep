@@ -39,6 +39,10 @@ internal sealed interface SearchStartPreparation {
     class Reserved internal constructor(internal val dispatch: () -> SearchStartV3) : SearchStartPreparation
 }
 
+internal interface SearchTerminalCommitterV1 {
+    fun commitTerminal(terminal: SearchTerminalV3): Boolean
+}
+
 internal class SearchController(
     private val port: SearchSessionPortV3,
     private val store: ResultStore,
@@ -376,8 +380,21 @@ internal class SearchController(
                 return
             }
             if (!session.committed) store.cancel(session.token)
-            val cleared = try { marker.markClear() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+            val cleared = try { marker.markClear() && marker.read() == MarkerState.CLEAR } catch (_: Exception) { false } catch (_: LinkageError) { false }
             if (!cleared) {
+                interrupt(session)
+                return
+            }
+            val committed = if (terminal is SearchTerminalV3.Complete) {
+                try {
+                    (port as? SearchTerminalCommitterV1)?.commitTerminal(terminal) != false
+                } catch (_: Exception) {
+                    false
+                } catch (_: LinkageError) {
+                    false
+                }
+            } else true
+            if (!committed) {
                 interrupt(session)
                 return
             }

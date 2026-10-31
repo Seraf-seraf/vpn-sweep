@@ -1,6 +1,5 @@
 package com.seraf.vpnsweep.resultactivation
 
-import com.seraf.vpnsweep.importer.MAX_CONFIG_BYTES
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchstate.MarkerState
@@ -10,8 +9,6 @@ import com.seraf.vpnsweep.searchstate.SessionMarker
 import com.seraf.vpnsweep.searchstorage.CurrentRevisionStore
 import com.seraf.vpnsweep.searchstorage.ResultRevision
 import com.seraf.vpnsweep.searchstorage.ResultStorage
-import com.seraf.vpnsweep.searchstorage.ResultStore
-import com.seraf.vpnsweep.searchstorage.digest
 
 internal sealed interface VpnAdmission<out T : Any> {
     data object Unavailable : VpnAdmission<Nothing>
@@ -22,11 +19,11 @@ internal sealed interface VpnAdmission<out T : Any> {
 
 internal class ResultActivation(
     private val controller: SearchController,
-    private val store: ResultStore,
     private val storage: ResultStorage,
     private val revisions: CurrentRevisionStore,
     private val marker: SessionMarker,
     private val vpnDisconnected: () -> Boolean,
+    private val completionReceipts: SearchCompletionReceiptStorage = EmptySearchCompletionReceiptStorage,
 ) {
     private var uncertain = false
     private var deciding = false
@@ -141,15 +138,21 @@ internal class ResultActivation(
     private fun verifiedBytes(): ByteArray? {
         return try {
             val revision = revisions.load() ?: return null
-            val manifest = store.resolve(revision) ?: return null
-            val result = storage.readGeneration(manifest.generation) ?: return null
-            result.input.use { input ->
-                if (result.revision != revision || result.sha256 != manifest.sha256) return null
-                val bytes = input.readNBytes(MAX_CONFIG_BYTES + 1)
-                if (bytes.isEmpty() || bytes.size > MAX_CONFIG_BYTES || digest(bytes.inputStream()) != manifest.sha256) null else bytes
-            }
+            if (completionReceipts.hasPending()) return null
+            val receipt = completionReceipts.read() ?: return null
+            verifiedCompletionBytes(storage, receipt, revision)
         } catch (_: Exception) {
             null
         }
     }
+
+}
+
+private object EmptySearchCompletionReceiptStorage : SearchCompletionReceiptStorage {
+    override fun read(): SearchCompletionReceiptV1? = null
+    override fun readPrepared(): SearchCompletionReceiptV1? = null
+    override fun hasPending(): Boolean = false
+    override fun prepare(receipt: SearchCompletionReceiptV1): Boolean = false
+    override fun commit(): Boolean = false
+    override fun write(receipt: SearchCompletionReceiptV1): Boolean = false
 }

@@ -1,6 +1,9 @@
 package com.seraf.vpnsweep.resultactivation
 
+import com.seraf.vpnsweep.AcceptedSubscriptionReceiptV1
+import com.seraf.vpnsweep.SearchLeaseReceiptV1
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
+import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
 import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
 import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
 import com.seraf.vpnsweep.searchprotocol.SearchResultOfferV3
@@ -41,6 +44,226 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ResultActivationCompositionTest {
+    @Test
+    fun cleanCompleteReceiptRestoresReadinessWithoutStartingSearchOrVpn(): Unit {
+        val f = Fixture()
+        f.publishResult()
+        val startsBeforeRestore = f.port.starts
+        assertEquals(f.searched, f.composition.loadCleanComplete(f.accepted))
+        assertTrue(f.composition.activation.ready())
+        assertTrue(f.registry.available())
+        val recovered = f.recovered()
+        assertEquals(f.searched, recovered.loadCleanComplete(f.accepted))
+        assertTrue(recovered.activation.ready())
+        assertTrue(recovered.vpnRuns.available())
+        assertEquals(startsBeforeRestore, f.port.starts)
+    }
+
+    @Test
+    fun staleGenerationRevisionOrManifestMismatchCannotRestoreReadiness(): Unit {
+        val f = Fixture()
+        f.publishResult()
+
+        assertNull(f.composition.loadCleanComplete(f.accepted.copy(requestGeneration = 12L)))
+        assertNull(f.composition.loadCleanComplete(f.accepted.copy(sourceRevision = "3")))
+
+        val saved = checkNotNull(f.completionReceipts.receipt)
+        f.completionReceipts.receipt = saved.copy(
+            result = saved.result.copy(sha256 = "f".repeat(64)),
+        )
+        assertFalse(f.composition.activation.ready())
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+
+        f.completionReceipts.receipt = saved.copy(
+            result = saved.result.copy(generation = "00000000-0000-0000-0000-000000000099"),
+        )
+        assertFalse(f.composition.activation.ready())
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+
+        f.completionReceipts.receipt = saved
+        f.revisionStorage.value = ResultRevision("3", "2")
+        assertFalse(f.composition.activation.ready())
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+    }
+
+    @Test
+    fun lastGoodReceiptSurvivesNewerUncleanGenerationAtSameRevision(): Unit {
+        val f = Fixture()
+        f.publishResult()
+        val lastGoodReceipt = f.searched
+        val lastGoodManifest = checkNotNull(f.storage.readManifest())
+
+        val prepared = f.composition.activation.reserveSearch(1, 2, Input()) as SearchStartPreparation.Reserved
+        assertEquals(SearchStartV3.ACCEPTED, prepared.dispatch())
+        assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, f.port.offer(Input("unclean-new-result".toByteArray())))
+        val newerManifest = checkNotNull(f.storage.readManifest())
+        assertTrue(lastGoodManifest.generation != newerManifest.generation)
+
+        f.port.stopped()
+
+        assertEquals(lastGoodReceipt, f.composition.loadCleanComplete(f.accepted))
+        assertTrue(f.composition.activation.ready())
+        val admission = f.composition.activation.admitVpn {
+            f.registry.reserve(stopping = {})
+        } as VpnAdmission.Admitted
+        assertArrayEquals(f.result, admission.bytes)
+        assertTrue(admission.reservation.claimRelease())
+
+        f.storage.corruptGeneration(lastGoodManifest.generation)
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+        assertFalse(f.composition.activation.ready())
+        f.storage.repairGeneration(lastGoodManifest.generation)
+
+        assertTrue(f.composition.withSourceMutation { ResultRevision("3", "2") })
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+        assertFalse(f.composition.activation.ready())
+    }
+
+    @Test
+    fun missingReceiptAndInterruptedMarkerKeepPowerUnavailable(): Unit {
+        val missing = Fixture()
+        assertTrue(missing.composition.withSourceMutation { ResultRevision("1", "2") })
+        assertNull(missing.composition.loadCleanComplete(missing.accepted))
+        assertFalse(missing.composition.activation.ready())
+        assertUnavailable(missing.composition)
+
+        val interrupted = Fixture()
+        interrupted.publishResult()
+        interrupted.marker.state = MarkerState.ACTIVE
+        assertNull(interrupted.composition.loadCleanComplete(interrupted.accepted))
+        assertFalse(interrupted.composition.activation.ready())
+        assertUnavailable(interrupted.composition)
+    }
+
+    @Test
+    fun failedReceiptWritePreservesPreviousCleanReceipt(): Unit {
+        val f = Fixture()
+        f.publishResult()
+        val previous = checkNotNull(f.completionReceipts.receipt)
+        f.completionReceipts.failWrite = true
+
+        val attempted = f.searched.copy(sessionGeneration = 22L, leaseIdentity = "00000000-0000-0000-0000-000000000022")
+        assertFalse(f.composition.recordCleanComplete(f.accepted, attempted))
+        assertEquals(previous, f.completionReceipts.receipt)
+        assertEquals(f.searched, f.composition.loadCleanComplete(f.accepted))
+    }
+
+    @Test
+    fun pendingReceiptBlocksPreviousAndCandidateUntilPostClearCommit(): Unit {
+        val f = Fixture()
+        f.publishResult()
+        val previous = checkNotNull(f.completionReceipts.receipt)
+        val profiles = Input()
+        val prepared = f.composition.activation.reserveSearch(1, 2, profiles) as SearchStartPreparation.Reserved
+        assertEquals(SearchStartV3.ACCEPTED, prepared.dispatch())
+        val nextResult = "synthetic-second-result".toByteArray()
+        assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, f.port.offer(Input(nextResult)))
+        val nextSearch = f.searched
+
+        var preparedBeforeClear = false
+        f.port.onAcceptTerminal = { terminal ->
+            if (terminal is SearchTerminalV3.Complete) {
+                assertEquals(MarkerState.ACTIVE, f.marker.state)
+                assertTrue(f.composition.prepareCleanComplete(f.accepted, nextSearch))
+                preparedBeforeClear = true
+                assertTrue(f.completionReceipts.hasPending())
+                assertEquals(previous, f.completionReceipts.receipt)
+                assertNull(f.composition.loadCleanComplete(f.accepted))
+                assertFalse(f.composition.activation.ready())
+            }
+        }
+        f.port.complete()
+        assertTrue(preparedBeforeClear)
+        assertEquals(MarkerState.CLEAR, f.marker.state)
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+        assertFalse(f.composition.activation.ready())
+        val restoredBeforeCommitPort = Port()
+        val restoredBeforeCommit = compose(
+            f.storage,
+            f.revisionStorage,
+            restoredBeforeCommitPort,
+            f.marker,
+            VpnRunRegistry(),
+            f.completionReceipts,
+        )
+        assertNull(restoredBeforeCommit.loadCleanComplete(f.accepted))
+        assertFalse(restoredBeforeCommit.activation.ready())
+        assertEquals(0, restoredBeforeCommitPort.starts)
+        assertTrue(restoredBeforeCommit.vpnRuns.available())
+
+        assertTrue(f.composition.commitCleanComplete())
+        assertFalse(f.completionReceipts.hasPending())
+        assertEquals(nextSearch, f.composition.loadCleanComplete(f.accepted))
+        assertTrue(f.composition.activation.ready())
+        assertArrayEquals(nextResult, (f.composition.activation.admitVpn { f.registry.reserve(stopping = {}) }
+            as VpnAdmission.Admitted).bytes)
+        val restoredAfterCommitPort = Port()
+        val restoredAfterCommit = compose(
+            f.storage,
+            f.revisionStorage,
+            restoredAfterCommitPort,
+            f.marker,
+            VpnRunRegistry(),
+            f.completionReceipts,
+        )
+        assertEquals(nextSearch, restoredAfterCommit.loadCleanComplete(f.accepted))
+        assertTrue(restoredAfterCommit.activation.ready())
+        assertEquals(0, restoredAfterCommitPort.starts)
+        assertTrue(restoredAfterCommit.vpnRuns.available())
+    }
+
+    @Test
+    fun pendingReceiptWithoutPriorAndFailedCommitStayUnavailableUntilRetry(): Unit {
+        val f = Fixture()
+        assertTrue(f.composition.withSourceMutation { ResultRevision("1", "2") })
+        val prepared = f.composition.activation.reserveSearch(1, 2, Input()) as SearchStartPreparation.Reserved
+        assertEquals(SearchStartV3.ACCEPTED, prepared.dispatch())
+        val result = "synthetic-first-result".toByteArray()
+        assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, f.port.offer(Input(result)))
+        val searched = f.searched
+
+        var preparedBeforeClear = false
+        f.port.onAcceptTerminal = { terminal ->
+            if (terminal is SearchTerminalV3.Complete) {
+                assertEquals(MarkerState.ACTIVE, f.marker.state)
+                assertTrue(f.composition.prepareCleanComplete(f.accepted, searched))
+                preparedBeforeClear = true
+                assertTrue(f.completionReceipts.hasPending())
+                assertNull(f.completionReceipts.receipt)
+                assertNull(f.composition.loadCleanComplete(f.accepted))
+                assertFalse(f.composition.activation.ready())
+            }
+        }
+        f.port.complete()
+        assertTrue(preparedBeforeClear)
+        f.completionReceipts.failCommit = true
+        assertFalse(f.composition.commitCleanComplete())
+        assertTrue(f.completionReceipts.hasPending())
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+        assertFalse(f.composition.activation.ready())
+        val restoredPendingPort = Port()
+        val restoredPending = compose(
+            f.storage,
+            f.revisionStorage,
+            restoredPendingPort,
+            f.marker,
+            VpnRunRegistry(),
+            f.completionReceipts,
+        )
+        assertNull(restoredPending.loadCleanComplete(f.accepted))
+        assertFalse(restoredPending.activation.ready())
+        assertEquals(0, restoredPendingPort.starts)
+        assertTrue(restoredPending.vpnRuns.available())
+
+        f.completionReceipts.failCommit = false
+        assertTrue(f.composition.commitCleanComplete())
+        assertEquals(searched, f.composition.loadCleanComplete(f.accepted))
+        assertTrue(f.composition.activation.ready())
+        assertEquals(1, f.port.starts)
+        assertArrayEquals(result, (f.composition.activation.admitVpn { f.registry.reserve(stopping = {}) }
+            as VpnAdmission.Admitted).bytes)
+    }
+
     @Test
     fun currentRevisionAndSnapshotReservationShareTheControllerMonitor(): Unit {
         val f = Fixture()
@@ -387,6 +610,7 @@ class ResultActivationCompositionTest {
         port: SearchSessionPortV3,
         marker: SessionMarker,
         registry: VpnRunRegistry,
+        completionReceipts: SearchCompletionReceiptStorage,
     ): ResultActivationComposition {
         val constructor = ResultActivationComposition::class.java.getDeclaredConstructor(
             ResultStorage::class.java,
@@ -394,9 +618,10 @@ class ResultActivationCompositionTest {
             SearchSessionPortV3::class.java,
             SessionMarker::class.java,
             VpnRunRegistry::class.java,
+            SearchCompletionReceiptStorage::class.java,
         )
         constructor.isAccessible = true
-        return constructor.newInstance(storage, revisions, port, marker, registry)
+        return constructor.newInstance(storage, revisions, port, marker, registry, completionReceipts)
     }
 
     private inner class Fixture {
@@ -405,11 +630,15 @@ class ResultActivationCompositionTest {
         val port = Port()
         val marker = Marker()
         val registry = VpnRunRegistry()
-        val composition = compose(storage, revisionStorage, port, marker, registry)
+        val completionReceipts = MemorySearchCompletionReceiptStorage()
+        val accepted = AcceptedSubscriptionReceiptV1(11L, "1", "2")
+        val searched: SearchLeaseReceiptV1
+            get() = SearchLeaseReceiptV1(accepted.requestGeneration, port.generation, 1L, 2L, port.leaseIdentity)
+        val composition = compose(storage, revisionStorage, port, marker, registry, completionReceipts)
         val result = "verified-synthetic-result".toByteArray()
 
         fun recovered(): ResultActivationComposition =
-            compose(storage, revisionStorage, Port(), marker, VpnRunRegistry())
+            compose(storage, revisionStorage, Port(), marker, VpnRunRegistry(), completionReceipts)
 
         fun publishResult(): Unit {
             assertTrue(composition.withSourceMutation { ResultRevision("1", "2") })
@@ -425,6 +654,7 @@ class ResultActivationCompositionTest {
             assertEquals(1, input.closes)
             assertFalse(composition.activation.ready())
             port.complete()
+            assertTrue(composition.recordCleanComplete(accepted, searched))
         }
     }
 
@@ -467,24 +697,32 @@ class ResultActivationCompositionTest {
     }
 
     private class Storage : ResultStorage {
-        private var result: Stored? = null
+        private val results = mutableMapOf<String, Stored>()
+        private val corruptedGenerations = mutableSetOf<String>()
         private var manifest: ResultManifest? = null
+        private var nextGeneration = 0L
+
         var failManifestRead = false
         override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String {
-            result = Stored(revision, sha256, input.readBytes())
-            return "generation"
+            val id = "00000000-0000-0000-0000-${(nextGeneration++).toString().padStart(12, '0')}"
+            results[id] = Stored(revision, sha256, input.readBytes())
+            return id
         }
         override fun readGeneration(generation: String): StoredResult? {
-            if (generation != "generation") return null
-            val stored = result ?: return null
-            return StoredResult(stored.revision, stored.sha256, stored.bytes.inputStream())
+            val stored = results[generation] ?: return null
+            val bytes = if (generation in corruptedGenerations) "tampered".toByteArray() else stored.bytes
+            return StoredResult(stored.revision, stored.sha256, bytes.inputStream())
         }
         override fun readManifest(): ResultManifest? {
             if (failManifestRead) throw IOException("synthetic")
             return manifest
         }
         override fun publish(manifest: ResultManifest): Unit { this.manifest = manifest }
-        override fun discard(generation: String): Unit { result = null }
+        override fun discard(generation: String): Unit { results.remove(generation) }
+
+        fun corruptGeneration(generation: String): Unit { corruptedGenerations.add(generation) }
+        fun repairGeneration(generation: String): Unit { corruptedGenerations.remove(generation) }
+
         private class Stored(val revision: ResultRevision, val sha256: String, val bytes: ByteArray)
     }
 
@@ -502,9 +740,14 @@ class ResultActivationCompositionTest {
     }
 
     private class Port : SearchSessionPortV4 {
-        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
+        var onAcceptTerminal: (SearchTerminalV3) -> Unit = {}
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean {
+            onAcceptTerminal(terminal)
+            return true
+        }
         private var observer: SearchSessionObserverV3? = null
-        private var generation = 0L
+        var generation = 0L
+        val leaseIdentity = "00000000-0000-0000-0000-000000000021"
         private var phase = 0L
         var starts = 0
         var onStart: () -> Unit = {}
@@ -525,6 +768,9 @@ class ResultActivationCompositionTest {
         )
         fun complete(): Unit = observer!!.onTerminal(
             SearchTerminalV3.Complete(generation, phase, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED),
+        )
+        fun stopped(): Unit = observer!!.onTerminal(
+            SearchTerminalV3.Stopped(generation, phase, SearchFailureV1.INTERNAL_ERROR, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED),
         )
         fun cancelled(): Unit = observer!!.onTerminal(
             SearchTerminalV3.Cancelled(generation, phase, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED),
