@@ -56,12 +56,16 @@ type SearchEngineWorker interface {
 }
 
 type SearchSession struct {
-	mu      sync.Mutex
-	runner  *searchbridge.Runner
-	store   *state.Store
-	cancel  context.CancelFunc
-	closed  bool
-	running bool
+	mu            sync.Mutex
+	runner        *searchbridge.Runner
+	store         *state.Store
+	stagingDir    string
+	cancel        context.CancelFunc
+	closed        bool
+	running       bool
+	resultReady   bool
+	resultClaimed bool
+	openingResult bool
 }
 
 // NewSearchSession accepts selected normalized profiles, not subscription JSON.
@@ -122,12 +126,12 @@ func NewSearchSession(generation int64, manifestBytes, profileBytes []byte, stat
 		Progress: func(p search.Progress) { emitSearchProgress(worker, p) },
 		Export:   func(a model.Attempt) error { return export.Save(stagingDir, manifest, profiles, a) },
 	}
-	return &SearchSession{runner: runner, store: store}, nil
+	return &SearchSession{runner: runner, store: store, stagingDir: stagingDir}, nil
 }
 
 func (s *SearchSession) Run() (string, error) {
 	s.mu.Lock()
-	if s.closed || s.running {
+	if s.closed || s.running || s.openingResult || s.resultReady || s.resultClaimed {
 		s.mu.Unlock()
 		return "busy", errors.New("search_busy")
 	}
@@ -140,6 +144,7 @@ func (s *SearchSession) Run() (string, error) {
 	s.mu.Lock()
 	s.running = false
 	s.cancel = nil
+	s.resultReady = err == nil && status == "success"
 	s.mu.Unlock()
 	if err != nil {
 		return status, safeSessionError(err)
@@ -159,7 +164,7 @@ func (s *SearchSession) Cancel() {
 func (s *SearchSession) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running {
+	if s.running || s.openingResult {
 		return errors.New("search_still_running")
 	}
 	if s.closed {
