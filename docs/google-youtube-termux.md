@@ -1,7 +1,10 @@
 # Google and YouTube pages: Termux ARM64
 
-The built-in google-youtube-web-v1 checks both pages in two rounds. It remains
-live-unverified; desktop tests and cross-build do not establish Android device acceptance.
+The built-in `google-youtube-web-noise-v1` checks the Google and YouTube HTML pages in
+two fresh-core rounds. For a candidate with `noise=true`, UDP/DNS through SOCKS must also
+pass in both rounds; it is not run for `noise=false`. The policy does not require video
+or downloads. It remains live-unverified; desktop tests and cross-build do not establish
+Android device acceptance.
 
 ```sh
 pkg install git golang make ca-certificates
@@ -43,7 +46,8 @@ Ctrl-C requests cleanup; wait for exit before using status/report or another wri
   --state "$SWEEP_PRIVATE/series-001" --output "$SWEEP_PRIVATE/result-001"
 ```
 
-The first success requires both pages again after core restart. Working.json contains
-credentials; do not publish it. Missing, challenge or forbidden pages are not success.
+The first success requires both pages again after core restart and, for `noise=true`,
+UDP/DNS in both rounds. `working.json` contains credentials; do not publish it. Missing,
+challenge or forbidden pages are not success.
 Saved series requiring YouTube video need a new series; status/report and export of verified
 results remain available. See [usage](usage.md).

@@ -1,7 +1,9 @@
 # Compatibility of saved video series
 
-New searches use `google-youtube-web-v1` and check Google and YouTube pages in two
-rounds. They do not check video delivery or install YouTube resolver dependencies.
+New searches use `google-youtube-web-noise-v1` and check the Google and YouTube HTML
+pages in two fresh-core rounds. For a candidate with `noise=true`, a UDP/DNS probe
+through SOCKS must also pass in both rounds; it is not run for `noise=false`. New searches
+do not check video delivery or downloads and do not need YouTube resolver dependencies.
 
 Saved series whose policy includes YouTube video cannot resume; start a new series.
 Their status and report remain readable, and already verified results can be exported
