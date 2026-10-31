@@ -37,13 +37,15 @@ class SearchSessionProducerTest {
         var holdPrepare = false
         var holdRun = false
         var cancelResult = true
-        var status = "success"
+        @Volatile var status = "success"
+        @Volatile var onRun: (Long) -> Unit = {}
         val cancelled = AtomicBoolean()
         val cancelCalls = Collections.synchronizedList(mutableListOf<Long>())
         val preparations = Collections.synchronizedList(mutableListOf<Long>())
         val closed = AtomicInteger()
         val released = AtomicInteger()
         val quarantined = AtomicInteger()
+        val quarantineReached = CountDownLatch(1)
         val resultInput = Input()
         override fun preparePhase(epoch: Long): Unit {
             preparations.add(epoch)
@@ -54,6 +56,7 @@ class SearchSessionProducerTest {
         override fun runPhase(epoch: Long): String {
             runThread.set(Thread.currentThread())
             runEntered.countDown()
+            onRun(epoch)
             if (holdRun) check(releaseRun.await(3, TimeUnit.SECONDS))
             return if (cancelled.get()) "interrupted" else status
         }
@@ -67,14 +70,16 @@ class SearchSessionProducerTest {
         override fun closeSession(): Unit { closed.incrementAndGet() }
         override fun pauseResources(): SearchResourceStateV2 = SearchResourceStateV2.PAUSED_LEASE_HELD
         override fun releaseResources(): SearchResourceStateV2 { released.incrementAndGet(); return SearchResourceStateV2.RELEASED }
-        override fun quarantine(): Unit { quarantined.incrementAndGet() }
+        override fun quarantine(): Unit { quarantined.incrementAndGet(); quarantineReached.countDown() }
     }
 
     private class Observer(private val failTerminal: Boolean = false) : SearchSessionObserverV3 {
         val terminals = Collections.synchronizedList(mutableListOf<SearchTerminalV3>())
         val terminal = CountDownLatch(1)
+        val finalTerminal = CountDownLatch(1)
+        val progress = Collections.synchronizedList(mutableListOf<Pair<Long, SearchProgressV1>>())
         val offers = AtomicInteger()
-        override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+        override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit { this.progress.add(phaseEpoch to progress) }
         override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
             offers.incrementAndGet()
             offer.result.open().use { it.readBytes() }
@@ -84,6 +89,7 @@ class SearchSessionProducerTest {
         override fun onTerminal(terminal: SearchTerminalV3): Unit {
             terminals.add(terminal)
             this.terminal.countDown()
+            if (terminal !is SearchTerminalV3.Paused) finalTerminal.countDown()
             if (failTerminal) throw IOException("synthetic")
         }
     }
@@ -140,21 +146,15 @@ class SearchSessionProducerTest {
         owner.releaseRun.countDown()
         assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
         assertTrue(observer.terminals[0] is SearchTerminalV3.Paused)
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
-        var nextEpoch = 2L
-        var resumed = SearchStartV3.REJECTED
-        while (resumed == SearchStartV3.REJECTED && System.nanoTime() < deadline) {
-            resumed = producer.resume(7, nextEpoch++)
-            if (resumed == SearchStartV3.REJECTED) Thread.yield()
-        }
-        assertEquals(SearchStartV3.ACCEPTED, resumed)
+        owner.runThread.get().join(3_000)
+        assertFalse(owner.runThread.get().isAlive)
+        assertEquals(SearchStartV3.ACCEPTED, producer.resume(7, 2))
         producer.cancel(7, 1)
-        val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
-        while (observer.terminals.size < 2 && System.nanoTime() < end) Thread.yield()
+        assertTrue(observer.finalTerminal.await(3, TimeUnit.SECONDS))
         assertEquals(2, observer.terminals.size)
         assertTrue(observer.terminals[1] is SearchTerminalV3.Complete)
         assertEquals(listOf(1L), owner.cancelCalls.toList())
-        assertEquals(listOf(1L, nextEpoch - 1), owner.preparations.toList())
+        assertEquals(listOf(1L, 2L), owner.preparations.toList())
     }
 
     @Test fun unknownProfileCloseBlocksFurtherAdmission(): Unit {
@@ -178,8 +178,7 @@ class SearchSessionProducerTest {
         val producer = producer(owner)
         assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
         assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
-        val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
-        while (owner.quarantined.get() == 0 && System.nanoTime() < end) Thread.yield()
+        assertTrue(owner.quarantineReached.await(2, TimeUnit.SECONDS))
         assertEquals(1, observer.terminals.size)
         assertEquals(1, owner.quarantined.get())
         assertEquals(SearchStartV3.BUSY, producer.start(snapshot(Input()), 1, Observer()))
@@ -283,5 +282,214 @@ class SearchSessionProducerTest {
         assertFalse(owner.runThread.get().isAlive)
         assertEquals(1, count.get())
         assertEquals(0, owner.quarantined.get())
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun sendProgress(sink: Any, phase: Long, progress: SearchProgressV1): Unit {
+        when (sink) {
+            is Function2<*, *, *> -> (sink as (Long, SearchProgressV1) -> Unit)(phase, progress)
+            is Function1<*, *> -> (sink as (SearchProgressV1) -> Unit)(progress)
+            else -> error("unexpected progress port")
+        }
+    }
+
+    @Test fun firstResumeDuringPausedCallbackIsAcceptedAndOldCallbackCannotOverwriteIt(): Unit {
+        val owner = Owner().apply { status = "paused_budget" }
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val complete = CountDownLatch(1)
+        val terminals = Collections.synchronizedList(mutableListOf<SearchTerminalV3>())
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().use { it.readBytes() }; offer.result.close(); return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(terminal: SearchTerminalV3): Unit {
+                terminals.add(terminal)
+                if (terminal is SearchTerminalV3.Paused) { entered.countDown(); check(release.await(3, TimeUnit.SECONDS)) }
+                else complete.countDown()
+            }
+        }
+        val producer = producer(owner)
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            owner.status = "success"
+            assertEquals(SearchStartV3.ACCEPTED, producer.resume(7, 2))
+            release.countDown()
+            assertTrue(complete.await(3, TimeUnit.SECONDS))
+            assertEquals(2, terminals.size)
+            assertEquals(1L, terminals[0].phaseEpoch)
+            assertEquals(2L, terminals[1].phaseEpoch)
+            assertTrue(terminals[1] is SearchTerminalV3.Complete)
+        } finally { release.countDown() }
+    }
+
+    @Test fun delayedOldProgressKeepsItsOriginatingPhase(): Unit {
+        val owner = Owner().apply { status = "paused_budget" }
+        val sink = AtomicReference<Any>()
+        val observer = Observer()
+        val enteredSecond = CountDownLatch(1)
+        val releaseSecond = CountDownLatch(1)
+        val producer = SearchSessionProducer(2_000, { snapshot, progress ->
+            snapshot.profiles.open().use { it.readBytes() }; sink.set(progress); owner
+        }, { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
+            owner.runThread.get().join(3_000)
+            assertFalse(owner.runThread.get().isAlive)
+            owner.status = "success"
+            owner.onRun = { epoch -> if (epoch == 2L) { enteredSecond.countDown(); check(releaseSecond.await(3, TimeUnit.SECONDS)) } }
+            assertEquals(SearchStartV3.ACCEPTED, producer.resume(7, 2))
+            assertTrue(enteredSecond.await(2, TimeUnit.SECONDS))
+            val value = SearchProgressV1(7, SearchProgressKindV1.ATTEMPT_STARTED, SearchProgressOutcomeV1.RUNNING, 1uL, 1, 1, 0, 0, 0)
+            sendProgress(sink.get(), 1, value)
+            assertTrue(observer.progress.isEmpty())
+            sendProgress(sink.get(), 2, value)
+            assertEquals(listOf(2L), observer.progress.map { it.first })
+            releaseSecond.countDown()
+            assertTrue(observer.finalTerminal.await(3, TimeUnit.SECONDS))
+        } finally { releaseSecond.countDown() }
+    }
+
+    @Test fun cancelWhilePrepareBlockedExpiresToUnknownWithoutLeaseRelease(): Unit {
+        val owner = Owner().apply { holdPrepare = true }
+        val observer = Observer()
+        val producer = SearchSessionProducer(100, { snapshot, _ -> snapshot.profiles.open().use { it.readBytes() }; owner },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(owner.prepareEntered.await(2, TimeUnit.SECONDS))
+            producer.cancel(7, 1)
+            assertTrue("cleanup deadline must be observed independently of Prepare", observer.terminal.await(2, TimeUnit.SECONDS))
+            val terminal = observer.terminals.single() as SearchTerminalV3.Stopped
+            assertEquals(SearchResultFenceV3.UNKNOWN, terminal.resultFence)
+            assertEquals(SearchResourceStateV2.QUARANTINED, terminal.resources)
+            assertEquals(1, owner.quarantined.get())
+            assertEquals(0, owner.released.get())
+        } finally { owner.releasePrepare.countDown() }
+    }
+
+    @Test fun cancelWhileRunBlockedExpiresToUnknownWithoutLeaseRelease(): Unit {
+        val owner = Owner().apply { holdRun = true }
+        val observer = Observer()
+        val producer = SearchSessionProducer(100, { snapshot, _ -> snapshot.profiles.open().use { it.readBytes() }; owner },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(owner.runEntered.await(2, TimeUnit.SECONDS))
+            producer.cancel(7, 1)
+            assertTrue("cleanup deadline must be observed independently of Run", observer.terminal.await(2, TimeUnit.SECONDS))
+            val terminal = observer.terminals.single() as SearchTerminalV3.Stopped
+            assertEquals(SearchResultFenceV3.UNKNOWN, terminal.resultFence)
+            assertEquals(1, owner.quarantined.get())
+            assertEquals(0, owner.released.get())
+        } finally { owner.releaseRun.countDown() }
+    }
+
+    @Test fun cancelAfterCompletedPauseStartsFreshCleanupBudget(): Unit {
+        val owner = Owner().apply { status = "paused_budget" }
+        val observer = Observer()
+        val clock = java.util.concurrent.atomic.AtomicLong(1_000)
+        val producer = SearchSessionProducer(1_000, { snapshot, _ -> snapshot.profiles.open().use { it.readBytes() }; owner }, clock::get)
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+        assertTrue(observer.terminal.await(2, TimeUnit.SECONDS))
+        owner.runThread.get().join(3_000)
+        assertFalse(owner.runThread.get().isAlive)
+        clock.set(3_000)
+        producer.cancel(7, 1)
+        assertTrue(observer.finalTerminal.await(3, TimeUnit.SECONDS))
+        assertTrue(observer.terminals[1] is SearchTerminalV3.Cancelled)
+        assertEquals(1, owner.released.get())
+        assertEquals(0, owner.quarantined.get())
+    }
+
+    @Test fun cancelWhileFactoryBlockedExpiresToUnknown(): Unit {
+        val owner = Owner()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val observer = Observer()
+        val producer = SearchSessionProducer(100, { snapshot, _ ->
+            entered.countDown(); check(release.await(3, TimeUnit.SECONDS)); snapshot.profiles.open().use { it.readBytes() }; owner
+        }, { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            producer.cancel(7, 1)
+            assertTrue("cleanup deadline must be observed independently of factory", observer.terminal.await(2, TimeUnit.SECONDS))
+            val terminal = observer.terminals.single() as SearchTerminalV3.Stopped
+            assertEquals(SearchResultFenceV3.UNKNOWN, terminal.resultFence)
+            assertEquals(0, owner.released.get())
+        } finally { release.countDown() }
+    }
+
+    @Test fun cancelDuringUndeliveredPauseRetainsOriginalDeadline(): Unit {
+        val owner = Owner().apply { status = "paused_budget" }
+        val clock = java.util.concurrent.atomic.AtomicLong(1_000)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val finalTerminal = CountDownLatch(1)
+        val terminals = Collections.synchronizedList(mutableListOf<SearchTerminalV3>())
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 = error("unexpected result")
+            override fun onTerminal(terminal: SearchTerminalV3): Unit {
+                terminals.add(terminal)
+                if (terminal is SearchTerminalV3.Paused) { entered.countDown(); check(release.await(3, TimeUnit.SECONDS)) }
+                else finalTerminal.countDown()
+            }
+        }
+        val producer = SearchSessionProducer(1_000, { snap, _ -> snap.profiles.open().use { it.readBytes() }; owner }, clock::get)
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            clock.set(1_500)
+            producer.cancel(7, 1)
+            clock.set(2_000)
+            release.countDown()
+            assertTrue(finalTerminal.await(3, TimeUnit.SECONDS))
+            val terminal = terminals[1] as SearchTerminalV3.Stopped
+            assertEquals(SearchResultFenceV3.UNKNOWN, terminal.resultFence)
+            assertEquals(0, owner.released.get())
+        } finally { release.countDown() }
+    }
+
+    @Test fun cancelWhileResultCallbackBlockedExpiresWithoutConfirmedFence(): Unit {
+        val owner = Owner()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val offers = AtomicInteger()
+        val terminals = Collections.synchronizedList(mutableListOf<SearchTerminalV3>())
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offers.incrementAndGet()
+                entered.countDown()
+                check(release.await(3, TimeUnit.SECONDS))
+                offer.result.open().use { it.readBytes() }
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { terminals.add(value); terminal.countDown() }
+        }
+        val producer = SearchSessionProducer(100, { snap, _ -> snap.profiles.open().use { it.readBytes() }; owner },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            producer.cancel(7, 1)
+            assertTrue("control deadline must be observed independently of result callback", terminal.await(2, TimeUnit.SECONDS))
+            val unknown = terminals.single() as SearchTerminalV3.Stopped
+            assertEquals(SearchResultFenceV3.UNKNOWN, unknown.resultFence)
+            assertEquals(SearchResourceStateV2.RELEASED, unknown.resources)
+            release.countDown()
+            owner.runThread.get().join(3_000)
+            assertFalse(owner.runThread.get().isAlive)
+            assertEquals(1, offers.get())
+            assertEquals(1, terminals.size)
+            assertEquals(1, owner.resultInput.closed.get())
+        } finally { release.countDown() }
     }
 }

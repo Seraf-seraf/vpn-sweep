@@ -23,7 +23,8 @@ import java.util.concurrent.TimeUnit
 // It must consume profiles synchronously; the producer closes the input.
 // Pause and release states require confirmed worker death and FD disposition;
 // quarantine must stop further work and forbid unconfirmed lease release.
-// A factory that fails after acquiring resources must quarantine them itself.
+// A factory retains acquired resources until ownership transfers and must
+// quarantine them itself if it fails before returning a session.
 internal interface SearchPhaseSession {
     fun preparePhase(epoch: Long): Unit
     fun runPhase(epoch: Long): String
@@ -37,7 +38,7 @@ internal interface SearchPhaseSession {
 
 internal class SearchSessionProducer(
     private val cleanupMillis: Long,
-    private val createSession: (SearchSnapshotV1, (SearchProgressV1) -> Unit) -> SearchPhaseSession,
+    private val createSession: (SearchSnapshotV1, (Long, SearchProgressV1) -> Unit) -> SearchPhaseSession,
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
 ) : SearchSessionPortV3 {
     private enum class State { STARTING, RUNNING, FINISHING, EMITTING_PAUSE, PAUSED, TERMINAL, UNKNOWN }
@@ -45,6 +46,12 @@ internal class SearchSessionProducer(
     private class Cancellation(val epoch: Long) {
         val done = CountDownLatch(1)
         @Volatile var accepted: Boolean? = null
+    }
+    private class ControlWatch(val epoch: Long, val deadline: Long) {
+        val done = CountDownLatch(1)
+    }
+    private class PauseDelivery {
+        val done = CountDownLatch(1)
     }
     private class Active(val snapshot: SearchSnapshotV1, val observer: SearchSessionObserverV3, epoch: Long) {
         var state = State.STARTING
@@ -56,6 +63,8 @@ internal class SearchSessionProducer(
         var prepared = false
         var phase: SearchLocalPhase? = null
         var cancellation: Cancellation? = null
+        var watch: ControlWatch? = null
+        var pauseDelivery: PauseDelivery? = null
         var resources = SearchResourceStateV2.QUARANTINED
     }
 
@@ -92,12 +101,17 @@ internal class SearchSessionProducer(
     }
 
     override fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3 {
+        var pendingPause: PauseDelivery? = null
         val current = synchronized(lock) {
             val value = active ?: return SearchStartV3.REJECTED
             if (blocked || value.state == State.UNKNOWN) return SearchStartV3.UNKNOWN
-            if (value.snapshot.sessionGeneration != sessionGeneration || value.state != State.PAUSED ||
-                phaseEpoch <= value.lastEpoch || phaseEpoch <= 0
+            if (value.snapshot.sessionGeneration != sessionGeneration ||
+                (value.state != State.PAUSED && value.state != State.EMITTING_PAUSE) ||
+                value.control == Control.CANCEL || phaseEpoch <= value.lastEpoch || phaseEpoch <= 0
             ) return SearchStartV3.REJECTED
+            pendingPause = value.pauseDelivery
+            value.watch?.done?.countDown()
+            value.watch = null
             value.lastEpoch = phaseEpoch
             value.epoch = phaseEpoch
             value.control = Control.NONE
@@ -105,10 +119,21 @@ internal class SearchSessionProducer(
             value.prepared = false
             value.phase = null
             value.cancellation = null
+            value.pauseDelivery = null
             value.state = State.STARTING
             value
         }
-        if (!launch { runPhase(current, phaseEpoch) }) {
+        if (!launch {
+                val pause = pendingPause
+                if (pause != null) {
+                    try { pause.done.await() } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        unknown(current)
+                        return@launch
+                    }
+                }
+                runPhase(current, phaseEpoch)
+            }) {
             unknown(current)
             return SearchStartV3.UNKNOWN
         }
@@ -121,7 +146,7 @@ internal class SearchSessionProducer(
             current.snapshot.sessionGeneration, current.snapshot.sourceRevision, current.snapshot.selectionRevision, profiles,
         )
         val session = try {
-            createSession(snapshot) { progress -> progress(current, progress) }
+            createSession(snapshot) { epoch, progress -> progress(current, epoch, progress) }
         } catch (failure: Throwable) {
             try { profiles.close() } catch (_: Exception) { }
             unknown(current)
@@ -237,6 +262,7 @@ internal class SearchSessionProducer(
         var dispatch: Triple<Active, SearchPhaseSession, Cancellation>? = null
         var finishPaused: Active? = null
         var failed: Active? = null
+        var startWatch: Pair<Active, ControlWatch>? = null
         synchronized(lock) {
             val current = active ?: return
             if (current.snapshot.sessionGeneration != generation || current.epoch != epoch ||
@@ -248,6 +274,11 @@ internal class SearchSessionProducer(
             } else {
                 if (current.deadline == null) current.deadline = now + cleanupMillis
                 current.control = requested
+                if (current.watch == null) {
+                    val watch = ControlWatch(epoch, current.deadline!!)
+                    current.watch = watch
+                    startWatch = current to watch
+                }
                 if (requested == Control.CANCEL) phase = current.phase
                 if (current.state == State.PAUSED && requested == Control.CANCEL) {
                     current.state = State.FINISHING
@@ -263,9 +294,29 @@ internal class SearchSessionProducer(
             }
         }
         phase?.revoke()
+        startWatch?.let { (current, watch) -> dispatchWatch(current, watch) }
         failed?.let { unknown(it) }
         dispatch?.let { (current, session, cancellation) -> dispatchCancel(current, session, cancellation) }
         finishPaused?.let { current -> if (!launch { finishWithoutRun(current, cancelled = true) }) unknown(current) }
+    }
+
+    private fun dispatchWatch(current: Active, watch: ControlWatch): Unit {
+        if (!launch {
+                while (true) {
+                    val now = nowMillis()
+                    if (now < 0 || now >= watch.deadline) {
+                        unknown(current, watch = watch)
+                        return@launch
+                    }
+                    val finished = try { watch.done.await(watch.deadline - now, TimeUnit.MILLISECONDS) }
+                    catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        unknown(current, watch = watch)
+                        return@launch
+                    }
+                    if (finished) return@launch
+                }
+            }) unknown(current, watch = watch)
     }
 
     private fun dispatchCancel(current: Active, session: SearchPhaseSession, cancellation: Cancellation): Unit {
@@ -299,23 +350,34 @@ internal class SearchSessionProducer(
         val session = synchronized(lock) { current.session } ?: return unknown(current)
         val resources = cleanup(current) { session.pauseResources() } ?: SearchResourceStateV2.QUARANTINED
         if (resources != SearchResourceStateV2.PAUSED_LEASE_HELD) return unknown(current)
+        var delivery: PauseDelivery? = null
+        val epoch = synchronized(lock) { current.epoch }
         val cancelInstead = synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN) return
             if (current.control == Control.CANCEL) true else {
+                delivery = PauseDelivery()
+                current.pauseDelivery = delivery
                 current.state = State.EMITTING_PAUSE
                 false
             }
         }
         if (cancelInstead) return finishWithoutRun(current, cancelled = true)
-        val terminal = SearchTerminalV3.Paused(current.snapshot.sessionGeneration, current.epoch, reason, resources)
-        if (!emit(current, terminal)) return
+        val terminal = SearchTerminalV3.Paused(current.snapshot.sessionGeneration, epoch, reason, resources)
+        val delivered = try { emit(current, terminal) } finally { delivery!!.done.countDown() }
+        if (!delivered) return
         val cancelAfter = synchronized(lock) {
-            if (active !== current || current.state == State.UNKNOWN) return
+            if (active !== current || current.state == State.UNKNOWN || current.epoch != epoch ||
+                current.state != State.EMITTING_PAUSE || current.pauseDelivery !== delivery
+            ) return
+            current.pauseDelivery = null
             if (current.control == Control.CANCEL) {
                 current.state = State.FINISHING
                 true
             } else {
                 current.state = State.PAUSED
+                current.deadline = null
+                current.watch?.done?.countDown()
+                current.watch = null
                 false
             }
         }
@@ -354,6 +416,8 @@ internal class SearchSessionProducer(
         synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN || current.state == State.TERMINAL) return
             current.state = State.TERMINAL
+            current.watch?.done?.countDown()
+            current.watch = null
         }
         if (!emit(current, terminal)) return
         synchronized(lock) { if (active === current && current.state == State.TERMINAL) active = null }
@@ -367,19 +431,24 @@ internal class SearchSessionProducer(
         false
     }
 
-    private fun progress(current: Active, progress: SearchProgressV1): Unit {
-        val epoch = synchronized(lock) {
-            if (active !== current || current.state != State.RUNNING || progress.sessionGeneration != current.snapshot.sessionGeneration) return
-            current.epoch
+    private fun progress(current: Active, epoch: Long, progress: SearchProgressV1): Unit {
+        synchronized(lock) {
+            if (active !== current || current.state != State.RUNNING || current.epoch != epoch ||
+                progress.sessionGeneration != current.snapshot.sessionGeneration
+            ) return
         }
         try { current.observer.onProgress(epoch, progress) } catch (_: Exception) { }
     }
 
-    private fun unknown(current: Active, notify: Boolean = true): Unit {
+    private fun unknown(current: Active, notify: Boolean = true, watch: ControlWatch? = null): Unit {
         val captured = synchronized(lock) {
-            if (active !== current || current.state == State.UNKNOWN) return
+            if (active !== current || current.state == State.UNKNOWN ||
+                (watch != null && (current.watch !== watch || current.epoch != watch.epoch || current.state == State.TERMINAL))
+            ) return
             blocked = true
             current.state = State.UNKNOWN
+            current.watch?.done?.countDown()
+            current.watch = null
             Triple(current.session, current.phase, current.resources)
         }
         captured.second?.revoke()
