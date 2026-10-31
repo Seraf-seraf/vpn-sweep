@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -155,65 +156,77 @@ internal fun ServerSelectionDialogContent(
             border = BorderStroke(1.dp, ServerDialogColors.outline),
         ) {
             val listState = rememberLazyListState()
-            Column(modifier = Modifier.padding(16.dp)) {
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                val actions = dialogActionsLayout(maxWidth, horizontalPadding = 12.dp, outerPadding = 6.dp)
+                val actionHeight = maxOf(48.dp, with(LocalDensity.current) { 22.sp.toDp() } + 16.dp) + 6.dp
+                val footerHeight = if (actions.stacked) actionHeight * 2 + 8.dp else actionHeight
+                val scrollEntireDialog = maxHeight < footerHeight + 48.dp
                 Column(
-                    modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                    modifier = Modifier.fillMaxWidth().then(
+                        if (scrollEntireDialog) Modifier.verticalScroll(rememberScrollState()) else Modifier,
+                    ),
                 ) {
-                    ServerDialogHeader()
-                    Spacer(Modifier.height(16.dp))
-                    ServerSearch(search, { search = it })
-                    Spacer(Modifier.height(8.dp))
-                    SelectAllServers(
-                        state = selectAllState,
-                        enabled = visibleSupportedIds.isNotEmpty(),
-                        selectedCount = visibleSelected,
-                        totalCount = visibleSupportedIds.size,
-                        onClick = {
-                            selected = updateVisibleSelection(
-                                selected = selected,
-                                visibleSupportedIds = visibleSupportedIds,
-                                select = selectAllState != ToggleableState.On,
-                            )
-                        },
-                    )
-                    Box(modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
-                        LazyColumn(
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).padding(end = 10.dp),
-                            state = listState,
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            if (servers.isEmpty()) {
-                                item { ServerListMessage("Нет загруженных серверов") }
-                            } else if (filteredServers.isEmpty()) {
-                                item { ServerListMessage("Серверы не найдены") }
-                            } else {
-                                itemsIndexed(
-                                    items = filteredServers,
-                                    key = { index, server -> "$index:${server.id}" },
-                                ) { _, server ->
-                                    ServerRow(
-                                        server = server,
-                                        checked = server.supported && server.id in selected,
-                                        onCheckedChange = { checked ->
-                                            selected = if (checked) {
-                                                selected + server.id
-                                            } else {
-                                                selected - server.id
-                                            }
-                                        },
-                                    )
+                    Column(
+                        modifier = if (scrollEntireDialog) Modifier else
+                            Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                    ) {
+                        ServerDialogHeader()
+                        Spacer(Modifier.height(16.dp))
+                        ServerSearch(search, { search = it })
+                        Spacer(Modifier.height(8.dp))
+                        SelectAllServers(
+                            state = selectAllState,
+                            enabled = visibleSupportedIds.isNotEmpty(),
+                            selectedCount = visibleSelected,
+                            totalCount = visibleSupportedIds.size,
+                            onClick = {
+                                selected = updateVisibleSelection(
+                                    selected = selected,
+                                    visibleSupportedIds = visibleSupportedIds,
+                                    select = selectAllState != ToggleableState.On,
+                                )
+                            },
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).padding(end = 10.dp),
+                                state = listState,
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                if (servers.isEmpty()) {
+                                    item { ServerListMessage("Нет загруженных серверов") }
+                                } else if (filteredServers.isEmpty()) {
+                                    item { ServerListMessage("Серверы не найдены") }
+                                } else {
+                                    itemsIndexed(
+                                        items = filteredServers,
+                                        key = { index, server -> "$index:${server.id}" },
+                                    ) { _, server ->
+                                        ServerRow(
+                                            server = server,
+                                            checked = server.supported && server.id in selected,
+                                            onCheckedChange = { checked ->
+                                                selected = if (checked) {
+                                                    selected + server.id
+                                                } else {
+                                                    selected - server.id
+                                                }
+                                            },
+                                        )
+                                    }
                                 }
                             }
+                            ServerListScrollbar(listState, Modifier.matchParentSize())
                         }
-                        ServerListScrollbar(listState, Modifier.matchParentSize())
+                        ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
                     }
+                    ServerDialogFooter(
+                        selectedCount = selected.size,
+                        onDismiss = onDismiss,
+                        onConfirm = { onConfirm(selected.toSet()) },
+                        layout = actions,
+                    )
                 }
-                ServerDialogFooter(
-                    selectedCount = selected.size,
-                    noServers = servers.isEmpty(),
-                    onDismiss = onDismiss,
-                    onConfirm = { onConfirm(selected.toSet()) },
-                )
             }
         }
     }
@@ -466,11 +479,9 @@ private fun ServerListScrollbar(state: LazyListState, modifier: Modifier = Modif
 }
 
 @Composable
-private fun ServerDialogFooter(
+private fun ServerSelectionSummary(
     selectedCount: Int,
     noServers: Boolean,
-    onDismiss: () -> Unit,
-    onConfirm: () -> Unit,
 ): Unit {
     HorizontalDivider(modifier = Modifier.padding(top = 8.dp), color = ServerDialogColors.outline)
     Text(
@@ -484,24 +495,25 @@ private fun ServerDialogFooter(
         fontSize = 14.sp,
         lineHeight = 20.sp,
     )
-    val textMeasurer = rememberTextMeasurer()
-    val buttonStyle = TextStyle(fontFamily = SweepSans, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-    val labelWidth = maxOf(
-        textMeasurer.measure("Отмена", style = buttonStyle).size.width,
-        textMeasurer.measure("Ок", style = buttonStyle).size.width,
-    )
-    val requiredWidth = with(LocalDensity.current) { (labelWidth * 2).toDp() } + 116.dp
-    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-        val stack = maxWidth < requiredWidth
-        if (stack) {
+}
+
+@Composable
+private fun ServerDialogFooter(
+    selectedCount: Int,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+    layout: DialogActionsLayout,
+): Unit {
+    Box(modifier = Modifier.fillMaxWidth()) {
+        if (layout.stacked) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 ServerCancelButton(onDismiss, Modifier.fillMaxWidth())
                 ServerConfirmButton(selectedCount > 0, onConfirm, Modifier.fillMaxWidth())
             }
         } else {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ServerCancelButton(onDismiss, Modifier.weight(1f))
-                ServerConfirmButton(selectedCount > 0, onConfirm, Modifier.weight(1f))
+                ServerCancelButton(onDismiss, Modifier.weight(layout.cancelWeight))
+                ServerConfirmButton(selectedCount > 0, onConfirm, Modifier.weight(layout.confirmWeight))
             }
         }
     }
@@ -515,6 +527,7 @@ private fun ServerCancelButton(onClick: () -> Unit, modifier: Modifier = Modifie
         shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, ServerDialogColors.accent),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = ServerDialogColors.text),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text("Отмена", fontSize = 16.sp, lineHeight = 22.sp)
     }
@@ -533,6 +546,7 @@ private fun ServerConfirmButton(enabled: Boolean, onClick: () -> Unit, modifier:
             disabledContainerColor = ServerDialogColors.outline,
             disabledContentColor = ServerDialogColors.secondary,
         ),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text("Ок", fontSize = 16.sp, lineHeight = 22.sp)
     }

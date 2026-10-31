@@ -63,7 +63,6 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -166,55 +165,66 @@ internal fun SubscriptionDialogContent(
         color = SubscriptionSurface,
         border = androidx.compose.foundation.BorderStroke(1.dp, SubscriptionOutline),
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            val actions = dialogActionsLayout(maxWidth, horizontalPadding = 12.dp, confirmExtra = if (loading) 24.dp else 0.dp)
+            val actionHeight = maxOf(48.dp, with(LocalDensity.current) { 20.sp.toDp() } + 24.dp)
+            val footerHeight = if (actions.stacked) actionHeight * 2 + 8.dp else actionHeight
+            val scrollEntireDialog = maxHeight < footerHeight + 48.dp
             Column(
-                modifier = Modifier
-                    .weight(1f, fill = false)
-                    .verticalScroll(rememberScrollState()),
+                modifier = Modifier.fillMaxWidth().then(
+                    if (scrollEntireDialog) Modifier.verticalScroll(rememberScrollState()) else Modifier,
+                ),
             ) {
-                Text(
-                    text = "Добавить подписку",
-                    modifier = Modifier.fillMaxWidth(),
-                    color = SubscriptionText,
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                    lineHeight = 30.sp,
-                    textAlign = TextAlign.Center,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Вставьте ссылку на подписку",
-                    modifier = Modifier.fillMaxWidth(),
-                    color = SubscriptionSecondaryText,
-                    fontSize = 16.sp,
-                    lineHeight = 22.sp,
-                    textAlign = TextAlign.Center,
-                )
-                Spacer(Modifier.height(24.dp))
-                Text(
-                    text = "Ссылка",
-                    color = SubscriptionText,
-                    fontSize = 14.sp,
-                    lineHeight = 20.sp,
-                )
-                Spacer(Modifier.height(8.dp))
-                SubscriptionLinkField(
-                    link = link,
-                    status = status,
-                    enabled = !loading,
-                    onLinkChange = onLinkChange,
+                Column(
+                    modifier = if (scrollEntireDialog) Modifier else Modifier
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    Text(
+                        text = "Добавить подписку",
+                        modifier = Modifier.fillMaxWidth(),
+                        color = SubscriptionText,
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold,
+                        lineHeight = 30.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "Вставьте ссылку на подписку",
+                        modifier = Modifier.fillMaxWidth(),
+                        color = SubscriptionSecondaryText,
+                        fontSize = 16.sp,
+                        lineHeight = 22.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    Text(
+                        text = "Ссылка",
+                        color = SubscriptionText,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    SubscriptionLinkField(
+                        link = link,
+                        status = status,
+                        enabled = !loading,
+                        onLinkChange = onLinkChange,
+                        onSubmit = submit,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    SubscriptionStatusMessage(status)
+                    Spacer(Modifier.height(24.dp))
+                }
+                SubscriptionActions(
+                    canSubmit = canSubmit,
+                    loading = loading,
+                    onDismiss = onDismiss,
                     onSubmit = submit,
+                    layout = actions,
                 )
-                Spacer(Modifier.height(16.dp))
-                SubscriptionStatusMessage(status)
-                Spacer(Modifier.height(24.dp))
             }
-            SubscriptionActions(
-                canSubmit = canSubmit,
-                loading = loading,
-                onDismiss = onDismiss,
-                onSubmit = submit,
-            )
         }
     }
 }
@@ -402,18 +412,13 @@ private fun SubscriptionActions(
     loading: Boolean,
     onDismiss: () -> Unit,
     onSubmit: () -> Unit,
+    layout: DialogActionsLayout,
 ): Unit {
-    val textMeasurer = rememberTextMeasurer()
-    val textStyle = TextStyle(fontFamily = SweepSans, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-    val cancelWidth = textMeasurer.measure("Отмена", style = textStyle).size.width
-    val okWidth = textMeasurer.measure("Ок", style = textStyle).size.width
-    val requiredWidth = with(LocalDensity.current) { maxOf(cancelWidth, okWidth).toDp() * 2 + 72.dp }
-
-    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-        if (maxWidth >= requiredWidth) {
+    Box(modifier = Modifier.fillMaxWidth()) {
+        if (!layout.stacked) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SubscriptionCancelButton(onDismiss, Modifier.weight(1f))
-                SubscriptionSubmitButton(canSubmit, loading, onSubmit, Modifier.weight(1f))
+                SubscriptionCancelButton(onDismiss, Modifier.weight(layout.cancelWeight))
+                SubscriptionSubmitButton(canSubmit, loading, onSubmit, Modifier.weight(layout.confirmWeight))
             }
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -433,7 +438,7 @@ private fun SubscriptionCancelButton(onDismiss: () -> Unit, modifier: Modifier =
         shape = RoundedCornerShape(12.dp),
         border = androidx.compose.foundation.BorderStroke(if (focused) 2.dp else 1.dp, if (focused) SubscriptionAccent else SubscriptionOutline),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = SubscriptionText),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
     ) {
         Text("Отмена", fontSize = 16.sp, lineHeight = 20.sp, fontWeight = FontWeight.Bold)
     }
@@ -461,7 +466,7 @@ private fun SubscriptionSubmitButton(
             disabledContainerColor = SubscriptionDisabled,
             disabledContentColor = SubscriptionSecondaryText,
         ),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
     ) {
         if (loading) {
             CircularProgressIndicator(modifier = Modifier.size(16.dp), color = SubscriptionSecondaryText, strokeWidth = 2.dp)

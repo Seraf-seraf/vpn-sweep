@@ -3,7 +3,11 @@ package com.seraf.vpnsweep
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.test.SemanticsMatcher
@@ -11,6 +15,7 @@ import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasText
@@ -26,6 +31,7 @@ import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Density
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -139,6 +145,38 @@ class UiAccessibilityTest {
         compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().performClick()
         compose.onNodeWithContentDescription("Ссылка").assertTextContains("https://example.com/sub")
         compose.onNodeWithText("Введите корректную ссылку").assertDoesNotExist()
+    }
+
+    @Test
+    fun subscriptionFooterFitsAboveKeyboardWithLargeText(): Unit {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 2f)) {
+                SweepTheme {
+                    Box(Modifier.size(width = 272.dp, height = 148.dp)) {
+                        SubscriptionDialogContent("", SubscriptionDialogStatus.Empty, {}, {}, {})
+                    }
+                }
+            }
+        }
+        compose.onNodeWithText("Отмена").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("Ок").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+    }
+
+    @Test
+    fun serverFooterFitsAboveKeyboardWithLargeText(): Unit {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 2f)) {
+                SweepTheme {
+                    Box(Modifier.size(width = 320.dp, height = 196.dp)) {
+                        ServerSelectionDialogContent(emptyList(), emptySet(), {}, {})
+                    }
+                }
+            }
+        }
+        compose.onNodeWithText("Отмена").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("Ок").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
     }
 
     @Test
