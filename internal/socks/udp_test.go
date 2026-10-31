@@ -18,12 +18,16 @@ func TestUDPExchangeChecksSourceAndLimit(t *testing.T) {
 		size    int
 		legacy  bool
 		wantErr string
+		minRead int
 	}{
+		{name: "empty payload", source: net.IPv4(192, 0, 2, 1), port: 53, size: 0},
+		{name: "below limit", source: net.IPv4(192, 0, 2, 1), port: 53, size: 511},
 		{name: "valid", source: net.IPv4(192, 0, 2, 1), port: 53, size: 512},
-		{name: "wrong source", source: net.IPv4(192, 0, 2, 2), port: 53, size: 1, wantErr: "udp_reply_source_mismatch"},
-		{name: "wrong port", source: net.IPv4(192, 0, 2, 1), port: 54, size: 1, wantErr: "udp_reply_source_mismatch"},
-		{name: "over limit", source: net.IPv4(192, 0, 2, 1), port: 53, size: 513, wantErr: "udp_reply_too_large"},
-		{name: "truncated datagram", source: net.IPv4(192, 0, 2, 1), port: 53, size: 1024, wantErr: "udp_reply_too_large"},
+		{name: "wrong source", source: net.IPv4(192, 0, 2, 2), port: 53, size: 1, wantErr: "udp_reply_source_mismatch", minRead: 1},
+		{name: "wrong port", source: net.IPv4(192, 0, 2, 1), port: 54, size: 1, wantErr: "udp_reply_source_mismatch", minRead: 1},
+		{name: "over limit", source: net.IPv4(192, 0, 2, 1), port: 53, size: 513, wantErr: "udp_reply_too_large", minRead: 513},
+		{name: "oversized datagram", source: net.IPv4(192, 0, 2, 1), port: 53, size: 1024, wantErr: "udp_reply_too_large", minRead: 1024},
+		{name: "large datagram", source: net.IPv4(192, 0, 2, 1), port: 53, size: 65000, wantErr: "udp_reply_too_large", minRead: 65000},
 		{name: "legacy echo", source: net.IPv4(192, 0, 2, 2), port: 53, size: 1, legacy: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,6 +105,9 @@ func TestUDPExchangeChecksSourceAndLimit(t *testing.T) {
 			}
 			if tc.wantErr == "" && (err != nil || len(reply) != tc.size) || tc.wantErr != "" && model.Code(err) != tc.wantErr {
 				t.Fatalf("reply size %d, error %v", len(reply), err)
+			}
+			if len(reply) < tc.minRead || len(reply) > tc.size {
+				t.Fatalf("received payload size %d, want %d..%d", len(reply), tc.minRead, tc.size)
 			}
 			if err := <-done; err != nil {
 				t.Fatal(err)

@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-const maxUDPHeaderBytes = 4 + 1 + 253 + 2
+const maxUDPDatagramBytes = 1 << 16
 
 func (e Endpoint) UDPEcho(ctx context.Context, address string, payload []byte) ([]byte, error) {
-	return e.udpExchange(ctx, address, payload, false, 65536)
+	return e.udpExchange(ctx, address, payload, false, maxUDPDatagramBytes)
 }
 
 func (e Endpoint) UDPExchange(ctx context.Context, address string, payload []byte, maxReplyBytes int) ([]byte, error) {
@@ -25,7 +25,7 @@ func (e Endpoint) UDPExchange(ctx context.Context, address string, payload []byt
 func (e Endpoint) udpExchange(ctx context.Context, address string, payload []byte, verifySource bool, maxReplyBytes int) ([]byte, error) {
 	host, p, err := net.SplitHostPort(address)
 	port, x := strconv.Atoi(p)
-	if err != nil || x != nil || port < 1 || port > 65535 || len(host) > 253 || len(payload) > 1200 || maxReplyBytes < 1 || maxReplyBytes > 65536 {
+	if err != nil || x != nil || port < 1 || port > 65535 || len(host) > 253 || len(payload) > 1200 || maxReplyBytes < 1 || maxReplyBytes > maxUDPDatagramBytes {
 		return nil, model.Err("invalid_udp_probe", "udp")
 	}
 	control, err := e.Negotiate(ctx)
@@ -95,54 +95,56 @@ func (e Endpoint) udpExchange(ctx context.Context, address string, payload []byt
 	if _, err = c.Write(packet); err != nil {
 		return nil, model.Err("udp_send_failed", "udp")
 	}
-	bufferSize := maxReplyBytes + maxUDPHeaderBytes
-	if bufferSize > 65536 {
-		bufferSize = 65536
-	}
-	reply := make([]byte, bufferSize)
+	reply := make([]byte, maxUDPDatagramBytes)
 	var n int
+	var flags int
 	if verifySource {
-		var flags int
 		n, _, flags, _, err = c.ReadMsgUDP(reply, nil)
-		if err == nil && flags&syscall.MSG_TRUNC != 0 {
-			return nil, model.Err("udp_reply_too_large", "udp")
-		}
 	} else {
 		n, err = c.Read(reply)
 	}
+	reject := func(code string) ([]byte, error) {
+		if verifySource {
+			return udpPayloadForAccounting(reply[:n]), model.Err(code, "udp")
+		}
+		return nil, model.Err(code, "udp")
+	}
 	if err != nil {
-		return nil, model.Err("udp_timeout_or_read_failed", "udp")
+		return reject("udp_timeout_or_read_failed")
+	}
+	if flags&syscall.MSG_TRUNC != 0 {
+		return reject("udp_reply_too_large")
 	}
 	if n < 4 || reply[0] != 0 || reply[1] != 0 || reply[2] != 0 {
-		return nil, model.Err("udp_fragment_unsupported", "udp")
+		return reject("udp_fragment_unsupported")
 	}
 	off := 4
 	var source string
 	switch reply[3] {
 	case 1:
 		if n < off+4+2 {
-			return nil, model.Err("udp_reply_invalid", "udp")
+			return reject("udp_reply_invalid")
 		}
 		source = net.IP(reply[off : off+4]).String()
 		off += 4
 	case 4:
 		if n < off+16+2 {
-			return nil, model.Err("udp_reply_invalid", "udp")
+			return reject("udp_reply_invalid")
 		}
 		source = net.IP(reply[off : off+16]).String()
 		off += 16
 	case 3:
 		if n < 5 {
-			return nil, model.Err("udp_reply_invalid", "udp")
+			return reject("udp_reply_invalid")
 		}
 		length := int(reply[4])
 		if n < off+1+length+2 {
-			return nil, model.Err("udp_reply_invalid", "udp")
+			return reject("udp_reply_invalid")
 		}
 		source = string(reply[off+1 : off+1+length])
 		off += 1 + length
 	default:
-		return nil, model.Err("udp_reply_invalid", "udp")
+		return reject("udp_reply_invalid")
 	}
 	sourcePort := int(binary.BigEndian.Uint16(reply[off : off+2]))
 	off += 2
@@ -153,11 +155,35 @@ func (e Endpoint) udpExchange(ctx context.Context, address string, payload []byt
 			matches = strings.EqualFold(host, source)
 		}
 		if !matches || sourcePort != port {
-			return nil, model.Err("udp_reply_source_mismatch", "udp")
+			return reject("udp_reply_source_mismatch")
 		}
 		if n-off > maxReplyBytes {
-			return nil, model.Err("udp_reply_too_large", "udp")
+			return reject("udp_reply_too_large")
 		}
 	}
 	return append([]byte(nil), reply[off:n]...), nil
+}
+
+func udpPayloadForAccounting(packet []byte) []byte {
+	if len(packet) < 4 {
+		return packet
+	}
+	offset := 0
+	switch packet[3] {
+	case 1:
+		offset = 4 + 4 + 2
+	case 4:
+		offset = 4 + 16 + 2
+	case 3:
+		if len(packet) < 5 {
+			return packet
+		}
+		offset = 5 + int(packet[4]) + 2
+	default:
+		return packet
+	}
+	if offset > len(packet) {
+		return packet
+	}
+	return packet[offset:]
 }

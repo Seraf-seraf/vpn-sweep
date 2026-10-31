@@ -276,6 +276,50 @@ func TestNoiseDNSRespectsPayloadBudgetBeforeSending(t *testing.T) {
 	}
 }
 
+func TestFailedNoiseProbeCountsTowardPayloadBudget(t *testing.T) {
+	m, _, _, s := setup(t)
+	m.Policy = policy.Default()
+	m.Budgets.PayloadBytes = 4 << 20
+	profile, err := importer.Parse([]byte(syntheticSS("192.0.2.1")), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noise := []any{map[string]any{"type": "rand", "packet": "1", "delay": "0", "applyTo": "ip"}}
+	g, err := space.New(space.Spec{Version: 2, Strategy: "exhaustive", Parameters: []space.Domain{
+		{Name: "mux", Values: []any{false}},
+		{Name: "noise", Values: []any{true}},
+		{Name: "noises", Values: []any{noise}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed, pages, udpCalls := 0, 0, 0
+	e := Engine{
+		Open: func(_ context.Context, _ model.Profile, params map[string]any) (Tunnel, error) {
+			if params["noise"] != true {
+				return nil, model.Err("core_start_failed", "core")
+			}
+			return tunnel{&closed}, nil
+		},
+		Check: func(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
+			pages++
+			bytes := int64(2 << 20)
+			if pages == 2 {
+				bytes -= 512
+			}
+			return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", Bytes: bytes}
+		},
+		UDP: func(_ context.Context, _ socks.Endpoint, p model.UDPProbe, round int) model.ProbeResult {
+			udpCalls++
+			return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Transport: "udp-socks5", Outcome: "udp_reply_too_large", Bytes: 513}
+		},
+	}
+	status, err := e.Run(context.Background(), m, profile.Profiles, make([]byte, 32), g, s)
+	if err != nil || status != "paused_budget" || pages != 2 || udpCalls != 1 || closed != 1 || s.View().PayloadBytes != m.Budgets.PayloadBytes+1 {
+		t.Fatalf("failed UDP accounting: status=%s err=%v pages=%d udp=%d closed=%d bytes=%d", status, err, pages, udpCalls, closed, s.View().PayloadBytes)
+	}
+}
+
 func TestMissingNoiseProbeStopsAndPreservesCleanupError(t *testing.T) {
 	for _, failClose := range []bool{false, true} {
 		t.Run(strconv.FormatBool(failClose), func(t *testing.T) {

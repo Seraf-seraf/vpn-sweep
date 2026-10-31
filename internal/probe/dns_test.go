@@ -34,9 +34,10 @@ func TestUDPDNSThroughSOCKS(t *testing.T) {
 	}
 	defer h.Close()
 	for _, tc := range []struct {
-		name   string
-		mutate func([]byte) []byte
-		pass   bool
+		name      string
+		mutate    func([]byte) []byte
+		pass      bool
+		wantBytes int64
 	}{
 		{name: "valid A response", pass: true},
 		{name: "wrong transaction", mutate: func(b []byte) []byte { b[0] ^= 1; return b }},
@@ -45,7 +46,8 @@ func TestUDPDNSThroughSOCKS(t *testing.T) {
 		{name: "no answer", mutate: func(b []byte) []byte { b[7] = 0; return b }},
 		{name: "incomplete answer", mutate: func(b []byte) []byte { return b[:len(b)-1] }},
 		{name: "bad compression pointer", mutate: func(b []byte) []byte { b[len(b)-16] = 0xff; return b }},
-		{name: "oversized response", mutate: func(b []byte) []byte { return append(b, make([]byte, 600)...) }},
+		{name: "response one byte over limit", mutate: func(b []byte) []byte { return append(b, make([]byte, 513-len(b))...) }, wantBytes: 513},
+		{name: "oversized datagram", mutate: func(b []byte) []byte { return append(b, make([]byte, 1200-len(b))...) }, wantBytes: 1200},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -74,8 +76,11 @@ func TestUDPDNSThroughSOCKS(t *testing.T) {
 			if (result.Outcome == "pass") != tc.pass || result.Transport != "udp-socks5" {
 				t.Fatal(result)
 			}
-			if tc.name == "oversized response" && result.Outcome != "udp_reply_too_large" {
+			if tc.wantBytes > 0 && result.Outcome != "udp_reply_too_large" {
 				t.Fatal("DNS size limit was not enforced", result)
+			}
+			if tc.wantBytes > 0 && result.Bytes != tc.wantBytes {
+				t.Fatalf("received payload was not counted: %+v", result)
 			}
 		})
 	}
