@@ -73,7 +73,7 @@ func NewSearchSession(generation int64, manifestBytes, profileBytes []byte, stat
 	var manifest model.Manifest
 	var profiles []model.Profile
 	if model.Decode(manifestBytes, &manifest) != nil || model.Decode(profileBytes, &profiles) != nil ||
-		manifest.Version != model.SchemaVersion || len(profiles) == 0 || len(profiles) > 10000 ||
+		len(profiles) == 0 || len(profiles) > 10000 || !model.SupportsProfileSchemaVersion(manifest.Version, profiles) ||
 		(manifest.SearchVersion != model.SearchVersion && manifest.SearchVersion != model.LegacySearchVersion) ||
 		(manifest.Environment != "unverified" && (manifest.Environment != "user_attested" || manifest.NetworkLabel == "")) ||
 		!validSearchBudgets(manifest.Budgets) || capability.Gate(manifest.Mode, manifest.Core.Commit) != nil ||
