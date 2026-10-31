@@ -18,6 +18,7 @@ import (
 type fakeWorker struct {
 	identities []Identity
 	trace      []string
+	rounds     []int
 	openErr    error
 	openErrors []error
 	closeErr   error
@@ -45,6 +46,7 @@ type fakeRound struct{ worker *fakeWorker }
 
 func (r *fakeRound) Check(_ context.Context, p model.Probe, round int) (model.ProbeResult, error) {
 	r.worker.trace = append(r.worker.trace, "check")
+	r.worker.rounds = append(r.worker.rounds, round)
 	if r.worker.checkErr != nil {
 		return model.ProbeResult{}, r.worker.checkErr
 	}
@@ -117,6 +119,12 @@ func TestAndroidSearchOpensAndClosesOneWorkerPerRound(t *testing.T) {
 	identities := []Identity{{42, 1, 1, 1}, {42, 1, 2, 2}}
 	if !reflect.DeepEqual(worker.identities, identities) {
 		t.Fatalf("identities %v, want %v", worker.identities, identities)
+	}
+	if want := []int{0, 0, 1}; !reflect.DeepEqual(worker.rounds, want) {
+		t.Fatalf("probe rounds %v, want %v", worker.rounds, want)
+	}
+	if attempts := runner.Store.View().Attempts; attempts != 1 {
+		t.Fatalf("rounds changed candidate budget: attempts=%d, want 1", attempts)
 	}
 }
 
