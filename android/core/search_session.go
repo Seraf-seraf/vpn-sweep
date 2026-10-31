@@ -39,6 +39,16 @@ const (
 const SearchWorkerRetryableFlag = 1 << 8
 
 const (
+	searchWorkerFrameHeaderBytes            int64 = 16
+	searchWorkerMaxJSONLeafBytes            int64 = importer.MaxInputBytes
+	searchWorkerMaxOpenFrameBytes           int64 = searchWorkerFrameHeaderBytes + 2*searchWorkerMaxJSONLeafBytes
+	searchWorkerMaxCallFrameBytes           int64 = searchWorkerFrameHeaderBytes + searchWorkerMaxJSONLeafBytes
+	searchWorkerResultEnvelopeOverheadBytes int64 = 21
+	searchWorkerMaxReplyEnvelopeBytes       int64 = searchWorkerMaxJSONLeafBytes + searchWorkerResultEnvelopeOverheadBytes
+	searchWorkerMaxInt64                    int64 = 1<<63 - 1
+)
+
+const (
 	SearchWorkerCheck = iota + 1
 	SearchWorkerUDP
 	SearchWorkerMedia
@@ -86,6 +96,9 @@ func NewSearchSession(generation int64, manifestBytes, profileBytes []byte, stat
 		!validSearchBudgets(manifest.Budgets) || capability.Gate(manifest.Mode, manifest.Core.Commit) != nil ||
 		policy.Validate(manifest.Policy) != nil {
 		return nil, errors.New("invalid_search_input")
+	}
+	if !searchWorkerPolicyRequestWithinBounds(manifest.Policy) {
+		return nil, errors.New("search_worker_request_size")
 	}
 	for _, profile := range profiles {
 		if importer.Validate(profile) != nil {
@@ -249,6 +262,59 @@ func safeSessionError(err error) error {
 	return errors.New(model.Code(err))
 }
 
+func searchWorkerPolicyRequestWithinBounds(value model.Policy) bool {
+	if policy.HasVideo(value) {
+		encoded, err := json.Marshal(value)
+		return err == nil && searchWorkerJSONWithinBounds(int64(len(encoded)))
+	}
+	for _, probe := range value.Probes {
+		encoded, err := json.Marshal(probe)
+		if err != nil || !searchWorkerJSONWithinBounds(int64(len(encoded))) {
+			return false
+		}
+	}
+	for _, probe := range value.UDP {
+		encoded, err := json.Marshal(probe)
+		if err != nil || !searchWorkerJSONWithinBounds(int64(len(encoded))) {
+			return false
+		}
+	}
+	return true
+}
+
+func searchWorkerJSONWithinBounds(length int64) bool {
+	return length > 0 && length <= searchWorkerMaxJSONLeafBytes
+}
+
+func searchWorkerReplyWithinBounds(length int64) bool {
+	return length > 0 && length <= searchWorkerMaxReplyEnvelopeBytes
+}
+
+func checkedSearchWorkerFramePart(total, part int64) (int64, bool) {
+	if total < 0 || part < 0 || total > searchWorkerMaxInt64-part {
+		return 0, false
+	}
+	return total + part, true
+}
+
+func searchWorkerFrameWithinBounds(maxFrameBytes int64, leafBytes ...int64) bool {
+	if maxFrameBytes < searchWorkerFrameHeaderBytes {
+		return false
+	}
+	total := searchWorkerFrameHeaderBytes
+	for _, length := range leafBytes {
+		if !searchWorkerJSONWithinBounds(length) {
+			return false
+		}
+		var ok bool
+		total, ok = checkedSearchWorkerFramePart(total, length)
+		if !ok || total > maxFrameBytes {
+			return false
+		}
+	}
+	return true
+}
+
 type androidSearchWorker struct {
 	callback      SearchEngineWorker
 	startup       time.Duration
@@ -263,6 +329,9 @@ func (w *androidSearchWorker) Open(ctx context.Context, id searchbridge.Identity
 	paramBytes, paramErr := json.Marshal(params)
 	if profileErr != nil || paramErr != nil {
 		return nil, searchbridge.ErrWorkerUnavailable
+	}
+	if !searchWorkerFrameWithinBounds(searchWorkerMaxOpenFrameBytes, int64(len(profileBytes)), int64(len(paramBytes))) {
+		return nil, searchbridge.ErrCapabilityUnavailable
 	}
 	generation := int64(id.WorkerGeneration)
 	stop := context.AfterFunc(ctx, func() { w.callback.Cancel(generation) })
@@ -379,6 +448,9 @@ func (r *androidSearchRound) call(ctx context.Context, operation int, request an
 	if err != nil {
 		return searchbridge.ErrWorkerUnavailable
 	}
+	if !searchWorkerFrameWithinBounds(searchWorkerMaxCallFrameBytes, int64(len(data))) {
+		return searchbridge.ErrCapabilityUnavailable
+	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}
@@ -391,6 +463,9 @@ func (r *androidSearchRound) call(ctx context.Context, operation int, request an
 	stop := context.AfterFunc(ctx, func() { r.callback.Cancel(r.generation) })
 	response := r.callback.Call(r.generation, operation, data, round, remaining)
 	stop()
+	if !searchWorkerReplyWithinBounds(int64(len(response))) {
+		return searchbridge.ErrWorkerUnavailable
+	}
 	if model.Decode(response, reply) != nil {
 		return searchbridge.ErrWorkerUnavailable
 	}

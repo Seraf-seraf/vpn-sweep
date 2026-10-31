@@ -3,6 +3,7 @@ package com.seraf.vpnsweep
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchstorage.ResultRevision
+import com.seraf.vpnsweep.searchworker.SearchWorkerServiceBounds
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionRecordV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionSnapshotV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionRejectV1
@@ -11,9 +12,40 @@ import java.io.InputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VpnStartGateV1Test {
+    @Test
+    fun productionWorkerBoundsMatchTheValidatedServiceWireContract(): Unit {
+        val limits = SearchWorkerTransportLimits.production()
+
+        assertEquals(16, SearchWorkerServiceBounds.FRAME_HEADER_BYTES)
+        assertEquals(
+            SearchWorkerServiceBounds.FRAME_HEADER_BYTES + SearchWorkerServiceBounds.MAX_JSON_LEAF_BYTES * 2,
+            SearchWorkerServiceBounds.MAX_FRAME_BYTES,
+        )
+        assertEquals(
+            SearchWorkerServiceBounds.FRAME_HEADER_BYTES + SearchWorkerServiceBounds.MAX_JSON_LEAF_BYTES,
+            SearchWorkerServiceBounds.MAX_CALL_FRAME_BYTES,
+        )
+        assertEquals(
+            SearchWorkerServiceBounds.MAX_RAW_REPLY_BYTES + SearchWorkerServiceBounds.RESULT_ENVELOPE_OVERHEAD_BYTES,
+            SearchWorkerServiceBounds.MAX_REPLY_BYTES,
+        )
+        assertEquals(21, SearchWorkerServiceBounds.RESULT_ENVELOPE_OVERHEAD_BYTES)
+        assertTrue(limits.isProven)
+
+        val frameBytes = checkNotNull(limits.frameBytes)
+        val replyBytes = checkNotNull(limits.replyBytes)
+        assertFalse(limits.copy(frameBytes = frameBytes - 1).isProven)
+        assertFalse(limits.copy(frameBytes = frameBytes + 1).isProven)
+        assertFalse(limits.copy(replyBytes = replyBytes - 1).isProven)
+        assertFalse(limits.copy(replyBytes = replyBytes + 1).isProven)
+        assertFalse(SearchWorkerTransportLimits(null, replyBytes).isProven)
+        assertFalse(SearchWorkerTransportLimits(frameBytes, null).isProven)
+    }
+
     @Test
     fun acceptedTypedSnapshotFlowsThroughSearchLeaseToOneShotServiceTicket(): Unit {
         val gate = VpnStartGateV1()

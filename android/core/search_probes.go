@@ -255,5 +255,8 @@ func encodeProbeResult(value any) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("probe_result_encoding_failed")
 	}
+	if !searchWorkerJSONWithinBounds(int64(len(result))) {
+		return nil, errors.New("search_worker_reply_size")
+	}
 	return result, nil
 }

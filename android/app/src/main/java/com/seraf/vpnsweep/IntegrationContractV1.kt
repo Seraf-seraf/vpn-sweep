@@ -2,6 +2,7 @@ package com.seraf.vpnsweep
 
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchstorage.ResultRevision
+import com.seraf.vpnsweep.searchworker.SearchWorkerServiceBounds
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionSnapshotV1
 import com.seraf.vpnsweep.vpn.VpnRun
 import java.util.UUID
@@ -96,6 +97,19 @@ internal data class VpnStartIdentityV1(
 }
 
 internal data class VpnStartTicketV1(val token: String, val identity: VpnStartIdentityV1)
+
+internal data class SearchWorkerTransportLimits(val frameBytes: Int?, val replyBytes: Int?) {
+    val isProven: Boolean
+        get() = frameBytes == SearchWorkerServiceBounds.MAX_FRAME_BYTES &&
+            replyBytes == SearchWorkerServiceBounds.MAX_REPLY_BYTES
+
+    companion object {
+        fun production(): SearchWorkerTransportLimits = SearchWorkerTransportLimits(
+            SearchWorkerServiceBounds.MAX_FRAME_BYTES,
+            SearchWorkerServiceBounds.MAX_REPLY_BYTES,
+        )
+    }
+}
 
 internal class VpnStartGateV1 {
     private var pending: VpnStartTicketV1? = null

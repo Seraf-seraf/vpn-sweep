@@ -62,7 +62,7 @@ internal class AppComposition(context: Context) {
     private var activeSearch: SearchLeaseReceiptV1? = null
     private var completedSearch: SearchLeaseReceiptV1? = null
     private val startGate = VpnStartGateV1()
-    private val workerTransportLimits = SearchWorkerTransportLimits(frameBytes = null, replyBytes = null)
+    private val workerTransportLimits = SearchWorkerTransportLimits.production()
     private val marker = PrivateSessionMarker(File(app.noBackupFilesDir, "session-state"))
     private val searchPort = ProductionSearchPort()
     val activation: ResultActivationComposition = ResultActivationComposition.create(
@@ -95,7 +95,7 @@ internal class AppComposition(context: Context) {
         val searched = synchronized(lock) { completedSearch } ?: return false
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return false
         val state = subscriptions.state.value
-        return state.phase == SubscriptionPhase.READY && state.selectedIds.isNotEmpty() &&
+        return workerTransportLimits.isProven && state.phase == SubscriptionPhase.READY && state.selectedIds.isNotEmpty() &&
             state.generation == imported.requestGeneration &&
             revision.source == imported.sourceRevision && revision.selection == imported.selectionRevision &&
             searched.requestGeneration == imported.requestGeneration &&
@@ -129,6 +129,7 @@ internal class AppComposition(context: Context) {
     fun cancelSearch(): Unit = activation.controller.cancel()
 
     fun prepareVpnStart(): VpnStartTicketV1? = synchronized(activation.controller) {
+        if (!workerTransportLimits.isProven) return null
         val imported = synchronized(lock) { acceptedSnapshot } ?: return null
         val searched = synchronized(lock) { completedSearch } ?: return null
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return null
@@ -161,7 +162,7 @@ internal class AppComposition(context: Context) {
                 )
             } else null
             val state = subscriptions.state.value
-            if (identity == null || state.phase != SubscriptionPhase.READY || state.selectedIds.isEmpty() ||
+            if (!workerTransportLimits.isProven || identity == null || state.phase != SubscriptionPhase.READY || state.selectedIds.isEmpty() ||
                 state.generation != imported?.requestGeneration || startGate.consume(token, identity) == null
             ) {
                 if (token != null) startGate.cancel(token)
@@ -436,10 +437,6 @@ internal class AppComposition(context: Context) {
                 owner = lease,
             )
         }
-    }
-
-    private data class SearchWorkerTransportLimits(val frameBytes: Int?, val replyBytes: Int?) {
-        val isProven: Boolean get() = frameBytes != null && frameBytes >= WORKER_FRAME_HEADER_BYTES && replyBytes != null && replyBytes > 0
     }
 
     private class VpnReservation(
