@@ -24,14 +24,28 @@ func Dir(path string) (string, error) {
 	return p, nil
 }
 func Open(path string, flags int) (*os.File, error) {
+	return open(path, flags, false)
+}
+
+func OpenWithCheckedClose(path string, flags int) (*os.File, error) {
+	return open(path, flags, true)
+}
+
+func open(path string, flags int, checkClose bool) (*os.File, error) {
 	fd, e := syscall.Open(path, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
 	if e != nil {
 		return nil, model.Err("file_unavailable", "filesystem")
 	}
 	f := os.NewFile(uintptr(fd), path)
+	return validateOpened(f, checkClose)
+}
+
+func validateOpened(f *os.File, checkClose bool) (*os.File, error) {
 	st, e := f.Stat()
 	if e != nil || !st.Mode().IsRegular() || st.Mode().Perm() != 0600 {
-		f.Close()
+		if closeErr := f.Close(); checkClose && closeErr != nil {
+			return nil, model.Err("file_cleanup_unknown", "filesystem")
+		}
 		return nil, model.Err("unsafe_file", "filesystem")
 	}
 	return f, nil
