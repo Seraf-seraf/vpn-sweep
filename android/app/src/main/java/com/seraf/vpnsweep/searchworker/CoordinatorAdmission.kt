@@ -3,6 +3,8 @@ package com.seraf.vpnsweep.searchworker
 import com.seraf.vpnsweep.searchprotocol.SearchLeaseDuplicateV1
 import com.seraf.vpnsweep.searchprotocol.SearchNetworkV1
 import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 internal interface CoordinatorLease {
     fun duplicate(): SearchLeaseDuplicateV1?
@@ -36,8 +38,19 @@ internal class CoordinatorAdmission(
     private var deathSeen = false
     private var unbindRequested = false
     private var unbindConfirmed = false
+    private val retirementFinished = CountDownLatch(1)
 
     fun state(): CoordinatorState = synchronized(lock) { state }
+
+    fun awaitRetirement(remainingNanos: Long): Boolean {
+        if (remainingNanos <= 0) return false
+        return try {
+            retirementFinished.await(remainingNanos, TimeUnit.NANOSECONDS) && state() == CoordinatorState.WORKER_RETIRED
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
 
     fun connect(worker: CoordinatorRemote): Boolean {
         synchronized(lock) {
@@ -102,6 +115,7 @@ internal class CoordinatorAdmission(
                 CoordinatorState.NEW -> {
                     state = CoordinatorState.QUARANTINED
                     lease.quarantine()
+                    retirementFinished.countDown()
                 }
                 CoordinatorState.ADMITTING, CoordinatorState.CONFIRMED -> state = CoordinatorState.STOPPING
                 else -> return
@@ -121,6 +135,7 @@ internal class CoordinatorAdmission(
             } else {
                 state = CoordinatorState.QUARANTINED
                 lease.quarantine()
+                retirementFinished.countDown()
             }
         }
         requestUnbind()
@@ -146,6 +161,7 @@ internal class CoordinatorAdmission(
             if (state == CoordinatorState.WORKER_RETIRED) return
             state = CoordinatorState.QUARANTINED
             lease.quarantine()
+            retirementFinished.countDown()
         }
         requestUnbind()
     }
@@ -174,6 +190,7 @@ internal class CoordinatorAdmission(
         } else if (state != CoordinatorState.WORKER_RETIRED) {
             state = CoordinatorState.QUARANTINED
             lease.quarantine()
+            retirementFinished.countDown()
         }
     }
 
@@ -182,9 +199,11 @@ internal class CoordinatorAdmission(
         try {
             lease.workerDeathConfirmed()
             state = CoordinatorState.WORKER_RETIRED
+            retirementFinished.countDown()
         } catch (_: Exception) {
             state = CoordinatorState.QUARANTINED
             lease.quarantine()
+            retirementFinished.countDown()
         }
     }
 }

@@ -18,6 +18,38 @@ class CoordinatorAdmissionTest {
     private val network = SearchNetworkV1(7, 3)
 
     @Test
+    fun retirementWaitCompletesOnlyAfterUnbindAndWorkerDeath(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { it == network })
+        assertTrue(admission.connect(remote))
+        admission.stop()
+        val returned = CountDownLatch(1)
+        val retired = AtomicBoolean(false)
+        val waiter = Thread { retired.set(admission.awaitRetirement(TimeUnit.SECONDS.toNanos(2))); returned.countDown() }
+        waiter.start()
+        try {
+            assertFalse(returned.await(100, TimeUnit.MILLISECONDS))
+            assertTrue(lease.anchorHeldForWorker())
+            remote.die()
+            assertTrue(returned.await(2, TimeUnit.SECONDS))
+            assertTrue(retired.get())
+            assertFalse(lease.anchorHeldForWorker())
+        } finally { remote.die(); waiter.join(3000) }
+    }
+
+    @Test
+    fun retirementWaitRejectsQuarantinedWorker(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { it == network })
+        assertTrue(admission.connect(remote))
+        remote.die()
+        assertEquals(CoordinatorState.QUARANTINED, admission.state())
+        assertFalse(admission.awaitRetirement(TimeUnit.SECONDS.toNanos(1)))
+    }
+
+    @Test
     fun confirmsOnlyWithLinkedDeathAndHeldAnchorThenWaitsForUnbindAndDeath(): Unit {
         val lease = FakeLease()
         val remote = FakeRemote(lease)

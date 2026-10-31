@@ -7,21 +7,76 @@ import android.content.ServiceConnection
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.os.Process
+import android.os.SystemClock
 import com.seraf.vpnsweep.searchprotocol.SearchLeaseDuplicateV1
 import com.seraf.vpnsweep.searchprotocol.SearchNetworkV1
 import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 internal class SearchWorkerCoordinator(
     context: Context,
     private val lease: SearchOwnerLease,
-    identity: WorkerIdentityV1,
-    network: SearchNetworkV1,
-    owner: RoundOwner,
+    private val identity: WorkerIdentityV1,
+    private val network: SearchNetworkV1,
+    private val owner: NetworkEpochOwner,
 ) {
     private val appContext = context.applicationContext
-    private val admission = CoordinatorAdmission(lease, identity, network, owner)
-    private val ownerBinder = Binder()
     private val lock = Any()
+    private var prepared: PreparedWorkerLeaseDuplicate? = null
+    private var passedToAdmission = false
+    private val handshakeFinished = CountDownLatch(1)
+    private var admittedBinder: IBinder? = null
+    private val admissionLease = object : CoordinatorLease {
+        override fun duplicate(): SearchLeaseDuplicateV1? = synchronized(lock) {
+            if (!bindCalled || passedToAdmission) null else prepared?.also { passedToAdmission = true }
+        }
+        override fun anchorHeldForWorker(): Boolean = lease.anchorHeldForWorker()
+        override fun workerDeathConfirmed(): Unit = lease.workerDeathConfirmed()
+        override fun quarantine(): Unit = lease.quarantine()
+    }
+    private val admission = CoordinatorAdmission(admissionLease, identity, network, owner)
+    private var workerPid = -1
+    private val currentCheck = OwnerCurrentCheck(
+        Process.myUid(), Process.myPid(), identity, network,
+        { synchronized(lock) { if (stopped) -1 else workerPid } },
+        { admission.state() == CoordinatorState.CONFIRMED },
+        lease::anchorHeldForWorker,
+        owner::verifyOnCallback,
+    )
+    private val ownerBinder = object : Binder() {
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code == INTERFACE_TRANSACTION) {
+                reply?.writeString(SearchOwnerIpcV1.DESCRIPTOR)
+                return true
+            }
+            if (code != SearchOwnerIpcV1.CURRENT) return super.onTransact(code, data, reply, flags)
+            if (reply == null || flags and IBinder.FLAG_ONEWAY != 0) return false
+            val uid = Binder.getCallingUid()
+            val pid = Binder.getCallingPid()
+            val valid = try {
+                data.enforceInterface(SearchOwnerIpcV1.DESCRIPTOR)
+                val requested = WorkerIdentityV1(data.readLong(), data.readLong().toULong(), data.readInt(), data.readLong())
+                val selected = SearchNetworkV1(data.readLong(), data.readLong())
+                data.enforceNoDataAvail()
+                currentCheck.permits(uid, pid, requested, selected)
+            } catch (_: Exception) {
+                false
+            } catch (_: LinkageError) {
+                false
+            }
+            if (!valid) rejectCurrent(uid, pid)
+            return try {
+                reply.writeNoException()
+                reply.writeInt(if (valid) 1 else 0)
+                true
+            } catch (_: Exception) {
+                rejectCurrent(uid, pid)
+                false
+            }
+        }
+    }
     private var bindCalled = false
     private var reservationOwned = false
     private var bindResult: Boolean? = null
@@ -53,16 +108,34 @@ internal class SearchWorkerCoordinator(
         override fun onNullBinding(name: ComponentName?): Unit = failClosed()
     }
 
+    fun prepare(): PreparedWorkerLeaseDuplicate? = synchronized(lock) {
+        if (bindCalled || stopped || reservationOwned || prepared != null) return null
+        if (!lease.reserveWorker()) return null
+        reservationOwned = true
+        val duplicate = lease.duplicate()
+        if (duplicate == null) {
+            lease.quarantine()
+            stopped = true
+            return null
+        }
+        try {
+            PreparedWorkerLeaseDuplicate(duplicate, {
+                lease.releaseUnstartedReservation()
+                synchronized(lock) { reservationOwned = false }
+            }, lease::quarantine).also { prepared = it }
+        } catch (_: Throwable) {
+            try { duplicate.close() } catch (_: Throwable) { }
+            lease.quarantine()
+            stopped = true
+            null
+        }
+    }
+
     fun bind(): Boolean {
         synchronized(lock) {
-            if (bindCalled || stopped) return false
+            if (bindCalled || stopped || !reservationOwned) return false
+            if (prepared?.beginBind() != true) return false
             bindCalled = true
-            if (!lease.reserveWorker()) {
-                stopped = true
-                bindResult = false
-                return false
-            }
-            reservationOwned = true
         }
         val outcome: Boolean? = try {
             appContext.bindService(Intent(appContext, SearchWorkerService::class.java), connection, Context.BIND_AUTO_CREATE)
@@ -93,13 +166,55 @@ internal class SearchWorkerCoordinator(
 
     fun state(): CoordinatorState = admission.state()
 
+    fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
+        val now = SystemClock.elapsedRealtime()
+        if (now < 0 || deadlineElapsedMillis <= now) return null
+        val remaining = deadlineElapsedMillis - now
+        val signalled = try {
+            handshakeFinished.await(remaining, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        return if (signalled) confirmedBinder() else null
+    }
+
+    fun confirmedBinder(): IBinder? {
+        val candidate = synchronized(lock) { if (stopped) null else admittedBinder } ?: return null
+        val valid = try {
+            admission.state() == CoordinatorState.CONFIRMED && lease.anchorHeldForWorker() && candidate.isBinderAlive &&
+                owner.verifyOnCallback(network) && candidate.isBinderAlive && lease.anchorHeldForWorker() &&
+                admission.state() == CoordinatorState.CONFIRMED
+        } catch (_: Exception) {
+            false
+        } catch (_: LinkageError) {
+            false
+        }
+        return if (valid) synchronized(lock) { if (!stopped && admittedBinder === candidate) candidate else null } else null
+    }
+
+    fun awaitRetired(deadlineElapsedMillis: Long): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        return now >= 0 && deadlineElapsedMillis > now &&
+            admission.awaitRetirement(TimeUnit.MILLISECONDS.toNanos(deadlineElapsedMillis - now))
+    }
+
+    fun quarantine(): Unit = failClosed()
+
     fun stop(): Unit {
-        val ownsReservation = synchronized(lock) {
+        val (ownsReservation, unstarted) = synchronized(lock) {
             stopped = true
             if (!bindCalled) bindResult = false
-            reservationOwned
+            reservationOwned to if (!bindCalled) prepared else null
         }
         if (!ownsReservation) return
+        if (unstarted != null) {
+            handshakeFinished.countDown()
+            try {
+                Thread({ try { unstarted.close() } catch (_: Exception) { lease.quarantine() } }, "search-unstarted-close").start()
+            } catch (_: Exception) { lease.quarantine() }
+            return
+        }
         admission.stop()
         requestUnbind { success -> if (!success) admission.disconnected() }
     }
@@ -112,7 +227,14 @@ internal class SearchWorkerCoordinator(
             candidate
         }
         try {
-            Thread({ admission.connect(AndroidRemote(binder)) }, "search-worker-admission").start()
+            Thread({
+                try {
+                    val accepted = admission.connect(AndroidRemote(binder))
+                    synchronized(lock) {
+                        if (accepted && !stopped && pendingBinder === binder) admittedBinder = binder
+                    }
+                } finally { handshakeFinished.countDown() }
+            }, "search-worker-admission").start()
         } catch (_: Exception) {
             failClosed()
         }
@@ -129,6 +251,16 @@ internal class SearchWorkerCoordinator(
 
     private fun failClosed(): Unit {
         synchronized(lock) { stopped = true }
+        handshakeFinished.countDown()
+        admission.disconnected()
+        requestUnbind { }
+    }
+
+    private fun rejectCurrent(uid: Int, pid: Int): Unit = rejectCurrentIfActive(lock,
+        { uid == Process.myUid() && !stopped && workerPid > 0 && workerPid == pid },
+        { stopped = true; lease.quarantine() },
+    ) {
+        handshakeFinished.countDown()
         admission.disconnected()
         requestUnbind { }
     }
@@ -202,11 +334,41 @@ internal class SearchWorkerCoordinator(
             network: SearchNetworkV1,
             duplicate: SearchLeaseDuplicateV1,
         ): Boolean {
-            val descriptor = (duplicate as? WorkerLeaseDuplicate)?.descriptor ?: return false
-            return transact(SearchWorkerIpcV2.ADMIT, SearchWorkerIpcV2.PENDING_CONFIRMATION) { data ->
-                data.writeStrongBinder(ownerBinder)
-                data.writeIdentity(identity, network)
-                data.writeTypedObject(descriptor, 0)
+            val prepared = duplicate as? PreparedWorkerLeaseDuplicate ?: return false
+            val owner = prepared.beginTransfer() ?: return false
+            val descriptor = (owner as? WorkerLeaseDuplicate)?.descriptor
+            if (descriptor == null) {
+                prepared.endTransfer()
+                return false
+            }
+            var data: Parcel? = null
+            var reply: Parcel? = null
+            return try {
+                val request = Parcel.obtain().also { data = it }
+                val response = Parcel.obtain().also { reply = it }
+                request.writeInterfaceToken(SearchWorkerIpcV2.DESCRIPTOR)
+                request.writeStrongBinder(ownerBinder)
+                request.writeIdentity(identity, network)
+                request.writeTypedObject(descriptor, 0)
+                if (!binder.transact(SearchWorkerIpcV2.ADMIT, request, response, 0)) return false
+                response.readException()
+                if (response.readInt() != SearchWorkerIpcV2.PENDING_CONFIRMATION) return false
+                val pid = response.readInt()
+                response.enforceNoDataAvail()
+                if (pid <= 0 || pid == Process.myPid()) return false
+                synchronized(lock) {
+                    if (stopped || pendingBinder !== binder || workerPid != -1) false else {
+                        workerPid = pid
+                        true
+                    }
+                }
+            } finally {
+                try {
+                    data?.recycle()
+                    reply?.recycle()
+                } finally {
+                    prepared.endTransfer()
+                }
             }
         }
 

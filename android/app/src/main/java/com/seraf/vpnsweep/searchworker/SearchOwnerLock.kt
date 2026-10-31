@@ -109,6 +109,12 @@ internal class SearchOwnerLease internal constructor(private var fd: Int) : Auto
         check(!quarantined.get() && workerOutstanding.compareAndSet(true, false)) { "worker_death_not_releasable" }
     }
 
+    @Synchronized
+    fun releaseUnstartedReservation(): Unit {
+        check(fd >= 0 && !quarantined.get() && workerOutstanding.compareAndSet(true, false)) { "worker_reservation_not_releasable" }
+        duplicateIssued = false
+    }
+
     override fun quarantine(): Unit { quarantined.set(true) }
 
     @Synchronized
@@ -125,11 +131,13 @@ internal class SearchOwnerLease internal constructor(private var fd: Int) : Auto
 internal class WorkerLeaseDuplicate internal constructor(
     val descriptor: ParcelFileDescriptor,
 ) : SearchLeaseDuplicateV1 {
+    private val closeOnce = LeaseCloseOnce { descriptor.close() }
+
     fun fileAndEnvironmentValid(context: Context): Boolean = try {
         SearchOwnerLock.workerFileAndEnvironmentValid(context, descriptor.fd)
     } catch (_: Exception) {
         false
     }
 
-    override fun close(): Unit = descriptor.close()
+    override fun close(): Unit = closeOnce.close()
 }
