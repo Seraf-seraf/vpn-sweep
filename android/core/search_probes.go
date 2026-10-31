@@ -219,7 +219,17 @@ func (w *SearchWorkerProbes) contextError(ctx context.Context) error {
 	if owner.searchRevoked.Load() {
 		return errors.New("search_owner_lost")
 	}
-	return ctx.Err()
+	err := ctx.Err()
+	if err == nil {
+		return nil
+	}
+	if activeProtection.Load() != owner {
+		owner.revokeSearch()
+	}
+	if owner.searchRevoked.Load() {
+		return errors.New("search_owner_lost")
+	}
+	return err
 }
 
 func validWorkerUDP(p model.UDPProbe) bool {

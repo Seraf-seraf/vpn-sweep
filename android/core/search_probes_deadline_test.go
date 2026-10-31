@@ -37,6 +37,18 @@ func (c *countedProbeClient) Check(context.Context, socks.Endpoint, model.Probe,
 	return model.ProbeResult{ID: "synthetic", Probe: "page", Outcome: "pass"}
 }
 
+type blockingProbeErrContext struct {
+	context.Context
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingProbeErrContext) Err() error {
+	close(c.entered)
+	<-c.release
+	return c.Context.Err()
+}
+
 func TestAndroidSearchProbeDeadlineIncludesBlockedOwnerCheck(t *testing.T) {
 	owner := &blockedProbeOwner{entered: make(chan struct{}), release: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -106,5 +118,31 @@ func TestAndroidSearchProbeCancelRetainsCancellation(t *testing.T) {
 	}
 	if owner.calls.Load() != 0 {
 		t.Fatal("cancelled probe called owner")
+	}
+}
+
+func TestAndroidSearchProbeRevokedDuringContextError(t *testing.T) {
+	owner := &fakeAndroidNetwork{current: true, allow: true}
+	ownerCtx, ownerCancel := context.WithCancel(context.Background())
+	defer ownerCancel()
+	guard := &protection{search: owner, searchContext: ownerCtx, searchCancel: ownerCancel}
+	previous := activeProtection.Swap(guard)
+	defer activeProtection.Store(previous)
+	child, childCancel := context.WithCancel(ownerCtx)
+	defer childCancel()
+	controlled := &blockingProbeErrContext{Context: child, entered: make(chan struct{}), release: make(chan struct{})}
+	worker := &SearchWorkerProbes{ctx: controlled, cancel: childCancel, owner: guard}
+	done := make(chan error, 1)
+	go func() { _, err := worker.Check(nil, 0, 1000); done <- err }()
+	select {
+	case <-controlled.entered:
+	case <-time.After(time.Second):
+		close(controlled.release)
+		t.Fatal("context error check not reached")
+	}
+	guard.revokeSearch()
+	close(controlled.release)
+	if err := <-done; err == nil || err.Error() != "search_owner_lost" {
+		t.Fatalf("concurrent owner revocation reported as %v", err)
 	}
 }
