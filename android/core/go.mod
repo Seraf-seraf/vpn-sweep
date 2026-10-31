@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/Seraf-seraf/vpn-sweep v0.0.0
 	github.com/andybalholm/brotli v1.2.3 // indirect
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e // indirect
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344 // indirect
@@ -63,3 +64,5 @@ tool (
 	golang.org/x/mobile/cmd/gobind
 	golang.org/x/mobile/cmd/gomobile
 )
+
+replace github.com/Seraf-seraf/vpn-sweep => ../..

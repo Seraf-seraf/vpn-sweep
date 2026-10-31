@@ -78,7 +78,7 @@ internal class ResultHandoffFence(
                     inFlight = false
                     return HandoffResult.Discarded
                 }
-                if (leaseState != SearchResourceStateV2.RELEASED) return HandoffResult.Rejected
+                if (leaseState != SearchResourceStateV2.PAUSED_LEASE_HELD) return HandoffResult.Rejected
                 started = true
             }
             val offer = try {

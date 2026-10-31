@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package seraf.vpnsweep.searchdns.v1;
+
+option go_package = "github.com/Seraf-seraf/vpn-sweep/android/core/searchdns";
+
+message Config {}

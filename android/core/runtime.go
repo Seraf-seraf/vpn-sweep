@@ -33,18 +33,26 @@ type Protector interface {
 }
 
 type protection struct {
-	callback Protector
-	dnsIP    string
-	passed   atomic.Int64
-	failed   atomic.Int64
+	callback      Protector
+	dnsIP         string
+	search        AndroidNetwork
+	searchContext context.Context
+	searchCancel  context.CancelFunc
+	searchRevoked atomic.Bool
+	searchRoundMu sync.RWMutex
+	searchRound   context.Context
+	passed        atomic.Int64
+	failed        atomic.Int64
 }
 
 var activeProtection atomic.Pointer[protection]
 var nullFD int
 var runtimeState struct {
 	sync.Mutex
-	instance *core.Instance
-	guard    *protection
+	instance            *core.Instance
+	guard               *protection
+	searchInitialized   bool
+	searchWorkerCreated bool
 }
 
 type discardLogs struct{}
@@ -65,41 +73,62 @@ func init() {
 		if guard == nil {
 			return nil, errors.New("vpn_not_running")
 		}
+		if guard.search != nil {
+			return searchDNSConnection(ctx, guard)
+		}
 		dialer := net.Dialer{Timeout: bootstrapTimeout, Control: protectSocket}
 		return dialer.DialContext(ctx, network, net.JoinHostPort(guard.dnsIP, "53"))
 	}}
 	if err := internet.RegisterDialerController(protectSocket); err != nil {
 		panic("socket_controller_unavailable")
 	}
-	if err := internet.RegisterListenerController(protectSocket); err != nil {
+	if err := internet.RegisterListenerController(protectListener); err != nil {
 		panic("socket_controller_unavailable")
 	}
 }
 
-func protectSocket(_ string, _ string, raw syscall.RawConn) error {
-	guard := activeProtection.Load()
+func protectSocket(network string, address string, raw syscall.RawConn) error {
+	return controlSocket(nil, SearchRoleXrayDial, network, address, raw, invalidateSocket)
+}
+
+func protectListener(network string, address string, raw syscall.RawConn) error {
+	return controlSocket(nil, SearchRoleXrayListener, network, address, raw, invalidateSocket)
+}
+
+func controlSocket(expected *protection, role int, network string, address string, raw syscall.RawConn, invalidate func(int) error) error {
 	var protectionErr error
 	err := raw.Control(func(fd uintptr) {
-		if guard != nil && guard.callback.Protect(int(fd)) {
+		guard := activeProtection.Load()
+		if guard != nil && (expected == nil || expected == guard) && guard.allowSocket(int(fd), role, network, address) &&
+			activeProtection.Load() == guard {
 			guard.passed.Add(1)
 			return
 		}
+		if expected != nil {
+			expected.revokeSearch()
+		}
 		if guard != nil {
+			guard.revokeSearch()
 			guard.failed.Add(1)
 		}
 		// This Xray version ignores controller errors. Keep descriptor ownership
 		// with Go, but replace the socket with /dev/null so a dial cannot escape.
-		if err := unix.Dup3(nullFD, int(fd), unix.O_CLOEXEC); err != nil {
+		if err := invalidate(int(fd)); err != nil {
 			// Continuing with an unprotected live socket would create a VPN loop.
 			panic("socket_protection_failed")
 		}
 		protectionErr = errors.New("socket_protection_failed")
 	})
 	if err != nil {
+		if guard := activeProtection.Load(); guard != nil && guard.search != nil {
+			panic("search_socket_control_failed")
+		}
 		return errors.New("socket_control_failed")
 	}
 	return protectionErr
 }
+
+func invalidateSocket(fd int) error { return unix.Dup3(nullFD, fd, unix.O_CLOEXEC) }
 
 // ValidateConfig checks Xray's actual schema before Android establishes TUN.
 func ValidateConfig(source []byte) error {
@@ -120,6 +149,9 @@ func Start(source []byte, tunFD int, bootstrapDNS string, protector Protector) e
 	defer runtimeState.Unlock()
 	if runtimeState.instance != nil {
 		return errors.New("vpn_already_running")
+	}
+	if runtimeState.searchInitialized {
+		return errors.New("search_already_initialized")
 	}
 	if tunFD < 0 || protector == nil {
 		return errors.New("invalid_vpn_runtime")
