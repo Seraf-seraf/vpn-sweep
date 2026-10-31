@@ -169,6 +169,9 @@ internal sealed interface WorkerOpenV2 {
 
 internal sealed interface WorkerReplyV1 {
     class Complete(val result: PrivateInputV1) : WorkerReplyV1
+    // Known call interruption after reply and transferred FD disposition;
+    // worker cleanup and process death are confirmed separately by close.
+    data class Interrupted(val reason: WorkerInterruptedV2) : WorkerReplyV1
     data object Rejected : WorkerReplyV1
     data object Quarantined : WorkerReplyV1
 }
