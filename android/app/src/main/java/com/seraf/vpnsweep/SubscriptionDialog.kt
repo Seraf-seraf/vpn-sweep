@@ -287,25 +287,24 @@ private fun SubscriptionLinkField(
                     innerTextField()
                 }
                 if (status == SubscriptionDialogStatus.InvalidUrl) {
-                    Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) {
                         SubscriptionAlertIcon()
                     }
-                } else if (link.isNotEmpty()) {
-                    IconButton(
-                        onClick = { clipboard.getText()?.text?.let(onLinkChange) },
-                        enabled = enabled,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .onFocusChanged { clipboardFocused = it.isFocused }
-                            .border(
-                                if (clipboardFocused) 2.dp else 0.dp,
-                                if (clipboardFocused) SubscriptionAccent else Color.Transparent,
-                                RoundedCornerShape(12.dp),
-                            )
-                            .semantics { contentDescription = "Вставить ссылку" },
-                    ) {
-                        ClipboardIcon()
-                    }
+                }
+                IconButton(
+                    onClick = { clipboard.getText()?.text?.let(onLinkChange) },
+                    enabled = enabled,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .onFocusChanged { clipboardFocused = it.isFocused }
+                        .border(
+                            if (clipboardFocused) 2.dp else 0.dp,
+                            if (clipboardFocused) SubscriptionAccent else Color.Transparent,
+                            RoundedCornerShape(12.dp),
+                        )
+                        .semantics { contentDescription = "Вставить ссылку" },
+                ) {
+                    ClipboardIcon()
                 }
             }
         },

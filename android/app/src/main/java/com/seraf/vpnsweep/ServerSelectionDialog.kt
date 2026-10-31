@@ -26,11 +26,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.selection.triStateToggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -64,8 +66,10 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -152,55 +156,57 @@ internal fun ServerSelectionDialogContent(
         ) {
             val listState = rememberLazyListState()
             Column(modifier = Modifier.padding(16.dp)) {
-                Box(modifier = Modifier.weight(1f, fill = false)) {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxWidth().padding(end = 10.dp),
-                        state = listState,
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        item(key = "server-dialog-header") {
-                            ServerDialogHeader()
-                            Spacer(Modifier.height(16.dp))
-                            ServerSearch(search, { search = it })
-                            Spacer(Modifier.height(8.dp))
-                            SelectAllServers(
-                                state = selectAllState,
-                                enabled = visibleSupportedIds.isNotEmpty(),
-                                selectedCount = visibleSelected,
-                                totalCount = visibleSupportedIds.size,
-                                onClick = {
-                                    selected = updateVisibleSelection(
-                                        selected = selected,
-                                        visibleSupportedIds = visibleSupportedIds,
-                                        select = selectAllState != ToggleableState.On,
-                                    )
-                                },
+                Column(
+                    modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                ) {
+                    ServerDialogHeader()
+                    Spacer(Modifier.height(16.dp))
+                    ServerSearch(search, { search = it })
+                    Spacer(Modifier.height(8.dp))
+                    SelectAllServers(
+                        state = selectAllState,
+                        enabled = visibleSupportedIds.isNotEmpty(),
+                        selectedCount = visibleSelected,
+                        totalCount = visibleSupportedIds.size,
+                        onClick = {
+                            selected = updateVisibleSelection(
+                                selected = selected,
+                                visibleSupportedIds = visibleSupportedIds,
+                                select = selectAllState != ToggleableState.On,
                             )
-                        }
-                        if (servers.isEmpty()) {
-                            item { ServerListMessage("Нет загруженных серверов") }
-                        } else if (filteredServers.isEmpty()) {
-                            item { ServerListMessage("Серверы не найдены") }
-                        } else {
-                            itemsIndexed(
-                                items = filteredServers,
-                                key = { index, server -> "$index:${server.id}" },
-                            ) { _, server ->
-                                ServerRow(
-                                    server = server,
-                                    checked = server.supported && server.id in selected,
-                                    onCheckedChange = { checked ->
-                                        selected = if (checked) {
-                                            selected + server.id
-                                        } else {
-                                            selected - server.id
-                                        }
-                                    },
-                                )
+                        },
+                    )
+                    Box(modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).padding(end = 10.dp),
+                            state = listState,
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            if (servers.isEmpty()) {
+                                item { ServerListMessage("Нет загруженных серверов") }
+                            } else if (filteredServers.isEmpty()) {
+                                item { ServerListMessage("Серверы не найдены") }
+                            } else {
+                                itemsIndexed(
+                                    items = filteredServers,
+                                    key = { index, server -> "$index:${server.id}" },
+                                ) { _, server ->
+                                    ServerRow(
+                                        server = server,
+                                        checked = server.supported && server.id in selected,
+                                        onCheckedChange = { checked ->
+                                            selected = if (checked) {
+                                                selected + server.id
+                                            } else {
+                                                selected - server.id
+                                            }
+                                        },
+                                    )
+                                }
                             }
                         }
+                        ServerListScrollbar(listState, Modifier.matchParentSize())
                     }
-                    ServerListScrollbar(listState, Modifier.matchParentSize())
                 }
                 ServerDialogFooter(
                     selectedCount = selected.size,
@@ -290,8 +296,18 @@ private fun SelectAllServers(
     totalCount: Int,
     onClick: () -> Unit,
 ): Unit {
+    val textMeasurer = rememberTextMeasurer()
+    val labelWidth = textMeasurer.measure(
+        "Выбрать все",
+        style = TextStyle(fontFamily = SweepSans, fontSize = 16.sp),
+    ).size.width
+    val countWidth = textMeasurer.measure(
+        "Выбрано $selectedCount из $totalCount",
+        style = TextStyle(fontFamily = SweepSans, fontSize = 14.sp),
+    ).size.width
+    val requiredWidth = with(LocalDensity.current) { (labelWidth + countWidth).toDp() } + 56.dp
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-        val stack = maxWidth < 300.dp || LocalDensity.current.fontScale >= 1.3f
+        val stack = maxWidth < requiredWidth
         if (stack) {
             Column {
                 SelectAllToggle(state, enabled, onClick, Modifier.fillMaxWidth())
@@ -468,8 +484,15 @@ private fun ServerDialogFooter(
         fontSize = 14.sp,
         lineHeight = 20.sp,
     )
+    val textMeasurer = rememberTextMeasurer()
+    val buttonStyle = TextStyle(fontFamily = SweepSans, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+    val labelWidth = maxOf(
+        textMeasurer.measure("Отмена", style = buttonStyle).size.width,
+        textMeasurer.measure("Ок", style = buttonStyle).size.width,
+    )
+    val requiredWidth = with(LocalDensity.current) { (labelWidth * 2).toDp() } + 116.dp
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-        val stack = maxWidth < 300.dp || LocalDensity.current.fontScale >= 1.3f
+        val stack = maxWidth < requiredWidth
         if (stack) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 ServerCancelButton(onDismiss, Modifier.fillMaxWidth())

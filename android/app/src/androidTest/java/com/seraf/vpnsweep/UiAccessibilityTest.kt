@@ -1,16 +1,26 @@
 package com.seraf.vpnsweep
 
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasScrollToIndexAction
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.text.AnnotatedString
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -72,6 +82,24 @@ class UiAccessibilityTest {
     }
 
     @Test
+    fun pasteIsAvailableForEmptyAndInvalidLinks(): Unit {
+        val clipboard = TestClipboard(AnnotatedString("https://example.com/sub"))
+        compose.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides clipboard) {
+                SweepTheme { SubscriptionDialog(onDismiss = {}) }
+            }
+        }
+        compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().performClick()
+        compose.onNodeWithContentDescription("Ссылка").assertTextContains("https://example.com/sub")
+        compose.onNodeWithContentDescription("Ссылка").performTextClearance()
+        compose.onNodeWithContentDescription("Ссылка").performTextInput("invalid")
+        compose.onNodeWithText("Введите корректную ссылку").assertExists()
+        compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().performClick()
+        compose.onNodeWithContentDescription("Ссылка").assertTextContains("https://example.com/sub")
+        compose.onNodeWithText("Введите корректную ссылку").assertDoesNotExist()
+    }
+
+    @Test
     fun parameterGroupAnnouncesExpansion(): Unit {
         compose.setContent {
             SweepTheme {
@@ -111,5 +139,25 @@ class UiAccessibilityTest {
         compose.onNodeWithText("Выбрать все").performClick()
         compose.onNodeWithText("Ок").performClick()
         compose.runOnIdle { assertEquals(setOf("se"), confirmed) }
+    }
+
+    @Test
+    fun serverListScrollKeepsSearchAndFooterVisible(): Unit {
+        val servers = (1..12).map { ServerChoice("$it", "Сервер $it", "Пример", true) }
+        compose.setContent {
+            SweepTheme { ServerSelectionDialogContent(servers, setOf("1"), {}, {}) }
+        }
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Сервер 12"))
+        compose.onNodeWithContentDescription("Поиск сервера").assertIsDisplayed()
+        compose.onNodeWithText("Отмена").assertIsDisplayed()
+        compose.onNodeWithText("Ок").assertIsDisplayed()
+    }
+}
+
+private class TestClipboard(private var value: AnnotatedString?) : ClipboardManager {
+    override fun getText(): AnnotatedString? = value
+
+    override fun setText(annotatedString: AnnotatedString): Unit {
+        value = annotatedString
     }
 }

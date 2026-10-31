@@ -51,7 +51,10 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -283,7 +286,7 @@ private fun ServerButton(onClick: () -> Unit) {
     ) {
         SweepGlyph(SweepIcon.Server, Accent)
         Spacer(Modifier.width(16.dp))
-        Text("Серверы: нет загруженных данных", Modifier.weight(1f), color = PrimaryText, fontSize = 16.sp)
+        Text("Серверы: нет данных", Modifier.weight(1f), color = PrimaryText, fontSize = 16.sp)
         Spacer(Modifier.width(8.dp))
         SweepGlyph(SweepIcon.ChevronRight, SecondaryText)
     }
@@ -311,21 +314,33 @@ internal fun InformationPanel(initialTab: Int = 0) {
                 .padding(16.dp),
         ) {
             if (selectedTab == 0) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SweepGlyph(SweepIcon.Terminal, Accent)
-                    Spacer(Modifier.width(12.dp))
-                    Text("Журнал событий", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                }
-                Spacer(Modifier.height(16.dp))
-                Text(
-                    text = "Событий пока нет",
-                    modifier = Modifier.heightIn(min = 80.dp),
-                    color = SecondaryText,
-                    fontFamily = SweepMono,
-                    fontSize = 14.sp,
-                )
+                // TODO: connect actual event entries when the runtime exposes them.
+                EventLogPanel(emptyList())
             } else {
                 ParametersPanel()
+            }
+        }
+    }
+}
+
+internal data class EventLogEntry(val time: String, val level: String, val message: String)
+
+@Composable
+internal fun EventLogPanel(entries: List<EventLogEntry>) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        SweepGlyph(SweepIcon.Terminal, Accent)
+        Spacer(Modifier.width(12.dp))
+        Text("Журнал событий", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+    }
+    Spacer(Modifier.height(16.dp))
+    Column(
+        Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 200.dp).verticalScroll(rememberScrollState()),
+    ) {
+        if (entries.isEmpty()) {
+            Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
+        } else {
+            for (entry in entries) {
+                Text("${entry.time}  [${entry.level}] ${entry.message}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
             }
         }
     }
@@ -353,24 +368,41 @@ private fun InformationTab(text: String, selected: Boolean, onClick: () -> Unit,
     }
 }
 
+internal data class ParameterValue(val label: String, val value: String)
+internal data class ParameterGroupValues(val summary: String, val fields: List<ParameterValue>)
+internal data class AppliedParameterValues(
+    val fragment: ParameterGroupValues? = null,
+    val mux: ParameterGroupValues? = null,
+    val fingerprint: ParameterGroupValues? = null,
+    val udpNoise: ParameterGroupValues? = null,
+)
+
 @Composable
-internal fun ParametersPanel(initialFragmentExpanded: Boolean = false) {
+internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: AppliedParameterValues? = null) {
     Text("Параметры подбора", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(8.dp))
-    Text("Применённые параметры пока недоступны", color = SecondaryText, fontSize = 14.sp)
-    Spacer(Modifier.height(12.dp))
+    if (applied == null) {
+        Text("Применённые параметры пока недоступны", color = SecondaryText, fontSize = 14.sp)
+        Spacer(Modifier.height(12.dp))
+    }
     // TODO: Подключить отображение применённых параметров, когда они появятся в runtime-состоянии.
-    ParameterGroup("Fragment", SweepIcon.Fragment, listOf("Фрагментация", "Пакеты", "Длина", "Интервал", "Макс. частей"), initialFragmentExpanded)
+    ParameterGroup("Fragment", SweepIcon.Fragment, listOf("Фрагментация", "Пакеты", "Длина", "Интервал", "Макс. частей"), initialFragmentExpanded, applied?.fragment)
     Spacer(Modifier.height(8.dp))
-    ParameterGroup("Mux", SweepIcon.Mux, listOf("Mux", "TCP concurrency", "XUDP concurrency", "UDP 443"))
+    ParameterGroup("Mux", SweepIcon.Mux, listOf("Mux", "TCP concurrency", "XUDP concurrency", "UDP 443"), values = applied?.mux)
     Spacer(Modifier.height(8.dp))
-    ParameterGroup("TLS fingerprint", SweepIcon.Fingerprint, listOf("Fingerprint"))
+    ParameterGroup("TLS fingerprint", SweepIcon.Fingerprint, listOf("Fingerprint"), values = applied?.fingerprint)
     Spacer(Modifier.height(8.dp))
-    ParameterGroup("Шум UDP", SweepIcon.Noise, listOf("Шум", "Записи"))
+    ParameterGroup("Шум UDP", SweepIcon.Noise, listOf("Шум", "Записи"), values = applied?.udpNoise)
 }
 
 @Composable
-private fun ParameterGroup(title: String, icon: SweepIcon, fields: List<String>, initialExpanded: Boolean = false) {
+private fun ParameterGroup(
+    title: String,
+    icon: SweepIcon,
+    fields: List<String>,
+    initialExpanded: Boolean = false,
+    values: ParameterGroupValues? = null,
+) {
     var expanded by rememberSaveable { mutableStateOf(initialExpanded) }
     Column(Modifier.fillMaxWidth().border(1.dp, Outline, ControlShape)) {
         Row(
@@ -386,20 +418,38 @@ private fun ParameterGroup(title: String, icon: SweepIcon, fields: List<String>,
         ) {
             SweepGlyph(icon, Accent)
             Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, color = PrimaryText, fontSize = 16.sp)
-                Text("Нет данных", color = SecondaryText, fontSize = 14.sp)
-            }
+            ParameterPair(title, values?.summary ?: "Нет данных", Modifier.weight(1f), titleSize = 16)
             Spacer(Modifier.width(8.dp))
             SweepGlyph(if (expanded) SweepIcon.ChevronDown else SweepIcon.ChevronRight, Accent)
         }
         if (expanded) {
-            for (field in fields) {
+            val rows = values?.fields ?: fields.map { ParameterValue(it, "Нет данных") }
+            for (field in rows) {
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Outline))
-                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                    Text(field, color = PrimaryText, fontSize = 14.sp)
-                    Text("Нет данных", color = SecondaryText, fontSize = 14.sp)
-                }
+                ParameterPair(field.label, field.value, Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ParameterPair(label: String, value: String, modifier: Modifier = Modifier, titleSize: Int = 14) {
+    val measurer = rememberTextMeasurer()
+    val labelWidth = measurer.measure(label, style = TextStyle(fontFamily = SweepSans, fontSize = titleSize.sp)).size.width
+    val valueWidth = measurer.measure(value, style = TextStyle(fontFamily = SweepSans, fontSize = 14.sp)).size.width
+    val density = LocalDensity.current
+    val requiredWidth = with(density) { (labelWidth + valueWidth).toDp() } + 24.dp
+    BoxWithConstraints(modifier) {
+        if (maxWidth >= requiredWidth && density.fontScale < 1.3f) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(label, Modifier.weight(1f), color = PrimaryText, fontSize = titleSize.sp)
+                Spacer(Modifier.width(12.dp))
+                Text(value, color = SecondaryText, fontSize = 14.sp, textAlign = TextAlign.End)
+            }
+        } else {
+            Column {
+                Text(label, color = PrimaryText, fontSize = titleSize.sp)
+                Text(value, color = SecondaryText, fontSize = 14.sp)
             }
         }
     }

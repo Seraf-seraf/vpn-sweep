@@ -22,6 +22,21 @@ private val previewServers = listOf(
     ServerChoice("se", "Швеция 05", "Shadowsocks", true),
     ServerChoice("unsupported", "Неподдерживаемая конфигурация", "Пример", false),
 )
+private val previewParameters = AppliedParameterValues(
+    fragment = ParameterGroupValues(
+        "Вкл",
+        listOf(
+            ParameterValue("Фрагментация", "Вкл"),
+            ParameterValue("Пакеты", "tlshello"),
+            ParameterValue("Длина", "128–256 байт"),
+            ParameterValue("Интервал", "10–20 мс"),
+            ParameterValue("Макс. частей", "64"),
+        ),
+    ),
+    mux = ParameterGroupValues("Выкл", emptyList()),
+    fingerprint = ParameterGroupValues("chrome", listOf(ParameterValue("Fingerprint", "chrome"))),
+    udpNoise = ParameterGroupValues("Недоступен", emptyList()),
+)
 
 @Composable
 private fun HomePreview(state: VpnState, selected: Boolean) {
@@ -67,6 +82,43 @@ private fun PreviewParameters() {
     }
 }
 
+@Preview(name = "PREVIEW · параметры, пример", widthDp = 360, heightDp = 720)
+@Composable
+private fun PreviewParametersExample() {
+    SweepTheme {
+        Column(
+            Modifier.fillMaxSize().background(SweepColors.background).verticalScroll(rememberScrollState()).padding(24.dp),
+        ) { ParametersPanel(initialFragmentExpanded = true, applied = previewParameters) }
+    }
+}
+
+@Preview(name = "PREVIEW · параметры, крупный шрифт", widthDp = 320, heightDp = 640, fontScale = 2f)
+@Composable
+private fun PreviewParametersLargeText() {
+    SweepTheme {
+        Column(
+            Modifier.fillMaxSize().background(SweepColors.background).verticalScroll(rememberScrollState()).padding(24.dp),
+        ) { ParametersPanel(initialFragmentExpanded = true, applied = previewParameters) }
+    }
+}
+
+@Preview(name = "PREVIEW · журнал, пример", widthDp = 360, heightDp = 300)
+@Composable
+private fun PreviewEventLogExample() {
+    SweepTheme {
+        Column(Modifier.fillMaxSize().background(SweepColors.background).padding(24.dp)) {
+            EventLogPanel(
+                listOf(
+                    EventLogEntry("21:01:00", "INFO", "Приложение готово"),
+                    EventLogEntry("21:01:01", "INFO", "Подписка загружена"),
+                    EventLogEntry("21:01:02", "INFO", "Выбрано серверов: 3"),
+                    EventLogEntry("21:01:03", "INFO", "Ожидание подбора"),
+                ),
+            )
+        }
+    }
+}
+
 @Composable
 private fun SubscriptionPreview(status: SubscriptionDialogStatus, link: String) {
     SweepTheme {
@@ -106,7 +158,9 @@ private fun SubscriptionPreview(status: SubscriptionDialogStatus, link: String) 
 @Composable
 private fun ServersPreview(servers: List<ServerChoice>, selected: Set<String>) {
     SweepTheme {
-        ServerSelectionDialogContent(servers, selected, {}, {})
+        Box(Modifier.fillMaxSize().background(SweepColors.background)) {
+            ServerSelectionDialogContent(servers, selected, {}, {})
+        }
     }
 }
 
