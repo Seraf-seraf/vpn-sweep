@@ -26,12 +26,46 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 internal enum class SearchPhase { IDLE, RUNNING, PAUSING, PAUSED, CANCELLING, COMPLETE, CANCELLED, FAILED, INTERRUPTED }
+internal enum class SearchStartStage(val code: String) {
+    PREFLIGHT("preflight"),
+    RESERVE("reserve"),
+    PORT_DISPATCH("port_dispatch"),
+    PRODUCER("producer"),
+}
+
+internal enum class SearchStartReason(val code: String) {
+    ACCEPTED_RECEIPT_MISSING("accepted_receipt_missing"),
+    CURRENT_REVISION_UNAVAILABLE("current_revision_unavailable"),
+    SUBSCRIPTION_NOT_READY("subscription_not_ready"),
+    SELECTION_EMPTY("selection_empty"),
+    GENERATION_MISMATCH("generation_mismatch"),
+    REVISION_MISMATCH("revision_mismatch"),
+    TRANSPORT_LIMITS_UNPROVEN("transport_limits_unproven"),
+    SNAPSHOT_NOT_READY("snapshot_not_ready"),
+    REVISION_INVALID("revision_invalid"),
+    PROFILE_TOO_LARGE("profile_too_large"),
+    PROFILE_UNAVAILABLE("profile_unavailable"),
+    PORT_UNSUPPORTED("port_unsupported"),
+    RESULT_RESERVATION_UNAVAILABLE("result_reservation_unavailable"),
+    MARKER_ACTIVATION_REJECTED("marker_activation_rejected"),
+    SNAPSHOT_REVISION_INVALID("snapshot_revision_invalid"),
+    SNAPSHOT_IDENTITY_MISMATCH("snapshot_identity_mismatch"),
+    LEASE_RECEIPT_INVALID("lease_receipt_invalid"),
+    PORT_REJECTED("port_rejected"),
+    PRODUCER_REJECTED("producer_rejected"),
+}
+
+internal data class SearchStartRejection(val stage: SearchStartStage, val reason: SearchStartReason) {
+    val safeCode: String get() = "${stage.code}:${reason.code}"
+}
+
 internal data class SearchUiState(
     val phase: SearchPhase = SearchPhase.IDLE,
     val progress: SearchProgressV1? = null,
     val pauseReason: SearchPauseReasonV1? = null,
     val failure: SearchFailureV1? = null,
     val resultCommitted: Boolean = false,
+    val startRejection: SearchStartRejection? = null,
 )
 
 internal sealed interface SearchStartPreparation {
@@ -80,6 +114,25 @@ internal class SearchController(
     private val pendingResultClose = mutableListOf<AutoCloseable>()
     private var cleanupInProgress = false
 
+    @Synchronized
+    fun clearStartRejection(): Unit {
+        if (mutableState.value.startRejection != null) {
+            mutableState.value = mutableState.value.copy(startRejection = null)
+        }
+    }
+
+    @Synchronized
+    fun recordStartRejection(rejection: SearchStartRejection): Unit {
+        mutableState.value = mutableState.value.copy(startRejection = rejection)
+    }
+
+    @Synchronized
+    fun recordStartRejectionIfAbsent(rejection: SearchStartRejection): Unit {
+        if (mutableState.value.startRejection == null) {
+            mutableState.value = mutableState.value.copy(startRejection = rejection)
+        }
+    }
+
     fun start(sourceRevision: Long, selectionRevision: Long, profiles: PrivateInputV1, vpnDisconnected: Boolean): SearchStartV3 =
         when (val prepared = reserveStart(sourceRevision, selectionRevision, profiles, vpnDisconnected)) {
             is SearchStartPreparation.Denied -> prepared.result
@@ -89,13 +142,24 @@ internal class SearchController(
     @Synchronized
     fun reserveStart(sourceRevision: Long, selectionRevision: Long, profiles: PrivateInputV1, vpnDisconnected: Boolean): SearchStartPreparation {
         if (!vpnDisconnected || active != null || admissionBlocked) return SearchStartPreparation.Denied(SearchStartV3.BUSY)
-        if (port !is SearchSessionPortV4) return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+        if (port !is SearchSessionPortV4) {
+            recordStartRejection(SearchStartRejection(SearchStartStage.RESERVE, SearchStartReason.PORT_UNSUPPORTED))
+            return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+        }
         val token = store.begin(ResultRevision(sourceRevision.toString(), selectionRevision.toString()))
-            ?: return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+            ?: run {
+                recordStartRejection(SearchStartRejection(SearchStartStage.RESERVE, SearchStartReason.RESULT_RESERVATION_UNAVAILABLE))
+                return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+            }
         admissionBlocked = true
         if (!marker.markActive()) {
             store.cancel(token)
-            mutableState.value = SearchUiState(phase = SearchPhase.INTERRUPTED, failure = SearchFailureV1.INTERRUPTED)
+            val rejection = SearchStartRejection(SearchStartStage.RESERVE, SearchStartReason.MARKER_ACTIVATION_REJECTED)
+            mutableState.value = SearchUiState(
+                phase = SearchPhase.INTERRUPTED,
+                failure = SearchFailureV1.INTERRUPTED,
+                startRejection = rejection,
+            )
             return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
         }
         val session = Session(++generation, token)
@@ -116,6 +180,9 @@ internal class SearchController(
             port.start(snapshot, phase, session.observer)
         } catch (_: Exception) {
             SearchStartV3.UNKNOWN
+        }
+        if (outcome == SearchStartV3.REJECTED) {
+            recordStartRejectionIfAbsent(SearchStartRejection(SearchStartStage.PORT_DISPATCH, SearchStartReason.PORT_REJECTED))
         }
         return finishDispatch(session, phase, null, outcome)
     }
@@ -427,6 +494,7 @@ internal class SearchController(
             phase = SearchPhase.INTERRUPTED,
             failure = if (workerQuarantined) SearchFailureV1.WORKER_QUARANTINED else SearchFailureV1.INTERRUPTED,
             resultCommitted = session.committed,
+            startRejection = mutableState.value.startRejection,
         )
     }
 }

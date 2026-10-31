@@ -244,25 +244,27 @@ internal class SubscriptionController(
     }
 
     fun startSelected(): SearchStartV3 {
+        composition.controller.clearStartRejection()
         val prepared = synchronized(this) {
             if (pendingClose.isNotEmpty() || uncertainSearchInput != null) return SearchStartV3.BUSY
-            if (installed == null || selectedIds.isEmpty()) return SearchStartV3.REJECTED
+            if (installed == null) return rejectStart(SearchStartReason.SNAPSHOT_NOT_READY)
+            if (selectedIds.isEmpty()) return rejectStart(SearchStartReason.SELECTION_EMPTY)
             synchronized(composition.controller) {
                 val revisions = try { composition.currentRevision() } catch (_: Exception) { null }
                 val sourceRevision = revisions?.source?.toLongOrNull()
                 val selectionRevision = revisions?.selection?.toLongOrNull()
                 if (sourceRevision == null || selectionRevision == null ||
                     sourceRevision.toString() != revisions.source || selectionRevision.toString() != revisions.selection) {
-                    return SearchStartV3.REJECTED
+                    return rejectStart(SearchStartReason.REVISION_INVALID)
                 }
                 val profiles = try {
                     installed?.selectedProfiles(selectedIds)
                 } catch (_: SubscriptionProfilesTooLargeException) {
                     mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.LIMIT_EXCEEDED)
-                    return SearchStartV3.REJECTED
+                    return rejectStart(SearchStartReason.PROFILE_TOO_LARGE)
                 }
                 if (profiles == null) {
-                    return SearchStartV3.REJECTED
+                    return rejectStart(SearchStartReason.PROFILE_UNAVAILABLE)
                 }
                 Pair(composition.activation.reserveSearch(sourceRevision, selectionRevision, profiles), profiles)
             }
@@ -283,6 +285,11 @@ internal class SubscriptionController(
             }
         }
         return result
+    }
+
+    private fun rejectStart(reason: SearchStartReason): SearchStartV3 {
+        composition.controller.recordStartRejection(SearchStartRejection(SearchStartStage.PREFLIGHT, reason))
+        return SearchStartV3.REJECTED
     }
 
     private fun visibleState(phase: SubscriptionPhase, failure: SubscriptionFailureV1? = null): SubscriptionUiState =

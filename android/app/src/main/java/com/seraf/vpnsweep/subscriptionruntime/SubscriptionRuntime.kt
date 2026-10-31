@@ -30,6 +30,16 @@ private const val GO_SIZE_CODE = "subscription_size"
 private const val NANOS_PER_MILLISECOND = 1_000_000L
 private val ID_PATTERN = Regex("[0-9a-f]{32}")
 
+internal data class SubscriptionDisplayText(val title: String, val subtitle: String)
+
+internal fun readSubscriptionDisplayText(
+    ordinal: Int,
+    readField: (String) -> String,
+): SubscriptionDisplayText {
+    val title = readField("title").trim().ifEmpty { "Сервер $ordinal" }
+    return SubscriptionDisplayText(title, readField("subtitle"))
+}
+
 internal class AndroidSubscriptionPort(
     context: Context,
     private val executor: Executor,
@@ -153,6 +163,7 @@ internal class AndroidSubscriptionSnapshot(
         val ids = HashSet<String>()
         for (index in 0 until count) {
             val record = JSONObject(String(native.recordJSON(index), Charsets.UTF_8))
+            val display = readSubscriptionDisplayText(index.toInt() + 1) { key -> record.optString(key, "") }
             val id = record.getString("id")
             val supported = record.getBoolean("supported")
             val reason = if (supported) null else {
@@ -162,7 +173,7 @@ internal class AndroidSubscriptionSnapshot(
             if (!ID_PATTERN.matches(id) || !ids.add(id) || (supported && record.has("reason"))) {
                 throw IOException("subscription_snapshot")
             }
-            records.add(SubscriptionRecordV1(id, record.optString("title", ""), record.optString("subtitle", ""), supported, reason))
+            records.add(SubscriptionRecordV1(id, display.title, display.subtitle, supported, reason))
         }
         if (records.any { it.supported } != (status == SubscriptionBatchStatusV1.HAS_SUPPORTED)) {
             throw IOException("subscription_snapshot")

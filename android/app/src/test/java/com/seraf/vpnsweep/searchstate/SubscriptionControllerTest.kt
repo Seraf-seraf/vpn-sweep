@@ -1,6 +1,8 @@
 package com.seraf.vpnsweep.searchstate
 
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
+import com.seraf.vpnsweep.resultactivation.MemorySearchCompletionReceiptStorage
+import com.seraf.vpnsweep.resultactivation.SearchCompletionReceiptStorage
 import com.seraf.vpnsweep.searchprotocol.*
 import com.seraf.vpnsweep.searchstorage.*
 import com.seraf.vpnsweep.subscriptionprotocol.*
@@ -429,6 +431,43 @@ class SubscriptionControllerTest {
         assertEquals(SubscriptionStartV1.BUSY, controller.load("synthetic"))
         assertTrue(controller.retryCleanup())
         assertTrue(snapshot.selectedInput.closed)
+    }
+
+    @Test
+    fun selectedSearchPortRejectionSurfacesSafeStageAndPreservesFailClosedMarker(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val lastGood = ResultManifest("last-good", ResultRevision("0", "0"), "synthetic-digest")
+        fixture.storage.manifest = lastGood
+        val controller = SubscriptionController(
+            port,
+            fixture.composition,
+            { ResultRevision("1", "1") },
+            { ResultRevision("1", "2") },
+        )
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic-input"))
+        val snapshot = Snapshot(listOf(record("synthetic-record", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+        assertEquals(SubscriptionPhase.READY, controller.state.value.phase)
+        assertTrue(controller.select(setOf("synthetic-record")))
+        fixture.runtime.result = SearchStartV3.REJECTED
+
+        assertEquals(SearchStartV3.REJECTED, controller.startSelected())
+        assertEquals(
+            SearchStartRejection(SearchStartStage.PORT_DISPATCH, SearchStartReason.PORT_REJECTED),
+            fixture.composition.controller.state.value.startRejection,
+        )
+        assertEquals("port_dispatch:port_rejected", fixture.composition.controller.state.value.startRejection?.safeCode)
+        assertEquals(SearchPhase.INTERRUPTED, fixture.composition.controller.state.value.phase)
+        assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+        assertEquals(1, fixture.marker.activeCalls)
+        assertEquals(0, fixture.marker.clearCalls)
+        assertEquals(lastGood, fixture.storage.manifest)
+        assertEquals(setOf("synthetic-record"), controller.state.value.selectedIds)
+        assertTrue(snapshot.selectedInput.closed)
+        assertFalse(fixture.composition.controller.state.value.toString().contains("synthetic-record"))
+        assertFalse(fixture.composition.controller.state.value.toString().contains("synthetic-digest"))
     }
 
     @Test
@@ -906,7 +945,15 @@ class SubscriptionControllerTest {
             SearchSessionPortV3::class.java,
             SessionMarker::class.java,
             VpnRunRegistry::class.java,
-        ).also { it.isAccessible = true }.newInstance(storage, revisions, runtime, marker, registry)
+            SearchCompletionReceiptStorage::class.java,
+        ).also { it.isAccessible = true }.newInstance(
+            storage,
+            revisions,
+            runtime,
+            marker,
+            registry,
+            MemorySearchCompletionReceiptStorage(),
+        )
     }
 
     private class Snapshot(override val records: List<SubscriptionRecordV1>) : SubscriptionSnapshotV1 {
@@ -974,6 +1021,7 @@ class SubscriptionControllerTest {
 
     private class FakeMarker(var value: MarkerState = MarkerState.CLEAR) : SessionMarker {
         var activeCalls = 0
+        var clearCalls = 0
         var throwAfterActive = false
         override fun read(): MarkerState = value
         override fun markActive(): Boolean {
@@ -982,7 +1030,7 @@ class SubscriptionControllerTest {
             if (throwAfterActive) throw IOException("synthetic")
             return true
         }
-        override fun markClear(): Boolean { value = MarkerState.CLEAR; return true }
+        override fun markClear(): Boolean { clearCalls++; value = MarkerState.CLEAR; return true }
     }
 
     private class FakeRevisions : RevisionStorage {

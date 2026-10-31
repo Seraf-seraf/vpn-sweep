@@ -100,7 +100,7 @@ class MainActivity : ComponentActivity() {
                             operationMessage = when (graph.startSearch()) {
                                 SearchStartV3.ACCEPTED -> ""
                                 SearchStartV3.BUSY -> "Подбор уже выполняется"
-                                SearchStartV3.REJECTED -> "Сначала выберите поддерживаемые серверы"
+                                SearchStartV3.REJECTED -> searchStartRejectedMessage(graph.searchState.value)
                                 SearchStartV3.UNKNOWN -> "Результат запуска неизвестен; повторный запуск заблокирован"
                             }
                         }
@@ -202,6 +202,10 @@ private fun searchFailureMessage(failure: SearchFailureV1?): String = when (fail
     SearchFailureV1.PROFILE_TOO_LARGE -> "Выбранные данные превышают поддерживаемый размер"
     null -> "Не удалось завершить подбор"
 }
+
+private fun searchStartRejectedMessage(state: SearchUiState): String = state.startRejection?.let {
+    "Подбор не запущен (${it.safeCode})"
+} ?: "Подбор не запущен (reason_unavailable)"
 
 private fun subscriptionFailureMessage(failure: SubscriptionFailureV1?): String = when (failure) {
     SubscriptionFailureV1.INVALID_URL -> "Введите корректную ссылку на подписку"

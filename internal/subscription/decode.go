@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
@@ -139,7 +140,7 @@ func ParseSubscription(ctx context.Context, data []byte, limits DecodeLimits) (B
 			id = hex.EncodeToString(idbytes[:])
 		}
 		seen[id] = struct{}{}
-		rec := Record{ID: id}
+		rec := Record{ID: id, Title: serverTitle(count)}
 		safe := safeURI(string(line))
 		if ctx.Err() != nil {
 			return fail(contextErrorCode(ctx))
@@ -150,6 +151,7 @@ func ParseSubscription(ctx context.Context, data []byte, limits DecodeLimits) (B
 			rec.Reason = "unsupported_record"
 		} else {
 			rec.Supported = true
+			rec.Title = displayTitle(string(line), count, profile)
 			batch.profiles[id] = profile
 		}
 		if ctx.Err() != nil {
@@ -167,6 +169,175 @@ func ParseSubscription(ctx context.Context, data []byte, limits DecodeLimits) (B
 		return batch, model.Err("no_supported_profiles", "subscription")
 	}
 	return batch, nil
+}
+
+const maxDisplayTitleRunes = 64
+
+func serverTitle(ordinal int) string {
+	return "Сервер " + strconv.Itoa(ordinal)
+}
+
+func displayTitle(raw string, ordinal int, profile model.Profile) string {
+	fallback := serverTitle(ordinal)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fallback
+	}
+	fragment := strings.TrimSpace(u.Fragment)
+	if hostname := u.Hostname(); hostname != "" && strings.EqualFold(fragment, hostname) {
+		return fallback
+	}
+	if matchesUserinfoCredential(fragment, u.User) {
+		return fallback
+	}
+	hosts, credentials, ok := profileDisplayValues(profile)
+	if !ok || matchesProfileValue(fragment, hosts, true) || matchesProfileValue(fragment, credentials, false) {
+		return fallback
+	}
+	return safeDisplayLabel(fragment, fallback)
+}
+
+func matchesUserinfoCredential(fragment string, user *url.Userinfo) bool {
+	if user == nil {
+		return false
+	}
+	if matchesCredential(fragment, user.Username()) {
+		return true
+	}
+	password, hasPassword := user.Password()
+	return hasPassword && matchesCredential(fragment, password)
+}
+
+func matchesCredential(fragment string, credential string) bool {
+	if credential == "" {
+		return false
+	}
+	return fragment == credential || (utf8.RuneCountInString(credential) >= 5 && strings.Contains(fragment, credential))
+}
+
+func matchesProfileValue(fragment string, values []string, caseInsensitive bool) bool {
+	for _, value := range values {
+		if caseInsensitive {
+			if strings.Contains(strings.ToLower(fragment), strings.ToLower(value)) {
+				return true
+			}
+		} else if strings.Contains(fragment, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func profileDisplayValues(profile model.Profile) ([]string, []string, bool) {
+	outbound := profile.Outbound
+	protocol, ok := outbound["protocol"].(string)
+	if !ok {
+		return nil, nil, false
+	}
+	settings, ok := outbound["settings"].(map[string]any)
+	if !ok {
+		return nil, nil, false
+	}
+	listKey := "servers"
+	credentialKey := "password"
+	switch protocol {
+	case "vless", "vmess":
+		listKey = "vnext"
+		credentialKey = "id"
+	case "trojan", "shadowsocks":
+	case "socks":
+		credentialKey = ""
+	default:
+		return nil, nil, false
+	}
+	server := firstProfileMap(settings[listKey])
+	if server == nil {
+		return nil, nil, false
+	}
+	address, ok := server["address"].(string)
+	if !ok || address == "" {
+		return nil, nil, false
+	}
+	hosts := []string{address}
+	var credentials []string
+	if credentialKey != "" {
+		credential, ok := serverCredential(server, protocol, credentialKey)
+		if !ok || credential == "" {
+			return nil, nil, false
+		}
+		credentials = append(credentials, credential)
+	} else if usersValue, exists := server["users"]; exists {
+		users, ok := usersValue.([]any)
+		if !ok || len(users) != 1 {
+			return nil, nil, false
+		}
+		user, ok := users[0].(map[string]any)
+		if !ok {
+			return nil, nil, false
+		}
+		for _, key := range []string{"user", "pass"} {
+			value, ok := user[key].(string)
+			if !ok {
+				return nil, nil, false
+			}
+			if value != "" {
+				credentials = append(credentials, value)
+			}
+		}
+	}
+	return hosts, credentials, true
+}
+
+func firstProfileMap(value any) map[string]any {
+	items, ok := value.([]any)
+	if !ok || len(items) != 1 {
+		return nil
+	}
+	result, _ := items[0].(map[string]any)
+	return result
+}
+
+func serverCredential(server map[string]any, protocol string, key string) (string, bool) {
+	if protocol == "vless" || protocol == "vmess" {
+		users, ok := server["users"].([]any)
+		if !ok || len(users) != 1 {
+			return "", false
+		}
+		user, ok := users[0].(map[string]any)
+		if !ok {
+			return "", false
+		}
+		value, ok := user[key].(string)
+		return value, ok
+	}
+	value, ok := server[key].(string)
+	return value, ok
+}
+
+func safeDisplayLabel(fragment string, fallback string) string {
+	if !utf8.ValidString(fragment) {
+		return fallback
+	}
+	for _, r := range fragment {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return fallback
+		}
+	}
+	title := strings.TrimSpace(fragment)
+	titleRunes := utf8.RuneCountInString(title)
+	if title == "" || titleRunes > maxDisplayTitleRunes {
+		return fallback
+	}
+	lowerTitle := strings.ToLower(title)
+	if strings.Contains(lowerTitle, "://") || strings.HasPrefix(title, "//") {
+		return fallback
+	}
+	for _, r := range title {
+		if !unicode.IsGraphic(r) && !unicode.IsSpace(r) {
+			return fallback
+		}
+	}
+	return title
 }
 
 func safeURI(raw string) bool {

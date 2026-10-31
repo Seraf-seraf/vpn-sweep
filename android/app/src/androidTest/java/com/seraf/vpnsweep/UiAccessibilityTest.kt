@@ -453,6 +453,17 @@ class UiAccessibilityTest {
     }
 
     @Test
+    fun serverSelectionDisplaysDecodedNonemptyTitle(): Unit {
+        val title = "東京 🌙"
+        compose.setContent {
+            SweepTheme {
+                ServerSelectionDialogContent(listOf(ServerChoice("synthetic", title, "", true)), emptySet(), {}, {})
+            }
+        }
+        compose.onNodeWithText(title).assertIsDisplayed()
+    }
+
+    @Test
     fun serverListScrollKeepsSearchAndFooterVisible(): Unit {
         val servers = (1..12).map { ServerChoice("$it", "Сервер $it", "Пример", true) }
         compose.setContent {

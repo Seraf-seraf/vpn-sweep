@@ -83,6 +83,71 @@ func TestSnapshotRecoveryPreservesOpaqueIDsAndProfiles(t *testing.T) {
 	}
 }
 
+func TestRecordJSONUsesSafeLowercaseDisplayTitle(t *testing.T) {
+	s, err := parseSnapshot(context.Background(), []byte("vless://synthetic-id@node.invalid:443#Z%C3%BCrich"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	record, err := s.RecordJSON(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(record, &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["title"] != "Zürich" || value["Title"] != nil {
+		t.Fatalf("record title JSON = %s", record)
+	}
+	for _, privateValue := range []string{"synthetic-id", "node.invalid"} {
+		if bytes.Contains(record, []byte(privateValue)) {
+			t.Fatalf("record JSON leaked %q", privateValue)
+		}
+	}
+}
+
+func TestSnapshotFingerprintIgnoresDisplayTitleAcrossRoundTrip(t *testing.T) {
+	s, err := parseSnapshot(context.Background(), []byte(syntheticSupported+"#Z%C3%BCrich"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	currentRecord := s.batch.Records[0]
+	legacyRecord := currentRecord
+	legacyRecord.Title = ""
+	legacyFingerprint, err := fingerprint(s.batch, legacyRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentFingerprint, err := fingerprint(s.batch, currentRecord)
+	if err != nil || currentFingerprint != legacyFingerprint {
+		t.Fatalf("display title changed snapshot identity: %v", err)
+	}
+
+	f, err := os.CreateTemp(t.TempDir(), "legacy-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	n, err := s.WriteSnapshot(int64(f.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := ReadSnapshot(int64(f.Fd()), n)
+	if err != nil {
+		t.Fatalf("read snapshot with legacy identity: %v", err)
+	}
+	defer recovered.Close()
+	if recovered.stableIDs[0] != s.stableIDs[0] {
+		t.Fatal("snapshot identity changed")
+	}
+	record, err := recovered.RecordJSON(0)
+	if err != nil || !bytes.Contains(record, []byte(`"title":"Zürich"`)) {
+		t.Fatalf("display title did not survive snapshot recovery: %s, %v", record, err)
+	}
+}
+
 func TestSnapshotSelectionRejectsUnknownUnsupportedAndDuplicateWithoutWriting(t *testing.T) {
 	s, err := parseSnapshot(context.Background(), []byte(syntheticSupported+"\n"+syntheticUnsupported+"\n"))
 	if err != nil {

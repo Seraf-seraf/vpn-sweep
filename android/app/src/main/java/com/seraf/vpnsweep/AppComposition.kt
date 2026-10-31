@@ -18,6 +18,9 @@ import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
 import com.seraf.vpnsweep.searchstate.MarkerState
 import com.seraf.vpnsweep.searchstate.SearchPhase
 import com.seraf.vpnsweep.searchstate.SearchTerminalCommitterV1
+import com.seraf.vpnsweep.searchstate.SearchStartReason
+import com.seraf.vpnsweep.searchstate.SearchStartRejection
+import com.seraf.vpnsweep.searchstate.SearchStartStage
 import com.seraf.vpnsweep.searchstate.SessionMarker
 import com.seraf.vpnsweep.searchstorage.ResultRevision
 import com.seraf.vpnsweep.searchworker.NetworkOwnerOpen
@@ -120,14 +123,33 @@ internal class AppComposition(context: Context) {
     }
 
     fun startSearch(): SearchStartV3 = synchronized(activation.controller) {
+        activation.controller.clearStartRejection()
         val before = subscriptions.state.value
-        val receipt = synchronized(lock) { acceptedSnapshot } ?: return SearchStartV3.REJECTED
-        val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return SearchStartV3.REJECTED
-        if (before.phase != SubscriptionPhase.READY || before.selectedIds.isEmpty() ||
-            before.generation != receipt.requestGeneration || revision != ResultRevision(receipt.sourceRevision, receipt.selectionRevision) ||
-            !workerTransportLimits.isProven
-        ) return SearchStartV3.REJECTED
+        val receipt = synchronized(lock) { acceptedSnapshot }
+            ?: return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.ACCEPTED_RECEIPT_MISSING)
+        val revision = try { activation.currentRevision() } catch (_: Exception) { null }
+            ?: return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.CURRENT_REVISION_UNAVAILABLE)
+        if (before.phase != SubscriptionPhase.READY) {
+            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.SUBSCRIPTION_NOT_READY)
+        }
+        if (before.selectedIds.isEmpty()) {
+            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.SELECTION_EMPTY)
+        }
+        if (before.generation != receipt.requestGeneration) {
+            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.GENERATION_MISMATCH)
+        }
+        if (revision != ResultRevision(receipt.sourceRevision, receipt.selectionRevision)) {
+            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.REVISION_MISMATCH)
+        }
+        if (!workerTransportLimits.isProven) {
+            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.TRANSPORT_LIMITS_UNPROVEN)
+        }
         return subscriptions.startSelected()
+    }
+
+    private fun rejectSearchStart(stage: SearchStartStage, reason: SearchStartReason): SearchStartV3 {
+        activation.controller.recordStartRejection(SearchStartRejection(stage, reason))
+        return SearchStartV3.REJECTED
     }
 
     fun cancelSearch(): Unit = activation.controller.cancel()
@@ -340,11 +362,14 @@ internal class AppComposition(context: Context) {
         )
 
         override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
-            val imported = synchronized(this@AppComposition.lock) { acceptedSnapshot } ?: return SearchStartV3.REJECTED
-            val source = imported.sourceRevision.toLongOrNull() ?: return SearchStartV3.REJECTED
-            val selection = imported.selectionRevision.toLongOrNull() ?: return SearchStartV3.REJECTED
+            val imported = synchronized(this@AppComposition.lock) { acceptedSnapshot }
+                ?: return rejectStart(SearchStartReason.ACCEPTED_RECEIPT_MISSING)
+            val source = imported.sourceRevision.toLongOrNull()
+                ?: return rejectStart(SearchStartReason.SNAPSHOT_REVISION_INVALID)
+            val selection = imported.selectionRevision.toLongOrNull()
+                ?: return rejectStart(SearchStartReason.SNAPSHOT_REVISION_INVALID)
             if (snapshot.sessionGeneration <= 0 || phaseEpoch <= 0 || snapshot.sourceRevision != source || snapshot.selectionRevision != selection) {
-                return SearchStartV3.REJECTED
+                return rejectStart(SearchStartReason.SNAPSHOT_IDENTITY_MISMATCH)
             }
             val lease = when (val result = SearchOwnerLock.acquire(app)) {
                 is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> result.lease
@@ -354,7 +379,7 @@ internal class AppComposition(context: Context) {
             val receipt = SearchLeaseReceiptV1.fromAcceptedSnapshot(imported, snapshot, leaseIdentity)
                 ?: run {
                     try { lease.close() } catch (_: Exception) { }
-                    return SearchStartV3.REJECTED
+                    return rejectStart(SearchStartReason.LEASE_RECEIPT_INVALID)
                 }
             synchronized(lock) {
                 if (identities.containsKey(snapshot.sessionGeneration)) {
@@ -375,6 +400,11 @@ internal class AppComposition(context: Context) {
                     restoredCompletedSearch = null
                 }
                 val result = producer.start(snapshot, phaseEpoch, observer)
+                if (result == SearchStartV3.REJECTED) {
+                    activation.controller.recordStartRejection(
+                        SearchStartRejection(SearchStartStage.PRODUCER, SearchStartReason.PRODUCER_REJECTED),
+                    )
+                }
                 if (result != SearchStartV3.ACCEPTED) {
                     identities.remove(snapshot.sessionGeneration)
                     synchronized(this@AppComposition.lock) {
@@ -383,6 +413,13 @@ internal class AppComposition(context: Context) {
                 }
                 return result
             }
+        }
+
+        private fun rejectStart(reason: SearchStartReason): SearchStartV3 {
+            activation.controller.recordStartRejection(
+                SearchStartRejection(SearchStartStage.PORT_DISPATCH, reason),
+            )
+            return SearchStartV3.REJECTED
         }
 
         override fun pause(sessionGeneration: Long, phaseEpoch: Long): Unit = producer.pause(sessionGeneration, phaseEpoch)

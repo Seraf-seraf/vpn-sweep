@@ -116,6 +116,8 @@ func (s *Snapshot) RecordJSON(index int64) ([]byte, error) {
 func fingerprint(b subscription.Batch, r subscription.Record) ([32]byte, error) {
 	privateID := r.ID
 	r.ID = ""
+	// Display titles must not change identity for persisted snapshots.
+	r.Title = ""
 	v := struct {
 		Record  subscription.Record `json:"record"`
 		Profile *model.Profile      `json:"profile,omitempty"`

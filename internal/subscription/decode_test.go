@@ -47,6 +47,74 @@ func TestSubscriptionDecodePure(t *testing.T) {
 		}
 	}
 }
+
+func TestSubscriptionDisplayTitlesAreDecodedAndPrivacyFiltered(t *testing.T) {
+	lines := []string{
+		"vless://synthetic-id@node.invalid:443#%E6%9D%B1%E4%BA%AC%20%F0%9F%8C%99",
+		"trojan://synthetic-password@node.invalid:443#P%C3%A4iv%C3%A4",
+		"vless://synthetic-id@node.invalid:443#",
+		"vless://synthetic-id@node.invalid:443#bad%ZZ",
+		"vless://synthetic-id@node.invalid:443#https%3A%2F%2Fsecret.invalid",
+		"vless://synthetic-id@node.invalid:443#node.invalid",
+		"trojan://synthetic-password@node.invalid:443#synthetic-password",
+		"vless://synthetic-id@node.invalid:443#unsafe%0Aname",
+		"vless://synthetic-id@node.invalid:443#S%C3%A3o%2520Paulo",
+		"vless://synthetic-id@node.invalid:443#s3cure123",
+		"vless://shortid@node.invalid:443#shortid",
+		"trojan://secret@node.invalid:443#secret",
+		"vless://synthetic-id@localhost:443#LOCALHOST",
+	}
+	vmessPayload, err := json.Marshal(map[string]string{"v": "2", "add": "node.invalid", "port": "443", "id": "shortid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vmessHostPayload, err := json.Marshal(map[string]string{"v": "2", "add": "localhost", "port": "443", "id": "vmessid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssPayload := base64.RawURLEncoding.EncodeToString([]byte("aes-128-gcm:sspass@localhost:8388"))
+	lines = append(lines,
+		"vmess://"+base64.StdEncoding.EncodeToString(vmessPayload)+"#shortid",
+		"ss://"+ssPayload+"#sspass",
+		"ss://"+ssPayload+"#LOCALHOST",
+		"vmess://"+base64.StdEncoding.EncodeToString(vmessHostPayload)+"#LOCALHOST",
+	)
+	batch, err := ParseSubscription(context.Background(), []byte(strings.Join(lines, "\n")), decodeLimits())
+	if err != nil || len(batch.Records) != len(lines) {
+		t.Fatalf("parse subscription: records=%d err=%v", len(batch.Records), err)
+	}
+	wantTitles := []string{"東京 🌙", "Päivä", "Сервер 3", "Сервер 4", "Сервер 5", "Сервер 6", "Сервер 7", "Сервер 8", "São%20Paulo", "s3cure123", "Сервер 11", "Сервер 12", "Сервер 13", "Сервер 14", "Сервер 15", "Сервер 16", "Сервер 17"}
+	for i, record := range batch.Records {
+		if record.Title != wantTitles[i] {
+			t.Errorf("record %d title = %q, want %q", i+1, record.Title, wantTitles[i])
+		}
+	}
+	encoded, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, privateValue := range []string{"synthetic-id", "synthetic-password", "shortid", "secret", "sspass", "vmessid", "node.invalid", "localhost", "secret.invalid", "vless://", "trojan://"} {
+		if strings.Contains(string(encoded), privateValue) {
+			t.Fatalf("display records leaked %q", privateValue)
+		}
+	}
+}
+
+func TestDisplayTitleRuneLimit(t *testing.T) {
+	spacedLabel := func(runes int) string {
+		prefix := strings.Repeat("a ", (runes-1)/2)
+		return prefix + strings.Repeat("a", runes-len(prefix))
+	}
+	for _, tc := range []struct {
+		runes int
+		want  string
+	}{{63, spacedLabel(63)}, {64, spacedLabel(64)}, {65, "Сервер 1"}} {
+		if got := safeDisplayLabel(spacedLabel(tc.runes), "Сервер 1"); got != tc.want {
+			t.Errorf("display title with %d runes = %q, want %q", tc.runes, got, tc.want)
+		}
+	}
+}
+
 func TestSubscriptionDecodeBoundsPure(t *testing.T) {
 	raw := []byte("socks5://node.invalid:1")
 	for _, delta := range []int{-1, 0, 1} {

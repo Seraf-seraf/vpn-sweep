@@ -4,6 +4,9 @@ import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchstate.MarkerState
 import com.seraf.vpnsweep.searchstate.SearchController
+import com.seraf.vpnsweep.searchstate.SearchStartReason
+import com.seraf.vpnsweep.searchstate.SearchStartRejection
+import com.seraf.vpnsweep.searchstate.SearchStartStage
 import com.seraf.vpnsweep.searchstate.SearchStartPreparation
 import com.seraf.vpnsweep.searchstate.SessionMarker
 import com.seraf.vpnsweep.searchstorage.CurrentRevisionStore
@@ -39,7 +42,14 @@ internal class ResultActivation(
             if (!markerClear()) return@synchronized SearchStartPreparation.Denied(SearchStartV3.BUSY)
             val expected = ResultRevision(sourceRevision.toString(), selectionRevision.toString())
             val current = try { revisions.load() } catch (_: Exception) { null }
-            if (current != expected) return@synchronized SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+            if (current == null) {
+                controller.recordStartRejection(SearchStartRejection(SearchStartStage.RESERVE, SearchStartReason.CURRENT_REVISION_UNAVAILABLE))
+                return@synchronized SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+            }
+            if (current != expected) {
+                controller.recordStartRejection(SearchStartRejection(SearchStartStage.RESERVE, SearchStartReason.REVISION_MISMATCH))
+                return@synchronized SearchStartPreparation.Denied(SearchStartV3.REJECTED)
+            }
             if (!disconnected()) return@synchronized SearchStartPreparation.Denied(SearchStartV3.BUSY)
             try {
                 controller.reserveStart(sourceRevision, selectionRevision, profiles, vpnDisconnected = true)
