@@ -214,6 +214,38 @@ class SearchFenceV3Test {
     }
 
     @Test
+    fun lateDeliveryBeingClosedBlocksNewAdmissions(): Unit {
+        val marker = Marker()
+        val port = Port()
+        val controller = SearchController(port, ResultStore(Storage()), marker)
+        controller.start(1, 2, Input(), true)
+        val oldObserver = port.observer!!
+        assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, port.offer(Input()))
+        port.terminal(SearchResultFenceV3.CONFIRMED)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val late = Input(closeAction = { entered.countDown(); check(release.await(10, TimeUnit.SECONDS)) })
+        var receipt: SearchResultReceiptV3? = null
+        val delivery = thread {
+            receipt = oldObserver.onResult(SearchResultOfferV3(1, 1, 1, 2, "unused", late))
+        }
+        try {
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            assertFalse(controller.withSourceMutation { true })
+            val start = controller.reserveStart(1, 2, Input(), true)
+            assertTrue(start is SearchStartPreparation.Denied)
+            assertEquals(SearchStartV3.BUSY, (start as SearchStartPreparation.Denied).result)
+        } finally {
+            release.countDown()
+            delivery.join(10_000)
+        }
+        assertFalse(delivery.isAlive)
+        assertEquals(SearchResultReceiptV3.IGNORED_CLOSED, receipt)
+        assertTrue(late.closed)
+        assertTrue(controller.withSourceMutation { true })
+    }
+
+    @Test
     fun pausedPhaseRejectsLateResultBeforeResumeWithoutOpeningIt(): Unit {
         val marker = Marker()
         val port = Port()
