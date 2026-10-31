@@ -64,3 +64,11 @@ func BuildDefaultSearchManifest(profileBytes []byte, coreDigest string) (result 
 	}
 	return result, nil
 }
+
+func SearchManifestCleanupMillis(manifestBytes []byte) (int64, error) {
+	var manifest model.Manifest
+	if model.Decode(manifestBytes, &manifest) != nil || !validSearchBudgets(manifest.Budgets) {
+		return 0, errors.New("invalid_search_input")
+	}
+	return int64(manifest.Budgets.CleanupSeconds) * 1000, nil
+}

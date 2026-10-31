@@ -124,3 +124,34 @@ func TestAndroidDefaultSearchManifestHonorsProfileCountBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestAndroidSearchManifestCleanupBudget(t *testing.T) {
+	manifest := model.Manifest{Budgets: model.DefaultBudgets()}
+	for _, seconds := range []int{0, 1, 60, 61} {
+		manifest.Budgets.CleanupSeconds = seconds
+		input, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		millis, err := SearchManifestCleanupMillis(input)
+		if seconds >= 1 && seconds <= 60 {
+			if err != nil || millis != int64(seconds)*1000 {
+				t.Fatalf("valid cleanup budget %d: millis=%d err=%v", seconds, millis, err)
+			}
+		} else if err == nil {
+			t.Fatalf("invalid cleanup budget %d accepted", seconds)
+		}
+	}
+	manifest.Budgets = model.DefaultBudgets()
+	input, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := bytes.Replace(input, []byte(`"cleanup_seconds":5`), []byte(`"cleanup_seconds":5,"cleanup_seconds":5`), 1)
+	if bytes.Equal(input, duplicate) {
+		t.Fatal("synthetic cleanup field not found")
+	}
+	if _, err := SearchManifestCleanupMillis(duplicate); err == nil {
+		t.Fatal("duplicate cleanup budget was accepted")
+	}
+}
