@@ -3,8 +3,10 @@ package mobile
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -208,6 +210,44 @@ func TestAndroidSearchEmbeddedReadinessCloseFailureQuarantines(t *testing.T) {
 	}
 	if instance.closes.Load() != 1 {
 		t.Fatal("core cleanup was skipped after readiness close failure")
+	}
+}
+
+func TestAndroidSearchEmbeddedAcceptsLargeValidParameters(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	input, err := importer.Parse([]byte("ss://YWVzLTEyOC1nY206c3ludGhldGlj@synthetic.invalid:8388"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := json.Marshal(input.Profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	delay := strings.Repeat("0", importer.MaxInputBytes)
+	params, err := json.Marshal(map[string]any{
+		"noise": true,
+		"noises": []any{map[string]any{
+			"type": "rand", "packet": "1", "delay": delay, "applyTo": "ip",
+		}},
+	})
+	if err != nil || len(params) <= importer.MaxInputBytes {
+		t.Fatal("test parameters did not exceed the profile input limit")
+	}
+	var starts atomic.Int32
+	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, actualProfile model.Profile, actualParams map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		starts.Add(1)
+		noises, ok := actualParams["noises"].([]any)
+		if !ok || len(noises) != 1 {
+			return nil, nil, errors.New("unexpected_noise_parameters")
+		}
+		noise, ok := noises[0].(map[string]any)
+		if !ok || actualProfile.Outbound["protocol"] != "shadowsocks" || actualParams["noise"] != true || noise["delay"] != delay {
+			return nil, nil, errors.New("unexpected_noise_parameters")
+		}
+		return nil, nil, model.Err("core_config_rejected", "core")
+	})
+	if status := worker.OpenStatus(profile, params, maxSearchStartupMillis, 1000); status != SearchWorkerCandidateConfigRejected || starts.Load() != 1 {
+		t.Fatalf("valid large parameters status=%d starts=%d", status, starts.Load())
 	}
 }
 
