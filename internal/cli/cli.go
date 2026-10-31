@@ -82,7 +82,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		return 0
 	}
 	if args[0] == "version" {
-		io.WriteString(out, "vpn-sweep google-youtube-web-noise-v1 schema=1 search=2 xray=ac5d8a8 android/arm64-unverified\n")
+		io.WriteString(out, "vpn-sweep google-youtube-web-noise-v1 schema=1 search=3 xray=ac5d8a8 android/arm64-unverified\n")
 		return 0
 	}
 	o, e := flags(args[1:])

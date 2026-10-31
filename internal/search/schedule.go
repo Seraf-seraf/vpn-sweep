@@ -6,9 +6,12 @@ import (
 	"math/big"
 )
 
+const fingerprintIdentityVersion = 3
+
 type candidateSchedule struct {
 	profiles []model.Profile
 	key      []byte
+	version  int
 	base     *space.Generator
 	spaces   []*space.Generator
 	counts   []*big.Int
@@ -17,8 +20,8 @@ type candidateSchedule struct {
 	total    *big.Int
 }
 
-func newCandidateSchedule(profiles []model.Profile, key []byte, g *space.Generator) (*candidateSchedule, error) {
-	s := &candidateSchedule{profiles: profiles, key: key, base: g, min: new(big.Int), max: new(big.Int), total: big.NewInt(int64(len(profiles)))}
+func newCandidateSchedule(profiles []model.Profile, key []byte, g *space.Generator, version int) (*candidateSchedule, error) {
+	s := &candidateSchedule{profiles: profiles, key: key, version: version, base: g, min: new(big.Int), max: new(big.Int), total: big.NewInt(int64(len(profiles)))}
 	for i, p := range profiles {
 		profileSpace, err := g.ForProfile(p)
 		if err != nil {
@@ -57,8 +60,50 @@ func (s *candidateSchedule) candidate(pos *big.Int) (model.Candidate, *big.Int, 
 		params, _ = s.spaces[profile].At(rank)
 	}
 	c := model.Candidate{Profile: profile, Params: params}
-	c.ID = model.PrivateID(s.key, []any{"candidate-v2", s.profiles[profile], Effective(s.profiles[profile], params)})
+	c.ID = s.candidateID(profile, params)
 	return c, new(big.Int).Add(pos, big.NewInt(1)), true
+}
+
+func sourceFingerprint(p model.Profile) string {
+	stream, _ := p.Outbound["streamSettings"].(map[string]any)
+	settings := "tlsSettings"
+	if stream["security"] == "reality" {
+		settings = "realitySettings"
+	} else if stream["security"] != "tls" {
+		return ""
+	}
+	tls, _ := stream[settings].(map[string]any)
+	fingerprint, _ := tls["fingerprint"].(string)
+	return fingerprint
+}
+
+func (s *candidateSchedule) candidateID(profile int, params map[string]any) string {
+	p := s.profiles[profile]
+	effective := Effective(p, params)
+	if s.version >= fingerprintIdentityVersion {
+		if fingerprint := sourceFingerprint(p); fingerprint != "" && effective["fingerprint"] == fingerprint {
+			delete(effective, "fingerprint")
+		}
+	}
+	return model.PrivateID(s.key, []any{"candidate-v2", p, effective})
+}
+
+func (s *candidateSchedule) isSaved(saved map[string]bool, c model.Candidate) bool {
+	if saved[c.ID] {
+		return true
+	}
+	if s.version < fingerprintIdentityVersion {
+		return false
+	}
+	p := s.profiles[c.Profile]
+	fingerprint := sourceFingerprint(p)
+	if fingerprint == "" || c.Params["fingerprint"] != nil && c.Params["fingerprint"] != fingerprint {
+		return false
+	}
+	effective := Effective(p, c.Params)
+	effective["fingerprint"] = fingerprint
+	legacyID := model.PrivateID(s.key, []any{"candidate-v2", p, effective})
+	return saved[legacyID]
 }
 
 func (s *candidateSchedule) position(position *big.Int) (int, *big.Int) {

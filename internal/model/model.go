@@ -12,7 +12,8 @@ import (
 )
 
 const SchemaVersion = 1
-const SearchVersion = 2
+const SearchVersion = 3
+const LegacySearchVersion = 2
 const TargetCommit = "ac5d8a83ba798c390cd89f235c3d4c35c77c1586"
 
 type Error struct {

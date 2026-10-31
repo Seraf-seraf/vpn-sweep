@@ -67,7 +67,7 @@ func Effective(p model.Profile, params map[string]any) map[string]any {
 	return capability.Effective(p, params)
 }
 func Candidate(profiles []model.Profile, key []byte, g *space.Generator, pos *big.Int) (model.Candidate, *big.Int, bool) {
-	s, err := newCandidateSchedule(profiles, key, g)
+	s, err := newCandidateSchedule(profiles, key, g, model.SearchVersion)
 	if err != nil {
 		return model.Candidate{}, nil, false
 	}
@@ -77,7 +77,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 	if policy.RequiresRemovedYouTube(m.Policy) {
 		return "youtube_video_removed_new_series_required", model.Err("youtube_video_removed_new_series_required", "search")
 	}
-	if m.SearchVersion != model.SearchVersion {
+	if m.SearchVersion != model.SearchVersion && m.SearchVersion != model.LegacySearchVersion {
 		return "unsupported_search_version", model.Err("search_version_requires_new_series", "search")
 	}
 	if m.Environment != "unverified" && (m.Environment != "user_attested" || m.NetworkLabel == "") {
@@ -95,7 +95,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		}
 		_ = p
 	}
-	schedule, err := newCandidateSchedule(profiles, key, g)
+	schedule, err := newCandidateSchedule(profiles, key, g, m.SearchVersion)
 	if err != nil {
 		return "invalid_input", err
 	}
@@ -118,7 +118,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		}
 	}
 	if winner := s.View().Winner; winner != nil {
-		if !e.Saved[winner.Candidate.ID] {
+		if !schedule.isSaved(e.Saved, winner.Candidate) {
 			if err := e.Export(*winner); err != nil {
 				return "result_save_failed", err
 			}
@@ -180,7 +180,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			}
 			continue
 		}
-		if e.Saved[c.ID] {
+		if schedule.isSaved(e.Saved, c) {
 			e.notify(s, Progress{Event: "saved_result_skipped"})
 			if err := s.End("already_saved"); err != nil {
 				return "state_error", err
@@ -266,7 +266,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 						continue
 					}
 					n := model.Candidate{Profile: c.Profile, Params: params}
-					n.ID = model.PrivateID(key, []any{"candidate-v2", profiles[c.Profile], Effective(profiles[c.Profile], params)})
+					n.ID = schedule.candidateID(c.Profile, params)
 					neighbors = append(neighbors, n)
 				}
 				if err = s.Refine(neighbors); err != nil {

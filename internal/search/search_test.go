@@ -77,7 +77,7 @@ func TestDefaultEarlyCoverageUsesApplicableProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schedule, err := newCandidateSchedule(profiles, make([]byte, 32), g)
+	schedule, err := newCandidateSchedule(profiles, make([]byte, 32), g, model.SearchVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,6 +172,134 @@ func TestProfileSpacesFinishInRoundRobinOrder(t *testing.T) {
 	}
 	if _, _, ok := Candidate(profiles, make([]byte, 32), g, big.NewInt(int64(len(order)))); ok {
 		t.Fatal("profile scheduler did not stop at the finite boundary")
+	}
+}
+
+func TestFingerprintCandidateIdentityMatchesRenderedSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		uri   string
+		equal bool
+	}{
+		{name: "TLS source fingerprint", uri: "vless://synthetic@vpn.invalid:443?type=tcp&security=tls&fp=chrome", equal: true},
+		{name: "REALITY source fingerprint", uri: "vless://synthetic@vpn.invalid:443?type=tcp&security=reality&sni=tls.invalid&pbk=synthetic&fp=chrome", equal: true},
+		{name: "no source fingerprint", uri: "vless://synthetic@vpn.invalid:443?type=tcp&security=tls"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := importer.Parse([]byte(tc.uri), "uri")
+			if err != nil {
+				t.Fatal(err)
+			}
+			g, err := space.New(space.Spec{Version: 2, Strategy: "exhaustive", Parameters: []space.Domain{{Name: "fingerprint", Optional: true, Values: []any{"chrome", "firefox"}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := make([]byte, 32)
+			base, _, _ := Candidate(r.Profiles, key, g, big.NewInt(0))
+			chrome, _, _ := Candidate(r.Profiles, key, g, big.NewInt(2))
+			firefox, _, _ := Candidate(r.Profiles, key, g, big.NewInt(3))
+			baseConfig, err := capability.Render(r.Profiles[0], base.Params, "127.0.0.1:10801", "local-user", "local-pass")
+			if err != nil {
+				t.Fatal(err)
+			}
+			chromeConfig, err := capability.Render(r.Profiles[0], chrome.Params, "127.0.0.1:10801", "local-user", "local-pass")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (string(baseConfig) == string(chromeConfig)) != tc.equal || (base.ID == chrome.ID) != tc.equal || base.ID == firefox.ID {
+				t.Fatalf("rendered equality and candidate identity disagree: base=%s chrome=%s firefox=%s", base.ID, chrome.ID, firefox.ID)
+			}
+		})
+	}
+}
+
+func TestVersionTwoKeepsFingerprintCandidateIdentity(t *testing.T) {
+	m, _, _, s := setup(t)
+	m.SearchVersion = 2
+	r, err := importer.Parse([]byte("vless://synthetic@vpn.invalid:443?type=tcp&security=tls&fp=chrome"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := space.New(space.Spec{Version: 2, Strategy: "exhaustive", Parameters: []space.Domain{{Name: "fingerprint", Optional: true, Values: []any{"chrome", "firefox"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	m.InputID = model.PrivateID(key, r.Profiles)
+	m.Space, err = json.Marshal(g.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveManifest(m, r.Profiles, key); err != nil {
+		t.Fatal(err)
+	}
+	var seen []string
+	e := Engine{Open: func(_ context.Context, _ model.Profile, _ map[string]any) (Tunnel, error) {
+		seen = append(seen, s.View().Pending.Candidate.ID)
+		return nil, model.Err("core_start_failed", "core")
+	}}
+	m.Budgets.Attempts = 1
+	status, err := e.Run(context.Background(), m, r.Profiles, key, g, s)
+	if err != nil || status != "paused_budget" || len(seen) != 1 {
+		t.Fatalf("legacy initial session: status=%s err=%v candidates=%v", status, err, seen)
+	}
+	dir := s.Dir
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = state.Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	loaded, profiles, loadedKey, err := s.LoadManifest()
+	if err != nil || loaded.SearchVersion != 2 {
+		t.Fatal("legacy manifest was not restored", err)
+	}
+	var spec space.Spec
+	if err = model.Decode(loaded.Space, &spec); err != nil {
+		t.Fatal(err)
+	}
+	g, err = space.New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Budgets.Attempts = 0
+	status, err = e.Run(context.Background(), loaded, profiles, loadedKey, g, s)
+	if err != nil || status != "space_exhausted" || len(seen) != 3 {
+		t.Fatalf("legacy series: status=%s err=%v candidates=%v", status, err, seen)
+	}
+	for i, want := range []string{
+		"8f5e876de08ee17a3bfe68c171831bbb313604cc25ca7d368dc2dbe8a20ecf4e",
+		"4b64d9d5c66252d4096628a3a721334a082af49e0bf5fac3090b191f363e6947",
+		"ba1020577e5482867d48d5b2025e192312e2ae2d65b270d0f5c32c365ecc49e9",
+	} {
+		if seen[i] != want {
+			t.Fatalf("legacy candidate %d: got %s, want %s", i, seen[i], want)
+		}
+	}
+}
+
+func TestPreviouslySavedLegacyFingerprintSkipsEquivalentCandidate(t *testing.T) {
+	m, _, _, s := setup(t)
+	r, err := importer.Parse([]byte("vless://synthetic@vpn.invalid:443?type=tcp&security=tls&fp=chrome"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := space.New(space.Spec{Version: 2, Strategy: "exhaustive", Parameters: []space.Domain{{Name: "fingerprint", Optional: true, Values: []any{"chrome"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	legacyID := model.PrivateID(key, []any{"candidate-v2", r.Profiles[0], Effective(r.Profiles[0], map[string]any{"fingerprint": "chrome"})})
+	opens := 0
+	e := Engine{Saved: map[string]bool{legacyID: true}, Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+		opens++
+		return nil, model.Err("core_start_failed", "core")
+	}}
+	status, err := e.Run(context.Background(), m, r.Profiles, key, g, s)
+	if err != nil || status != "space_exhausted" || opens != 0 {
+		t.Fatalf("legacy saved candidate: status=%s err=%v opens=%d", status, err, opens)
 	}
 }
 
