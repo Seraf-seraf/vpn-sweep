@@ -64,21 +64,27 @@ func (w *SearchWorkerProbes) Authenticate(remainingMillis int64) error {
 	defer cancel()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return err
 	}
 	conn, err := w.proxy.Negotiate(ctx)
+	if err := w.contextError(ctx); err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return err
+	}
 	if !searchCurrent(w.owner) {
 		if conn != nil {
 			_ = conn.Close()
 		}
 		return errors.New("search_owner_lost")
 	}
-	if ctx.Err() != nil {
+	if err := w.contextError(ctx); err != nil {
 		if conn != nil {
 			_ = conn.Close()
 		}
-		return ctx.Err()
+		return err
 	}
 	if err != nil {
 		return errors.New("search_proxy_not_ready")
@@ -101,14 +107,17 @@ func (w *SearchWorkerProbes) Check(source []byte, round int, remainingMillis int
 	if round < 0 || model.Decode(source, &request) != nil || probe.Validate(request) != nil {
 		return nil, errors.New("invalid_probe")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return nil, err
 	}
 	result := w.check.Check(ctx, w.proxy, request, round)
+	if err := w.contextError(ctx); err != nil {
+		return nil, err
+	}
 	if !searchCurrent(w.owner) {
 		return nil, errors.New("search_owner_lost")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return nil, err
 	}
 	return encodeProbeResult(result)
@@ -126,14 +135,17 @@ func (w *SearchWorkerProbes) UDP(source []byte, round int, remainingMillis int64
 	if round < 0 || model.Decode(source, &request) != nil || !validWorkerUDP(request) {
 		return nil, errors.New("invalid_udp_probe")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return nil, err
 	}
 	result := w.udp(ctx, w.proxy, request, round)
+	if err := w.contextError(ctx); err != nil {
+		return nil, err
+	}
 	if !searchCurrent(w.owner) {
 		return nil, errors.New("search_owner_lost")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return nil, err
 	}
 	return encodeProbeResult(result)
@@ -151,14 +163,17 @@ func (w *SearchWorkerProbes) Media(source []byte, round int, remainingMillis int
 	if round < 0 || model.Decode(source, &request) != nil || policy.Validate(request) != nil {
 		return nil, errors.New("invalid_media_policy")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return nil, err
 	}
 	result := w.media.Round(ctx, w.proxy, request, round)
+	if err := w.contextError(ctx); err != nil {
+		return nil, err
+	}
 	if !searchCurrent(w.owner) {
 		return nil, errors.New("search_owner_lost")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		return nil, err
 	}
 	return encodeProbeResult(result)
@@ -175,7 +190,7 @@ func (w *SearchWorkerProbes) deadline(millis int64) (context.Context, context.Ca
 	if millis < 0 || millis > math.MaxInt64/int64(time.Millisecond) {
 		return nil, nil, errors.New("invalid_deadline")
 	}
-	if err := w.ctx.Err(); err != nil {
+	if err := w.contextError(w.ctx); err != nil {
 		return nil, nil, err
 	}
 	if millis == 0 {
@@ -186,11 +201,25 @@ func (w *SearchWorkerProbes) deadline(millis int64) (context.Context, context.Ca
 		cancel()
 		return nil, nil, errors.New("search_owner_lost")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := w.contextError(ctx); err != nil {
 		cancel()
 		return nil, nil, err
 	}
 	return ctx, cancel, nil
+}
+
+func (w *SearchWorkerProbes) contextError(ctx context.Context) error {
+	owner := w.owner
+	if owner == nil || owner.search == nil {
+		return errors.New("search_owner_lost")
+	}
+	if activeProtection.Load() != owner {
+		owner.revokeSearch()
+	}
+	if owner.searchRevoked.Load() {
+		return errors.New("search_owner_lost")
+	}
+	return ctx.Err()
 }
 
 func validWorkerUDP(p model.UDPProbe) bool {

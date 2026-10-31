@@ -63,3 +63,48 @@ func TestAndroidSearchProbeDeadlineIncludesBlockedOwnerCheck(t *testing.T) {
 		t.Fatal("expired probe dispatched after owner check")
 	}
 }
+
+func TestAndroidSearchProbeRevokedOwnerIsNotOrdinaryCancellation(t *testing.T) {
+	owner := &blockedProbeOwner{entered: make(chan struct{}), release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	guard := &protection{search: owner, searchContext: ctx, searchCancel: cancel}
+	previous := activeProtection.Swap(guard)
+	defer activeProtection.Store(previous)
+	worker := &SearchWorkerProbes{ctx: ctx, cancel: cancel, owner: guard}
+	guard.revokeSearch()
+
+	for name, call := range map[string]func() error{
+		"authenticate": func() error { return worker.Authenticate(1000) },
+		"check":        func() error { _, err := worker.Check(nil, 0, 1000); return err },
+		"udp":          func() error { _, err := worker.UDP(nil, 0, 1000); return err },
+		"media":        func() error { _, err := worker.Media(nil, 0, 1000); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); err == nil || err.Error() != "search_owner_lost" {
+				t.Fatalf("revoked owner reported as %v", err)
+			}
+		})
+	}
+	if owner.calls.Load() != 0 {
+		t.Fatal("revoked owner callback was called")
+	}
+}
+
+func TestAndroidSearchProbeCancelRetainsCancellation(t *testing.T) {
+	owner := &blockedProbeOwner{entered: make(chan struct{}), release: make(chan struct{})}
+	ownerCtx, ownerCancel := context.WithCancel(context.Background())
+	defer ownerCancel()
+	guard := &protection{search: owner, searchContext: ownerCtx, searchCancel: ownerCancel}
+	previous := activeProtection.Swap(guard)
+	defer activeProtection.Store(previous)
+	ctx, cancel := context.WithCancel(ownerCtx)
+	worker := &SearchWorkerProbes{ctx: ctx, cancel: cancel, owner: guard}
+	worker.Cancel()
+	if _, err := worker.Check(nil, 0, 1000); !errors.Is(err, context.Canceled) {
+		t.Fatalf("explicit cancellation reported as %v", err)
+	}
+	if owner.calls.Load() != 0 {
+		t.Fatal("cancelled probe called owner")
+	}
+}
