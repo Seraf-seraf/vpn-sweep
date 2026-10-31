@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
+        android:name=".SweepApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="VPN Sweep"
@@ -34,5 +35,9 @@
             </intent-filter>
             <meta-data android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON" android:value="false" />
         </service>
+        <service
+            android:name=".searchworker.SearchWorkerService"
+            android:exported="false"
+            android:process=":search" />
     </application>
 </manifest>

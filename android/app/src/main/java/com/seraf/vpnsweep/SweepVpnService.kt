@@ -25,7 +25,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.seraf.vpnsweep.core.mobile.Mobile
 import com.seraf.vpnsweep.core.mobile.Protector
-import java.io.File
+import java.io.IOException
 
 class SweepVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -45,12 +45,14 @@ class SweepVpnService : VpnService() {
             return START_NOT_STICKY
         }
         val epoch = lifecycle.epoch()
-        if (intent?.action != START || epoch == null || prepare(this) != null) {
-            if (lifecycle.current()?.stop() != true) stopRejected(startId)
+        val integration = (application as? SweepApplication)?.integration
+        val token = intent?.getStringExtra(EXTRA_START_TOKEN)
+        if (intent?.action != START || epoch == null || integration == null) {
+            if (!lifecycle.hasActiveConnection()) stopRejected(startId)
             return START_NOT_STICKY
         }
         val diagnosticsSession = Any()
-        val run = DiagnosticsStatus.withDeferredDelivery {
+        val admission = integration.consumeVpnStart(token) {
             lifecycle.reserve(sessions, epoch,
                 deferDelivery = { DiagnosticsStatus.withDeferredDelivery(it) },
                 onReserved = { DiagnosticsStatus.reserve(diagnosticsSession) },
@@ -59,11 +61,13 @@ class SweepVpnService : VpnService() {
                 VpnStatus.update(VpnState(VpnPhase.STOPPING, "Отключение…"))
             }
         }
-        if (run == null) {
+        if (admission == null) {
+            integration.cancelVpnStart(token)
             if (!lifecycle.hasActiveConnection()) stopRejected(startId)
             return START_NOT_STICKY
         }
-        run.launch(scope, ConnectionOperations(diagnosticsSession)) {
+        val run = admission.run
+        run.launch(scope, ConnectionOperations(diagnosticsSession, integration, admission)) {
             startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
             run.publishIfActive { VpnStatus.update(VpnState(VpnPhase.CONNECTING, "Подключение…")) }
         }
@@ -98,10 +102,16 @@ class SweepVpnService : VpnService() {
         val dns: String,
         val source: ByteArray,
         val digest: String,
+        val admission: VpnStartAdmissionV1,
     )
 
-    private inner class ConnectionOperations(private val diagnosticsSession: Any) : VpnRunOperations<Preparation, ParcelFileDescriptor> {
+    private inner class ConnectionOperations(
+        private val diagnosticsSession: Any,
+        private val integration: AppComposition,
+        private val admission: VpnStartAdmissionV1,
+    ) : VpnRunOperations<Preparation, ParcelFileDescriptor> {
         override fun prepare(run: VpnRun): Preparation {
+            check(admission.isCurrent()) { "vpn_start_admission_stale" }
             val manager = getSystemService(ConnectivityManager::class.java)
             val network = manager.activeNetwork ?: error("network_unavailable")
             val capabilities = manager.getNetworkCapabilities(network)
@@ -111,13 +121,16 @@ class SweepVpnService : VpnService() {
             val dns = manager.getLinkProperties(network)?.dnsServers?.firstOrNull()
                 ?.hostAddress ?: error("network_dns_unavailable")
             run.checkActive()
-            val source = File(noBackupFilesDir, CONFIG_NAME).readBytes()
+            check(admission.isCurrent() && integration.isCurrentVpnIdentity(admission.identity)) {
+                "vpn_start_admission_stale"
+            }
+            val source = admission.source.copyOf()
             run.checkActive()
             val digest = Mobile.outboundDigest(source)
             run.checkActive()
             Mobile.validateConfig(source)
             run.checkActive()
-            return Preparation(manager, network, capabilities, dns, source, digest)
+            return Preparation(manager, network, capabilities, dns, source, digest, admission)
         }
 
         override fun setUnderlying(prepared: Preparation): Unit {
@@ -136,6 +149,9 @@ class SweepVpnService : VpnService() {
             .establish() ?: error("vpn_permission_revoked")
 
         override fun start(prepared: Preparation, tunnel: ParcelFileDescriptor): Unit {
+            check(prepared.admission.isCurrent() && integration.isCurrentVpnIdentity(prepared.admission.identity)) {
+                "vpn_start_admission_stale"
+            }
             Mobile.start(prepared.source, tunnel.fd.toLong(), prepared.dns, SocketProtector(prepared.network))
         }
 
@@ -170,7 +186,21 @@ class SweepVpnService : VpnService() {
                 dispatcher = Dispatchers.Main.immediate,
                 stopForeground = { stopForeground(STOP_FOREGROUND_REMOVE) },
                 stopSelf = { startId -> stopSelfResult(startId) },
-                complete = complete,
+                complete = { cleanupFailure ->
+                    if (cleanupFailure != null || !AppVpnRegistry.instance.available()) {
+                        admission.quarantine()
+                        complete(cleanupFailure ?: IOException("vpn_cleanup_unknown"))
+                    } else {
+                        try {
+                            admission.close()
+                            complete(null)
+                        } catch (failure: Throwable) {
+                            admission.quarantine()
+                            if (failure !is Exception) throw failure
+                            complete(failure)
+                        }
+                    }
+                },
             )
         }
 
@@ -232,7 +262,7 @@ class SweepVpnService : VpnService() {
         private val sessions = AppVpnRegistry.instance
         const val START = "com.seraf.vpnsweep.START"
         const val STOP = "com.seraf.vpnsweep.STOP"
-        const val CONFIG_NAME = "integration-result.json"
+        const val EXTRA_START_TOKEN = "com.seraf.vpnsweep.extra.START_TOKEN"
         private const val CHANNEL = "vpn"
         private const val NOTIFICATION_ID = 1
         private const val MTU_BYTES = 1500

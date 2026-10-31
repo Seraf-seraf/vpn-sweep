@@ -89,13 +89,13 @@ internal enum class SubscriptionDialogStatus {
 }
 
 @Composable
-internal fun SubscriptionDialogHost(onDismiss: () -> Unit): Unit {
+internal fun SubscriptionDialogHost(onDismiss: () -> Unit, onSubmit: (String) -> Boolean): Unit {
     var link by remember { mutableStateOf("") }
     val valid = remember(link) { isValidSubscriptionUrl(link) }
     val status = when {
         link.isBlank() -> SubscriptionDialogStatus.Empty
         !valid -> SubscriptionDialogStatus.InvalidUrl
-        else -> SubscriptionDialogStatus.Unavailable
+        else -> SubscriptionDialogStatus.Input
     }
 
     Dialog(
@@ -116,7 +116,10 @@ internal fun SubscriptionDialogHost(onDismiss: () -> Unit): Unit {
                 onLinkChange = { link = it },
                 onDismiss = onDismiss,
                 onSubmit = {
-                    // TODO: подключить загрузку подписки, когда интеграция будет доступна.
+                    if (onSubmit(link.trim())) {
+                        link = ""
+                        onDismiss()
+                    }
                 },
             )
         }

@@ -46,6 +46,11 @@ android {
         if (name == "screenshotTestQa") java.srcDir("src/qa/java")
     }
     packaging { jniLibs.useLegacyPackaging = false }
+    externalNativeBuild {
+        ndkBuild {
+            path = file("src/main/cpp/Android.mk")
+        }
+    }
     lint { abortOnError = true }
 }
 
