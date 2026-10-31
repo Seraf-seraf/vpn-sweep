@@ -1,5 +1,7 @@
 package com.seraf.vpnsweep.ui
 
+import com.seraf.vpnsweep.searchui.ScreenInformation
+
 import com.seraf.vpnsweep.VpnPhase
 import com.seraf.vpnsweep.VpnState
 import androidx.compose.foundation.Canvas
@@ -87,8 +89,15 @@ internal fun VpnSweepScreenContent(
     onServers: () -> Unit,
     permissionMessage: String = "",
     contentWindowInsets: WindowInsets = WindowInsets.safeDrawing,
+    sourceEnabled: Boolean = true,
+    searchEnabled: Boolean = false,
+    searchRunning: Boolean = false,
+    searchMessage: String = "Подбор настроек пока недоступен",
+    onSearch: () -> Unit = {},
+    information: ScreenInformation = ScreenInformation(),
 ) {
-    val powerEnabled = selected && !importing && state.phase != VpnPhase.STOPPING
+    val powerEnabled = !importing && state.phase != VpnPhase.STOPPING &&
+        (selected || state.phase == VpnPhase.CONNECTING || state.phase == VpnPhase.RUNNING)
     val powerAction = when (state.phase) {
         VpnPhase.CONNECTING -> "Отменить подключение VPN"
         VpnPhase.RUNNING -> "Отключить VPN"
@@ -97,10 +106,10 @@ internal fun VpnSweepScreenContent(
     }
     val powerHint = when {
         importing -> "Дождитесь окончания чтения файла"
-        !selected -> "Конфигурация VPN пока недоступна"
         state.phase == VpnPhase.STOPPING -> "Дождитесь отключения VPN"
         state.phase == VpnPhase.CONNECTING -> "Нажмите, чтобы отменить подключение"
         state.phase == VpnPhase.RUNNING -> "Нажмите, чтобы отключить VPN"
+        !selected -> "Конфигурация VPN пока недоступна"
         else -> "Нажмите, чтобы подключить VPN"
     }
 
@@ -161,20 +170,25 @@ internal fun VpnSweepScreenContent(
                 onClick = onSubscription,
                 icon = SweepIcon.Link,
                 filled = true,
+                enabled = sourceEnabled,
             )
             Spacer(Modifier.height(8.dp))
-            ServerButton(onClick = onServers)
+            ServerButton(onClick = onServers, enabled = sourceEnabled)
             Spacer(Modifier.height(8.dp))
-            SweepButton(text = "Подобрать настройки", onClick = {}, enabled = false)
+            SweepButton(
+                text = if (searchRunning) "Отменить подбор" else "Подобрать настройки",
+                onClick = onSearch,
+                enabled = searchEnabled,
+            )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "Подбор настроек пока недоступен",
+                text = searchMessage,
                 modifier = Modifier.fillMaxWidth(),
                 color = SecondaryText,
                 fontSize = 14.sp,
             )
             Spacer(Modifier.height(16.dp))
-            InformationPanel()
+            InformationPanel(information = information)
         }
     }
 }
@@ -275,7 +289,7 @@ private fun SweepButton(
 }
 
 @Composable
-private fun ServerButton(onClick: () -> Unit) {
+private fun ServerButton(onClick: () -> Unit, enabled: Boolean = true) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -283,7 +297,7 @@ private fun ServerButton(onClick: () -> Unit) {
             .clip(ControlShape)
             .border(1.dp, Outline, ControlShape)
             .background(PanelBackground, ControlShape)
-            .clickable(role = Role.Button, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .heightIn(min = 64.dp)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -297,8 +311,9 @@ private fun ServerButton(onClick: () -> Unit) {
 }
 
 @Composable
-internal fun InformationPanel(initialTab: Int = 0) {
+internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformation = ScreenInformation()) {
     var selectedTab by rememberSaveable { mutableStateOf(initialTab) }
+    val presentation = presentInformation(information)
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -318,16 +333,13 @@ internal fun InformationPanel(initialTab: Int = 0) {
                 .padding(16.dp),
         ) {
             if (selectedTab == 0) {
-                // TODO: connect actual event entries when the runtime exposes them.
-                EventLogPanel(emptyList())
+                EventLogPanel(presentation.events)
             } else {
-                ParametersPanel()
+                ParametersPanel(applied = presentation.applied)
             }
         }
     }
 }
-
-internal data class EventLogEntry(val time: String, val level: String, val message: String)
 
 @Composable
 internal fun EventLogPanel(entries: List<EventLogEntry>) {
@@ -372,15 +384,6 @@ private fun InformationTab(text: String, selected: Boolean, onClick: () -> Unit,
     }
 }
 
-internal data class ParameterValue(val label: String, val value: String)
-internal data class ParameterGroupValues(val summary: String, val fields: List<ParameterValue>)
-internal data class AppliedParameterValues(
-    val fragment: ParameterGroupValues? = null,
-    val mux: ParameterGroupValues? = null,
-    val fingerprint: ParameterGroupValues? = null,
-    val udpNoise: ParameterGroupValues? = null,
-)
-
 @Composable
 internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: AppliedParameterValues? = null) {
     Text("Параметры подбора", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
@@ -389,7 +392,6 @@ internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: 
         Text("Применённые параметры пока недоступны", color = SecondaryText, fontSize = 14.sp)
         Spacer(Modifier.height(12.dp))
     }
-    // TODO: Подключить отображение применённых параметров, когда они появятся в runtime-состоянии.
     ParameterGroup("Fragment", SweepIcon.Fragment, listOf("Фрагментация", "Пакеты", "Длина", "Интервал", "Макс. частей"), initialFragmentExpanded, applied?.fragment)
     Spacer(Modifier.height(8.dp))
     ParameterGroup("Mux", SweepIcon.Mux, listOf("Mux", "TCP concurrency", "XUDP concurrency", "UDP 443"), values = applied?.mux)
