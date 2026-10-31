@@ -65,8 +65,13 @@ func (e Endpoint) udpExchange(ctx context.Context, address string, payload []byt
 		return nil, model.Err("udp_relay_not_loopback", "udp")
 	}
 	relay := &net.UDPAddr{IP: ip, Port: int(binary.BigEndian.Uint16(b))}
-	c, err := net.DialUDP("udp", nil, relay)
-	if err != nil {
+	var c UDPConn
+	if e.SocketDialer == nil {
+		c, err = net.DialUDP("udp", nil, relay)
+	} else {
+		c, err = e.SocketDialer.DialUDP(ctx, relay)
+	}
+	if err != nil || c == nil {
 		return nil, model.Err("udp_socket_failed", "udp")
 	}
 	defer c.Close()

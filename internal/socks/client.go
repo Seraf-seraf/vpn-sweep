@@ -11,9 +11,26 @@ import (
 )
 
 type Endpoint struct {
-	Address string
-	User    string
-	Pass    string
+	Address      string
+	User         string
+	Pass         string
+	SocketDialer SocketDialer
+}
+
+// SocketDialer owns both SOCKS connection paths when supplied by a caller.
+// A nil SocketDialer preserves the existing CLI network behavior.
+type SocketDialer interface {
+	DialTCP(context.Context, string) (net.Conn, error)
+	DialUDP(context.Context, *net.UDPAddr) (UDPConn, error)
+}
+
+// UDPConn retains the datagram truncation information needed by UDPExchange.
+type UDPConn interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	SetDeadline(time.Time) error
+	ReadMsgUDP([]byte, []byte) (int, int, int, *net.UDPAddr, error)
 }
 
 func (e Endpoint) Negotiate(ctx context.Context) (net.Conn, error) {
@@ -21,8 +38,13 @@ func (e Endpoint) Negotiate(ctx context.Context) (net.Conn, error) {
 	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || len(e.User) < 1 || len(e.User) > 255 || len(e.Pass) < 1 || len(e.Pass) > 255 {
 		return nil, model.Err("invalid_proxy_handle", "socks")
 	}
-	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", e.Address)
-	if err != nil {
+	var c net.Conn
+	if e.SocketDialer == nil {
+		c, err = (&net.Dialer{}).DialContext(ctx, "tcp", e.Address)
+	} else {
+		c, err = e.SocketDialer.DialTCP(ctx, e.Address)
+	}
+	if err != nil || c == nil {
 		return nil, model.Err("proxy_unavailable", "socks")
 	}
 	deadline := time.Now().Add(15 * time.Second)
