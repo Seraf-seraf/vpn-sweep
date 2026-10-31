@@ -140,6 +140,17 @@ internal class SearchEngineWorkerAdapterTest {
     }
 
     @Test
+    fun frameReportsExactLengthAndDeadlineBeforeItsSingleRead(): Unit {
+        val header = java.nio.ByteBuffer.allocate(16).putLong(7_500L).putInt(3).putInt(5).array()
+        val input = FrameInput(header, byteArrayOf(1, 2, 3), byteArrayOf(4, 5, 6, 7, 8))
+        assertEquals(24L, input.length)
+        assertEquals(7_500L, input.deadlineElapsedMillis)
+        assertEquals(24, input.open().use { it.readBytes().size })
+        try { input.open(); fail("frame opened twice") } catch (_: IOException) { }
+        input.close()
+    }
+
+    @Test
     fun oversizedOrUnclosedReplyQuarantinesAndPreventsNextOpen(): Unit {
         for ((reply, expected) in listOf(Reply(ByteArray(33)) to Mobile.SearchWorkerUnavailable,
             Reply(byteArrayOf(1), failClose = true) to Mobile.SearchWorkerCleanupIncomplete)) {

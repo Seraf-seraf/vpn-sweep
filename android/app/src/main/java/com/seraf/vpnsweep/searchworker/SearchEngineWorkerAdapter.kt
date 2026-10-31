@@ -747,11 +747,17 @@ private fun readReply(input: PrivateInputV1, bound: Int): ReplyRead {
 private fun fault(code: Long): ByteArray = "{\"fault\":$code}".toByteArray(Charsets.UTF_8)
 private fun resultEnvelope(result: ByteArray): ByteArray = "{\"fault\":0,\"result\":".toByteArray(Charsets.UTF_8) + result + byteArrayOf('}'.code.toByte())
 
-private class FrameInput(vararg chunks: ByteArray) : PrivateInputV1 {
+internal class FrameInput(vararg chunks: ByteArray) : PrivateInputV1 {
     private val lock = Any()
     private var parts: Array<out ByteArray>? = chunks
     private var stream: InputStream? = null
     private var opened = false
+    val length: Long = chunks.sumOf { it.size.toLong() }
+    val deadlineElapsedMillis: Long = if ((chunks.firstOrNull()?.size ?: 0) >= java.lang.Long.BYTES) {
+        java.nio.ByteBuffer.wrap(chunks[0]).long
+    } else {
+        0
+    }
 
     override fun open(): InputStream = synchronized(lock) {
         val bytes = parts ?: throw IOException("worker_input_closed")
