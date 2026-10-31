@@ -57,19 +57,28 @@ func newSearchWorkerProbes(address, user, password string) (*SearchWorkerProbes,
 }
 
 func (w *SearchWorkerProbes) Authenticate(remainingMillis int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	ctx, cancel, err := w.deadline(remainingMillis)
 	if err != nil {
 		return err
 	}
 	defer cancel()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	conn, err := w.proxy.Negotiate(ctx)
 	if !searchCurrent(w.owner) {
 		if conn != nil {
 			_ = conn.Close()
 		}
 		return errors.New("search_owner_lost")
+	}
+	if ctx.Err() != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return ctx.Err()
 	}
 	if err != nil {
 		return errors.New("search_proxy_not_ready")
@@ -81,58 +90,76 @@ func (w *SearchWorkerProbes) Authenticate(remainingMillis int64) error {
 }
 
 func (w *SearchWorkerProbes) Check(source []byte, round int, remainingMillis int64) ([]byte, error) {
+	ctx, cancel, err := w.deadline(remainingMillis)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var request model.Probe
 	if round < 0 || model.Decode(source, &request) != nil || probe.Validate(request) != nil {
 		return nil, errors.New("invalid_probe")
 	}
-	ctx, cancel, err := w.deadline(remainingMillis)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer cancel()
 	result := w.check.Check(ctx, w.proxy, request, round)
 	if !searchCurrent(w.owner) {
 		return nil, errors.New("search_owner_lost")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return encodeProbeResult(result)
 }
 
 func (w *SearchWorkerProbes) UDP(source []byte, round int, remainingMillis int64) ([]byte, error) {
+	ctx, cancel, err := w.deadline(remainingMillis)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var request model.UDPProbe
 	if round < 0 || model.Decode(source, &request) != nil || !validWorkerUDP(request) {
 		return nil, errors.New("invalid_udp_probe")
 	}
-	ctx, cancel, err := w.deadline(remainingMillis)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer cancel()
 	result := w.udp(ctx, w.proxy, request, round)
 	if !searchCurrent(w.owner) {
 		return nil, errors.New("search_owner_lost")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return encodeProbeResult(result)
 }
 
 func (w *SearchWorkerProbes) Media(source []byte, round int, remainingMillis int64) ([]byte, error) {
+	ctx, cancel, err := w.deadline(remainingMillis)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var request model.Policy
 	if round < 0 || model.Decode(source, &request) != nil || policy.Validate(request) != nil {
 		return nil, errors.New("invalid_media_policy")
 	}
-	ctx, cancel, err := w.deadline(remainingMillis)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer cancel()
 	result := w.media.Round(ctx, w.proxy, request, round)
 	if !searchCurrent(w.owner) {
 		return nil, errors.New("search_owner_lost")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return encodeProbeResult(result)
 }
@@ -145,9 +172,6 @@ func (w *SearchWorkerProbes) WaitStopped() bool {
 }
 
 func (w *SearchWorkerProbes) deadline(millis int64) (context.Context, context.CancelFunc, error) {
-	if !searchCurrent(w.owner) {
-		return nil, nil, errors.New("search_owner_lost")
-	}
 	if millis < 0 || millis > math.MaxInt64/int64(time.Millisecond) {
 		return nil, nil, errors.New("invalid_deadline")
 	}
@@ -158,6 +182,14 @@ func (w *SearchWorkerProbes) deadline(millis int64) (context.Context, context.Ca
 		return nil, nil, context.DeadlineExceeded
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, time.Duration(millis)*time.Millisecond)
+	if !searchCurrent(w.owner) {
+		cancel()
+		return nil, nil, errors.New("search_owner_lost")
+	}
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, nil, err
+	}
 	return ctx, cancel, nil
 }
 
