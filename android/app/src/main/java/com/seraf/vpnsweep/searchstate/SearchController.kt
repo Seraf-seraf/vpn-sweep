@@ -11,6 +11,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchResultOfferV3
 import com.seraf.vpnsweep.searchprotocol.SearchResultReceiptV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV4
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
@@ -45,6 +46,8 @@ internal class SearchController(
 ) {
     private enum class Control { PAUSE, CANCEL }
 
+    private class Finalization(val terminal: SearchTerminalV3)
+
     private class Session(val generation: Long, val token: PublicationToken) {
         var phase = 1L
         var lastPhase = 1L
@@ -58,6 +61,7 @@ internal class SearchController(
         var committed = false
         var unknown = false
         var terminal: SearchTerminalV3? = null
+        var finalization: Finalization? = null
         lateinit var observer: SearchSessionObserverV3
     }
 
@@ -81,6 +85,7 @@ internal class SearchController(
     @Synchronized
     fun reserveStart(sourceRevision: Long, selectionRevision: Long, profiles: PrivateInputV1, vpnDisconnected: Boolean): SearchStartPreparation {
         if (!vpnDisconnected || active != null || admissionBlocked) return SearchStartPreparation.Denied(SearchStartV3.BUSY)
+        if (port !is SearchSessionPortV4) return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
         val token = store.begin(ResultRevision(sourceRevision.toString(), selectionRevision.toString()))
             ?: return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
         admissionBlocked = true
@@ -120,7 +125,7 @@ internal class SearchController(
     fun pause(): Unit {
         val command = synchronized(this) {
             val session = active ?: return
-            if (mutableState.value.phase != SearchPhase.RUNNING || session.unknown) return
+            if (mutableState.value.phase != SearchPhase.RUNNING || session.unknown || session.terminal != null) return
             mutableState.value = mutableState.value.copy(phase = SearchPhase.PAUSING)
             if (session.dispatching) {
                 session.pendingControl = Control.PAUSE
@@ -133,7 +138,7 @@ internal class SearchController(
     fun resume(): SearchStartV3 {
         val prepared = synchronized(this) {
             val session = active ?: return SearchStartV3.REJECTED
-            if (mutableState.value.phase != SearchPhase.PAUSED || session.dispatching || session.unknown) return SearchStartV3.REJECTED
+            if (mutableState.value.phase != SearchPhase.PAUSED || session.dispatching || session.unknown || session.terminal != null) return SearchStartV3.REJECTED
             val previous = session.phase
             session.phase = ++session.lastPhase
             session.phasePaused = false
@@ -154,7 +159,7 @@ internal class SearchController(
     fun cancel(): Unit {
         val command = synchronized(this) {
             val session = active ?: return
-            if (session.unknown || !store.cancel(session.token)) return
+            if (session.unknown || session.terminal != null || !store.cancel(session.token)) return
             mutableState.value = mutableState.value.copy(phase = SearchPhase.CANCELLING)
             if (session.dispatching) {
                 session.pendingControl = Control.CANCEL
@@ -176,6 +181,7 @@ internal class SearchController(
     }
 
     private fun finishDispatch(session: Session, phase: Long, previousPhase: Long?, outcome: SearchStartV3): SearchStartV3 {
+        var finalization: Finalization? = null
         val command = synchronized(this) {
             if (active !== session || session.phase != phase) return outcome
             session.dispatching = false
@@ -200,12 +206,13 @@ internal class SearchController(
                     null
                 }
             } else if (session.terminal != null) {
-                finishTerminal(session)
+                finalization = reserveFinalization(session)
                 null
             } else if (!session.unknown && session.pendingControl != null) {
                 Triple(session, phase, session.pendingControl!!).also { session.pendingControl = null }
             } else null
         }
+        finalization?.let { completeFinalization(session, it) }
         if (command != null) sendControl(command.first, command.second, command.third)
         return outcome
     }
@@ -308,6 +315,7 @@ internal class SearchController(
     }
 
     private fun terminal(session: Session, terminal: SearchTerminalV3): Unit {
+        var finalization: Finalization? = null
         synchronized(this) {
             if (active !== session || terminal.sessionGeneration != session.generation || terminal.phaseEpoch != session.phase || session.terminal != null || session.unknown) return
             if (session.dispatching) session.callbackDuringDispatch = true
@@ -326,40 +334,65 @@ internal class SearchController(
             }
             session.terminal = terminal
             if (session.resultInFlight || pendingDeliveries != 0) interrupt(session)
-            if (!session.dispatching) finishTerminal(session)
+            if (!session.dispatching) finalization = reserveFinalization(session)
         }
+        finalization?.let { completeFinalization(session, it) }
     }
 
-    private fun finishTerminal(session: Session): Unit {
-        val terminal = session.terminal ?: return
+    private fun reserveFinalization(session: Session): Finalization? {
+        val terminal = session.terminal ?: return null
+        if (session.finalization != null) return null
         val fence = when (terminal) {
             is SearchTerminalV3.Complete -> terminal.resultFence
             is SearchTerminalV3.Cancelled -> terminal.resultFence
             is SearchTerminalV3.Stopped -> terminal.resultFence
-            is SearchTerminalV3.Paused -> return
+            is SearchTerminalV3.Paused -> return null
         }
         if (session.unknown || session.resultInFlight || pendingDeliveries != 0 || pendingResultClose.isNotEmpty() ||
             fence != SearchResultFenceV3.CONFIRMED || terminal.resources != SearchResourceStateV2.RELEASED ||
             (terminal is SearchTerminalV3.Complete && !session.committed)) {
             interrupt(session, terminal.resources == SearchResourceStateV2.QUARANTINED)
-            return
+            return null
         }
-        if (!session.committed) store.cancel(session.token)
-        if (!marker.markClear()) {
-            interrupt(session)
-            return
+        return Finalization(terminal).also { session.finalization = it }
+    }
+
+    private fun completeFinalization(session: Session, finalization: Finalization): Unit {
+        val accepted = try {
+            (port as? SearchSessionPortV4)?.acceptTerminal(finalization.terminal) == true
+        } catch (_: Exception) {
+            false
+        } catch (_: LinkageError) {
+            false
         }
-        active = null
-        admissionBlocked = false
-        mutableState.value = SearchUiState(
-            phase = when {
-                session.committed -> SearchPhase.COMPLETE
-                terminal is SearchTerminalV3.Cancelled -> SearchPhase.CANCELLED
-                else -> SearchPhase.FAILED
-            },
-            failure = (terminal as? SearchTerminalV3.Stopped)?.reason,
-            resultCommitted = session.committed,
-        )
+        synchronized(this) {
+            if (active !== session || session.finalization !== finalization) return
+            val terminal = finalization.terminal
+            if (!accepted || session.unknown || session.terminal !== terminal ||
+                session.phase != terminal.phaseEpoch || session.resultInFlight || pendingDeliveries != 0 ||
+                pendingResultClose.isNotEmpty() || (terminal is SearchTerminalV3.Complete && !session.committed)
+            ) {
+                interrupt(session)
+                return
+            }
+            if (!session.committed) store.cancel(session.token)
+            val cleared = try { marker.markClear() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+            if (!cleared) {
+                interrupt(session)
+                return
+            }
+            active = null
+            admissionBlocked = false
+            mutableState.value = SearchUiState(
+                phase = when {
+                    session.committed -> SearchPhase.COMPLETE
+                    terminal is SearchTerminalV3.Cancelled -> SearchPhase.CANCELLED
+                    else -> SearchPhase.FAILED
+                },
+                failure = (terminal as? SearchTerminalV3.Stopped)?.reason,
+                resultCommitted = session.committed,
+            )
+        }
     }
 
     private fun interruptCurrentOr(session: Session): Unit {

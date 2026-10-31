@@ -98,7 +98,8 @@ class SearchResultSizeTest {
         override fun markClear(): Boolean { state = MarkerState.CLEAR; return true }
     }
 
-    private class Port : SearchSessionPortV3 {
+    private class Port : SearchSessionPortV4 {
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         lateinit var observer: SearchSessionObserverV3
         var generation = 0L
         var phase = 0L

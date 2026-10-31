@@ -9,6 +9,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchResultOfferV3
 import com.seraf.vpnsweep.searchprotocol.SearchResultReceiptV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV4
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
@@ -168,6 +169,48 @@ class ResultActivationTest {
         assertEquals(SearchStartV3.BUSY, denied(f.activation.reserveSearch(1, 2, Input())))
         f.marker.failRead = false
         assertTrue(f.activation.ready())
+    }
+
+    @Test
+    fun uncertainClearRecoversOnlyAfterVerifiedMarkerRevisionAndHash(): Unit {
+        for (failureAfterWrite in listOf(false, true)) {
+            val f = Fixture()
+            f.publish(previous)
+            f.startSearch()
+            f.marker.failClear = !failureAfterWrite
+            f.marker.failClearAfterWrite = failureAfterWrite
+            f.port.stopped(SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED)
+
+            assertEquals(SearchPhase.INTERRUPTED, f.controller.state.value.phase)
+            assertFalse(f.activation.ready())
+            assertEquals(if (failureAfterWrite) MarkerState.CLEAR else MarkerState.ACTIVE, f.marker.value)
+
+            f.marker.readUnknown = true
+            val unknownController = SearchController(Port(), ResultStore(f.storage), f.marker)
+            assertEquals(SearchPhase.INTERRUPTED, unknownController.state.value.phase)
+
+            f.marker.readUnknown = false
+            val recoveryPort = Port()
+            val recoveredStore = ResultStore(f.storage)
+            val recoveredController = SearchController(recoveryPort, recoveredStore, f.marker)
+            val recovered = ResultActivation(recoveredController, recoveredStore, f.storage, f.revisions, f.marker) { true }
+            if (!failureAfterWrite) {
+                assertEquals(SearchPhase.INTERRUPTED, recoveredController.state.value.phase)
+                assertFalse(recovered.ready())
+                continue
+            }
+
+            assertEquals(SearchPhase.IDLE, recoveredController.state.value.phase)
+            assertEquals(0, recoveryPort.starts)
+            assertTrue(recovered.ready())
+            f.revisionStorage.value = ResultRevision("3", "2")
+            assertFalse(recovered.ready())
+            f.revisionStorage.value = current
+            val manifest = f.storage.manifest!!
+            val saved = f.storage.generations[manifest.generation]!!
+            f.storage.generations[manifest.generation] = saved.copy(bytes = "tampered".toByteArray())
+            assertFalse(recovered.ready())
+        }
     }
 
     @Test
@@ -571,16 +614,19 @@ class ResultActivationTest {
     private class Marker : SessionMarker {
         var value = MarkerState.CLEAR
         var failRead = false
+        var readUnknown = false
         var failClear = false
+        var failClearAfterWrite = false
         override fun read(): MarkerState {
             if (failRead) throw IOException("synthetic")
+            if (readUnknown) return MarkerState.UNKNOWN
             return value
         }
         override fun markActive(): Boolean { value = MarkerState.ACTIVE; return true }
         override fun markClear(): Boolean {
             if (failClear) return false
             value = MarkerState.CLEAR
-            return true
+            return !failClearAfterWrite
         }
     }
 
@@ -655,7 +701,8 @@ class ResultActivationTest {
         }
     }
 
-    private class Port : SearchSessionPortV3 {
+    private class Port : SearchSessionPortV4 {
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         var starts = 0
         var observer: SearchSessionObserverV3? = null
         var generation = 0L

@@ -319,7 +319,8 @@ class SearchControllerTest {
         override fun close(): Unit { closed = true }
     }
 
-    private class FakeSession : SearchSessionPortV3 {
+    private class FakeSession : SearchSessionPortV4 {
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         var observer: SearchSessionObserverV3? = null
         var phase = 1L
         var onStart: () -> Unit = {}

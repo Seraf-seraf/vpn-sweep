@@ -13,6 +13,109 @@ import org.junit.Test
 
 class SearchFenceV3Test {
     @Test
+    fun oldPortIsRejectedBeforeMarkerOrProfileTransfer(): Unit {
+        val marker = Marker()
+        var starts = 0
+        val legacy = object : SearchSessionPortV3 {
+            override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
+                starts++
+                return SearchStartV3.ACCEPTED
+            }
+            override fun pause(sessionGeneration: Long, phaseEpoch: Long): Unit = Unit
+            override fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3 = SearchStartV3.REJECTED
+            override fun cancel(sessionGeneration: Long, phaseEpoch: Long): Unit = Unit
+        }
+        val input = Input()
+        val controller = SearchController(legacy, ResultStore(Storage()), marker)
+
+        assertEquals(SearchStartV3.REJECTED, controller.start(1, 2, input, true))
+        assertEquals(MarkerState.CLEAR, marker.value)
+        assertEquals(0, marker.activeWrites)
+        assertEquals(0, starts)
+        assertFalse(input.closed)
+        assertEquals(0, input.opens)
+    }
+
+    @Test
+    fun refusedTerminalAcceptanceKeepsMarkerActive(): Unit {
+        val marker = Marker()
+        val port = Port().apply { acceptTerminalResult = false }
+        val controller = SearchController(port, ResultStore(Storage()), marker)
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input(), true))
+
+        port.observer!!.onTerminal(
+            SearchTerminalV3.Stopped(1, 1, SearchFailureV1.INTERRUPTED, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED),
+        )
+
+        assertEquals(MarkerState.ACTIVE, marker.value)
+        assertEquals(SearchPhase.INTERRUPTED, controller.state.value.phase)
+        assertEquals(1, port.acceptTerminalCalls)
+    }
+
+    @Test
+    fun finalizationWaitsOutsideControllerLockAndIgnoresDuplicateAndCancel(): Unit {
+        val marker = Marker()
+        val port = Port()
+        val controller = SearchController(port, ResultStore(Storage()), marker)
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input(), true))
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val terminal = SearchTerminalV3.Stopped(1, 1, SearchFailureV1.EXHAUSTED, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED)
+        port.onAcceptTerminal = {
+            assertSame(terminal, it)
+            assertFalse(Thread.holdsLock(controller))
+            entered.countDown()
+            check(release.await(10, TimeUnit.SECONDS))
+        }
+        val worker = thread { port.observer!!.onTerminal(terminal) }
+        assertTrue(entered.await(10, TimeUnit.SECONDS))
+        port.observer!!.onTerminal(terminal)
+        controller.cancel()
+        assertEquals(1, port.acceptTerminalCalls)
+        assertTrue(port.cancellations.isEmpty())
+        assertEquals(MarkerState.ACTIVE, marker.value)
+        release.countDown()
+        worker.join(10_000)
+        assertFalse(worker.isAlive)
+        assertEquals(MarkerState.CLEAR, marker.value)
+        assertEquals(SearchPhase.FAILED, controller.state.value.phase)
+    }
+
+    @Test
+    fun lateCloseFailureDuringAcceptanceCannotClearMarker(): Unit {
+        val marker = Marker()
+        val port = Port()
+        val controller = SearchController(port, ResultStore(Storage()), marker)
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input(), true))
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        port.onAcceptTerminal = { entered.countDown(); check(release.await(10, TimeUnit.SECONDS)) }
+        val terminal = SearchTerminalV3.Stopped(1, 1, SearchFailureV1.EXHAUSTED, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED)
+        val worker = thread { port.observer!!.onTerminal(terminal) }
+        assertTrue(entered.await(10, TimeUnit.SECONDS))
+        assertEquals(SearchResultReceiptV3.UNKNOWN, port.offer(Input(failInputClose = true)))
+        release.countDown()
+        worker.join(10_000)
+        assertFalse(worker.isAlive)
+        assertEquals(SearchPhase.INTERRUPTED, controller.state.value.phase)
+        assertEquals(MarkerState.ACTIVE, marker.value)
+    }
+
+    @Test
+    fun terminalAcceptanceExceptionKeepsMarkerActive(): Unit {
+        val marker = Marker()
+        val port = Port()
+        val controller = SearchController(port, ResultStore(Storage()), marker)
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input(), true))
+        port.onAcceptTerminal = { throw IllegalStateException("synthetic") }
+        port.observer!!.onTerminal(
+            SearchTerminalV3.Stopped(1, 1, SearchFailureV1.EXHAUSTED, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED),
+        )
+        assertEquals(SearchPhase.INTERRUPTED, controller.state.value.phase)
+        assertEquals(MarkerState.ACTIVE, marker.value)
+    }
+
+    @Test
     fun committedReceiptDoesNotClearUntilConfirmedFence(): Unit {
         val marker = Marker()
         val port = Port()
@@ -180,15 +283,23 @@ class SearchFenceV3Test {
         val marker = Marker()
         val port = Port()
         val controller = SearchController(port, ResultStore(Storage()), marker)
+        var startCallbackFinished = false
+        port.onAcceptTerminal = {
+            assertTrue(startCallbackFinished)
+            assertFalse(Thread.holdsLock(controller))
+        }
         port.onStart = {
             assertEquals(MarkerState.ACTIVE, marker.value)
             assertEquals(SearchResultReceiptV3.COMMITTED_CLOSED, port.offer(Input()))
             port.terminal(SearchResultFenceV3.CONFIRMED)
             assertEquals(MarkerState.ACTIVE, marker.value)
+            assertEquals(0, port.acceptTerminalCalls)
+            startCallbackFinished = true
         }
         assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input(), true))
         assertEquals(SearchPhase.COMPLETE, controller.state.value.phase)
         assertEquals(MarkerState.CLEAR, marker.value)
+        assertEquals(1, port.acceptTerminalCalls)
     }
 
     @Test
@@ -321,7 +432,15 @@ class SearchFenceV3Test {
         }
     }
 
-    private class Port : SearchSessionPortV3 {
+    private class Port : SearchSessionPortV4 {
+        var acceptTerminalResult = true
+        var acceptTerminalCalls = 0
+        var onAcceptTerminal: (SearchTerminalV3) -> Unit = {}
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean {
+            acceptTerminalCalls++
+            onAcceptTerminal(terminal)
+            return acceptTerminalResult
+        }
         var observer: SearchSessionObserverV3? = null
         var phase = 1L
         var onStart: (SearchSessionObserverV3) -> Unit = {}

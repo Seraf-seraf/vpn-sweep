@@ -1,6 +1,7 @@
 package com.seraf.vpnsweep.searchprotocol
 
 internal const val SEARCH_SESSION_PROTOCOL_VERSION_V3: Int = 3
+internal const val SEARCH_SESSION_PROTOCOL_VERSION_V4: Int = 4
 
 internal enum class SearchStartV3 { ACCEPTED, BUSY, REJECTED, UNKNOWN }
 
@@ -74,4 +75,9 @@ internal interface SearchSessionPortV3 {
     fun pause(sessionGeneration: Long, phaseEpoch: Long): Unit
     fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3
     fun cancel(sessionGeneration: Long, phaseEpoch: Long): Unit
+}
+
+// This same-process handoff accepts one exact final terminal before marker CLEAR.
+internal interface SearchSessionPortV4 : SearchSessionPortV3 {
+    fun acceptTerminal(terminal: SearchTerminalV3): Boolean
 }

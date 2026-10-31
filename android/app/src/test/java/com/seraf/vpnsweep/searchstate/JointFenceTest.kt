@@ -104,7 +104,8 @@ class JointFenceTest {
         assertEquals(MarkerState.CLEAR, marker.value)
     }
 
-    private class Port : SearchSessionPortV3 {
+    private class Port : SearchSessionPortV4 {
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         lateinit var fence: ResultHandoffFence
         lateinit var observer: SearchSessionObserverV3
         private var generation = 0L

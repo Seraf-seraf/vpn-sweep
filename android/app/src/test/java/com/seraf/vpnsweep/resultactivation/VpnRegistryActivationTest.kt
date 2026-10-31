@@ -5,6 +5,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
 import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV4
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
@@ -255,7 +256,8 @@ class VpnRegistryActivationTest {
         override fun close(): Unit { closed = true }
     }
 
-    private class Port : SearchSessionPortV3 {
+    private class Port : SearchSessionPortV4 {
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         var starts = 0
         private lateinit var observer: SearchSessionObserverV3
         private var generation = 0L

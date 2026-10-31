@@ -7,6 +7,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchResultOfferV3
 import com.seraf.vpnsweep.searchprotocol.SearchResultReceiptV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV4
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
@@ -500,7 +501,8 @@ class ResultActivationCompositionTest {
         override fun close(): Unit { closes++ }
     }
 
-    private class Port : SearchSessionPortV3 {
+    private class Port : SearchSessionPortV4 {
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         private var observer: SearchSessionObserverV3? = null
         private var generation = 0L
         private var phase = 0L
