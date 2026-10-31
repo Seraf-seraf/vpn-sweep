@@ -252,7 +252,7 @@ func (r *androidSearchRound) Check(ctx context.Context, p model.Probe, round int
 	if reply.Fault == nil {
 		return model.ProbeResult{}, searchbridge.ErrWorkerUnavailable
 	}
-	if err := searchWorkerError(*reply.Fault); err != nil {
+	if err := searchWorkerCallError(*reply.Fault, ctx); err != nil {
 		return model.ProbeResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -275,7 +275,7 @@ func (r *androidSearchRound) UDP(ctx context.Context, p model.UDPProbe, round in
 	if reply.Fault == nil {
 		return model.ProbeResult{}, searchbridge.ErrWorkerUnavailable
 	}
-	if err := searchWorkerError(*reply.Fault); err != nil {
+	if err := searchWorkerCallError(*reply.Fault, ctx); err != nil {
 		return model.ProbeResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -298,7 +298,7 @@ func (r *androidSearchRound) Media(ctx context.Context, p model.Policy, round in
 	if reply.Fault == nil {
 		return nil, searchbridge.ErrWorkerUnavailable
 	}
-	if err := searchWorkerError(*reply.Fault); err != nil {
+	if err := searchWorkerCallError(*reply.Fault, ctx); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -337,6 +337,16 @@ func (r *androidSearchRound) Failure() error {
 }
 func (r *androidSearchRound) Close() error {
 	return searchWorkerError(r.callback.Close(r.generation, r.cleanupMillis))
+}
+
+func searchWorkerCallError(code int, ctx context.Context) error {
+	if code == SearchWorkerCancelled || code == SearchWorkerDeadline {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return searchbridge.ErrWorkerUnavailable
+	}
+	return searchWorkerError(code)
 }
 
 func searchWorkerError(code int) error {
