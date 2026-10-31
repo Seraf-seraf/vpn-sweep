@@ -2,6 +2,7 @@ package com.seraf.vpnsweep.resultactivation
 
 import com.seraf.vpnsweep.importer.MAX_CONFIG_BYTES
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
+import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
 import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
 import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
 import com.seraf.vpnsweep.searchprotocol.SearchResultOfferV3
@@ -338,6 +339,64 @@ class ResultActivationTest {
     }
 
     @Test
+    fun profileTooLargeWithConfirmedCleanupPreservesAndAdmitsPreviousGood(): Unit {
+        val f = Fixture()
+        f.publish(previous)
+        val saved = f.storage.manifest!!
+        val stored = f.storage.generations[saved.generation]!!
+        assertEquals(current, saved.revision)
+        assertEquals(saved, f.store.resolve(current))
+
+        f.startSearch()
+        assertEquals(SearchPhase.RUNNING, f.controller.state.value.phase)
+        assertUnavailable(f)
+        f.port.stopped(SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED)
+
+        assertEquals(MarkerState.CLEAR, f.marker.value)
+        assertEquals(SearchPhase.FAILED, f.controller.state.value.phase)
+        assertEquals(SearchFailureV1.PROFILE_TOO_LARGE, f.controller.state.value.failure)
+        assertFalse(f.controller.state.value.resultCommitted)
+        assertEquals(saved, f.storage.manifest)
+        assertEquals(1, f.storage.next)
+        assertEquals(setOf(saved.generation), f.storage.generations.keys)
+        assertEquals(stored.revision, f.storage.generations[saved.generation]!!.revision)
+        assertEquals(stored.sha256, f.storage.generations[saved.generation]!!.sha256)
+        assertArrayEquals(previous, f.storage.generations[saved.generation]!!.bytes)
+        assertEquals(saved, f.store.resolve(current))
+        assertTrue(f.activation.ready())
+        val token = Any()
+        val admission = f.activation.admitVpn { f.vpnBusy = true; token } as VpnAdmission.Admitted
+        assertSame(token, admission.reservation)
+        assertArrayEquals(previous, admission.bytes)
+    }
+
+    @Test
+    fun profileTooLargeWithUnconfirmedCleanupKeepsMarkerAndDeniesAdmissions(): Unit {
+        val cleanupOutcomes = listOf(
+            SearchResourceStateV2.QUARANTINED to SearchResultFenceV3.CONFIRMED,
+            SearchResourceStateV2.RELEASED to SearchResultFenceV3.UNKNOWN,
+        )
+        for ((resources, fence) in cleanupOutcomes) {
+            val f = Fixture()
+            f.publish(previous)
+            val saved = f.storage.manifest!!
+            f.startSearch()
+            f.port.stopped(resources, fence)
+
+            assertEquals(MarkerState.ACTIVE, f.marker.value)
+            assertEquals(SearchPhase.INTERRUPTED, f.controller.state.value.phase)
+            assertFalse(f.controller.state.value.resultCommitted)
+            assertEquals(saved, f.storage.manifest)
+            assertEquals(1, f.storage.next)
+            assertEquals(setOf(saved.generation), f.storage.generations.keys)
+            assertArrayEquals(previous, f.storage.generations[saved.generation]!!.bytes)
+            assertFalse(f.activation.ready())
+            assertUnavailable(f)
+            assertEquals(SearchStartV3.BUSY, denied(f.activation.reserveSearch(1, 2, Input())))
+        }
+    }
+
+    @Test
     fun cancellationBeforeCommitKeepsAndAdmitsPreviousGood(): Unit {
         val f = Fixture()
         f.publish(previous)
@@ -619,6 +678,9 @@ class ResultActivationTest {
             resources: SearchResourceStateV2 = SearchResourceStateV2.RELEASED,
             fence: SearchResultFenceV3 = SearchResultFenceV3.CONFIRMED,
         ): Unit = observer!!.onTerminal(SearchTerminalV3.Complete(generation, phase, resources, fence))
+        fun stopped(resources: SearchResourceStateV2, fence: SearchResultFenceV3): Unit = observer!!.onTerminal(
+            SearchTerminalV3.Stopped(generation, phase, SearchFailureV1.PROFILE_TOO_LARGE, resources, fence),
+        )
         fun cancelled(): Unit = observer!!.onTerminal(
             SearchTerminalV3.Cancelled(generation, phase, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED),
         )
