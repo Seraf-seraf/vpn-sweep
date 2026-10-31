@@ -8,6 +8,7 @@ internal enum class SubscriptionStartV1 { ACCEPTED, BUSY, REJECTED }
 // NO_SUPPORTED is not a successful import; its records may still be displayed.
 internal enum class SubscriptionBatchStatusV1 { HAS_SUPPORTED, NO_SUPPORTED }
 internal enum class SubscriptionRejectV1 { UNSUPPORTED_RECORD }
+internal class SubscriptionProfilesTooLargeException : Exception()
 internal enum class SubscriptionFailureV1 {
     INVALID_URL,
     TIMEOUT,
