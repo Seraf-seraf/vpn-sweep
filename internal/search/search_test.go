@@ -33,6 +33,28 @@ func (t closeErrorTunnel) Close() error {
 	*t.closed++
 	return model.Err("core_kill_failed", "core")
 }
+
+type cancelAfterChecks struct {
+	context.Context
+	remaining int
+	done      chan struct{}
+}
+
+func (c *cancelAfterChecks) Done() <-chan struct{} { return c.done }
+func (c *cancelAfterChecks) Err() error {
+	if c.remaining > 0 {
+		c.remaining--
+		if c.remaining == 0 {
+			close(c.done)
+		}
+	}
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
 func setup(t *testing.T) (model.Manifest, []model.Profile, *space.Generator, *state.Store) {
 	t.Helper()
 	p, _ := importer.Parse([]byte("socks5://synthetic.invalid:1080"), "uri")
@@ -77,7 +99,7 @@ func TestDefaultEarlyCoverageUsesApplicableProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schedule, err := newCandidateSchedule(profiles, make([]byte, 32), g, model.SearchVersion)
+	schedule, err := newCandidateSchedule(context.Background(), profiles, make([]byte, 32), g, model.SearchVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,6 +194,70 @@ func TestProfileSpacesFinishInRoundRobinOrder(t *testing.T) {
 	}
 	if _, _, ok := Candidate(profiles, make([]byte, 32), g, big.NewInt(int64(len(order)))); ok {
 		t.Fatal("profile scheduler did not stop at the finite boundary")
+	}
+}
+
+func TestCancellationDuringProfileScheduling(t *testing.T) {
+	m, _, _, s := setup(t)
+	m.Budgets.SessionSeconds = 0
+	tls, err := importer.Parse([]byte("vless://synthetic@vpn.invalid:443?type=tcp&security=tls"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := importer.Parse([]byte("socks5://vpn.invalid:1080"), "uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := space.New(space.Spec{Version: 2, Strategy: "exhaustive", Parameters: []space.Domain{{Name: "mux", Values: []any{true}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := []model.Profile{tls.Profiles[0], tls.Profiles[0], tls.Profiles[0], tls.Profiles[0], plain.Profiles[0]}
+	ctx := &cancelAfterChecks{Context: context.Background(), remaining: 3, done: make(chan struct{})}
+	status, err := (Engine{}).Run(ctx, m, profiles, make([]byte, 32), g, s)
+	if err != nil || status != "interrupted" || s.View().Attempts != 0 || s.View().Next != "0" {
+		t.Fatalf("cancellation during scheduling: status=%s err=%v view=%+v", status, err, s.View())
+	}
+}
+
+func TestCancellationDuringSchedulingPreservesPendingRetry(t *testing.T) {
+	m, profiles, _, s := setup(t)
+	g, err := space.New(space.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := model.Candidate{Profile: 0, ID: "pending-candidate", Params: map[string]any{}}
+	if err := s.Begin(model.Attempt{ID: model.ID(), Candidate: candidate}, "1"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	status, err := (Engine{}).Run(ctx, m, profiles, make([]byte, 32), g, s)
+	view := s.View()
+	if err != nil || status != "interrupted" || view.Pending != nil || view.Retry == nil || view.Retry.ID != candidate.ID || view.Next != "1" || s.Seen(candidate.ID) {
+		t.Fatalf("pending retry after cancellation: status=%s err=%v view=%+v", status, err, view)
+	}
+}
+
+func TestSessionBudgetIncludesProfileScheduling(t *testing.T) {
+	m, p, _, s := setup(t)
+	m.Budgets.SessionSeconds = 1
+	g, err := space.New(space.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := make([]model.Profile, 4000)
+	for i := range profiles {
+		profiles[i] = p[0]
+	}
+	e := Engine{Open: func(ctx context.Context, _ model.Profile, _ map[string]any) (Tunnel, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	start := time.Now()
+	status, err := e.Run(context.Background(), m, profiles, make([]byte, 32), g, s)
+	if err != nil || status != "paused_budget" || time.Since(start) > 3*time.Second {
+		t.Fatalf("session budget: status=%s err=%v elapsed=%s", status, err, time.Since(start))
 	}
 }
 

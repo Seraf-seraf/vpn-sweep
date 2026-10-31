@@ -67,7 +67,7 @@ func Effective(p model.Profile, params map[string]any) map[string]any {
 	return capability.Effective(p, params)
 }
 func Candidate(profiles []model.Profile, key []byte, g *space.Generator, pos *big.Int) (model.Candidate, *big.Int, bool) {
-	s, err := newCandidateSchedule(profiles, key, g, model.SearchVersion)
+	s, err := newCandidateSchedule(context.Background(), profiles, key, g, model.SearchVersion)
 	if err != nil {
 		return model.Candidate{}, nil, false
 	}
@@ -95,10 +95,6 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		}
 		_ = p
 	}
-	schedule, err := newCandidateSchedule(profiles, key, g, m.SearchVersion)
-	if err != nil {
-		return "invalid_input", err
-	}
 	b := m.Budgets
 	if b.AttemptSeconds < 1 {
 		return "invalid_budget", model.Err("invalid_budget", "search")
@@ -109,9 +105,25 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		session, cancel = context.WithTimeout(ctx, time.Duration(b.SessionSeconds)*time.Second)
 	}
 	defer cancel()
+	status := func(v string) (string, error) { return v, s.Status(v) }
+	schedule, err := newCandidateSchedule(session, profiles, key, g, m.SearchVersion)
+	if err != nil {
+		if session.Err() == nil {
+			return "invalid_input", err
+		}
+		if s.View().Pending != nil {
+			if err := s.End("interrupted"); err != nil {
+				return "state_error", err
+			}
+		}
+		if ctx.Err() != nil {
+			return status("interrupted")
+		}
+		e.notify(s, Progress{Event: "budget_reached", Outcome: "session_budget"})
+		return status("paused_budget")
+	}
 	initial := s.View()
 	usedAttempts := uint64(0)
-	status := func(v string) (string, error) { return v, s.Status(v) }
 	if initial.Pending != nil {
 		if err := s.End("interrupted"); err != nil {
 			return "state_error", err

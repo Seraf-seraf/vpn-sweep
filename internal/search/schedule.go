@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/space"
 	"math/big"
@@ -20,9 +21,12 @@ type candidateSchedule struct {
 	total    *big.Int
 }
 
-func newCandidateSchedule(profiles []model.Profile, key []byte, g *space.Generator, version int) (*candidateSchedule, error) {
+func newCandidateSchedule(ctx context.Context, profiles []model.Profile, key []byte, g *space.Generator, version int) (*candidateSchedule, error) {
 	s := &candidateSchedule{profiles: profiles, key: key, version: version, base: g, min: new(big.Int), max: new(big.Int), total: big.NewInt(int64(len(profiles)))}
 	for i, p := range profiles {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		profileSpace, err := g.ForProfile(p)
 		if err != nil {
 			return nil, err
@@ -37,6 +41,9 @@ func newCandidateSchedule(profiles []model.Profile, key []byte, g *space.Generat
 		if count.Cmp(s.max) > 0 {
 			s.max.Set(count)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
