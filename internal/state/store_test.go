@@ -15,8 +15,16 @@ import (
 func attempt() model.Attempt {
 	return model.Attempt{ID: "attempt-a", Candidate: model.Candidate{ID: "candidate-a", Params: map[string]any{"fragment": false}}}
 }
-func TestAtomicBeginAndEveryTornPrefix(t *testing.T) {
+func privateTempDir(t *testing.T) string {
+	t.Helper()
 	d := t.TempDir()
+	if e := os.Chmod(d, 0700); e != nil {
+		t.Fatal(e)
+	}
+	return d
+}
+func TestAtomicBeginAndEveryTornPrefix(t *testing.T) {
+	d := privateTempDir(t)
 	s, e := Open(d, 0)
 	if e != nil {
 		t.Fatal(e)
@@ -27,7 +35,7 @@ func TestAtomicBeginAndEveryTornPrefix(t *testing.T) {
 	s.Close()
 	data, _ := os.ReadFile(filepath.Join(d, "journal.jsonl"))
 	for cut := 0; cut <= len(data); cut++ {
-		dir := t.TempDir()
+		dir := privateTempDir(t)
 		if e = os.WriteFile(filepath.Join(dir, "journal.jsonl"), data[:cut], 0600); e != nil {
 			t.Fatal(e)
 		}
@@ -51,8 +59,11 @@ func TestAtomicBeginAndEveryTornPrefix(t *testing.T) {
 func TestFaultWriteAndSyncRecovery(t *testing.T) {
 	for _, kind := range []string{"partial", "sync"} {
 		t.Run(kind, func(t *testing.T) {
-			d := t.TempDir()
-			s, _ := Open(d, 0)
+			d := privateTempDir(t)
+			s, e := Open(d, 0)
+			if e != nil {
+				t.Fatal(e)
+			}
 			if kind == "partial" {
 				s.write = func(b []byte) (int, error) { return s.file.Write(b[:len(b)/2]) }
 			} else {
@@ -84,8 +95,11 @@ func TestFaultWriteAndSyncRecovery(t *testing.T) {
 	}
 }
 func TestIntegrityAndVersions(t *testing.T) {
-	d := t.TempDir()
-	s, _ := Open(d, 0)
+	d := privateTempDir(t)
+	s, e := Open(d, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
 	s.Begin(attempt(), "1")
 	s.Close()
 	p := filepath.Join(d, "journal.jsonl")
@@ -96,16 +110,22 @@ func TestIntegrityAndVersions(t *testing.T) {
 		r.Close()
 		t.Fatal("corruption accepted")
 	}
-	dir := t.TempDir()
-	s, _ = Open(dir, 0)
+	dir := privateTempDir(t)
+	s, e = Open(dir, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
 	if s.SaveManifest(model.Manifest{Version: 2}, nil, nil) == nil {
 		t.Fatal("unknown version accepted")
 	}
 	s.Close()
 }
 func TestSingleWriterAndConcurrentBegin(t *testing.T) {
-	d := t.TempDir()
-	s, _ := Open(d, 0)
+	d := privateTempDir(t)
+	s, e := Open(d, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
 	defer s.Close()
 	if other, e := Open(d, 0); e == nil {
 		other.Close()
@@ -151,7 +171,7 @@ func TestCrashChild(t *testing.T) {
 		s.Begin(attempt(), "1")
 		os.Exit(73)
 	}
-	d := t.TempDir()
+	d := privateTempDir(t)
 	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashChild$")
 	cmd.Env = append(os.Environ(), "VPN_SWEEP_TEST_CRASH=1", "VPN_SWEEP_TEST_DIR="+d)
 	e := cmd.Run()
@@ -169,13 +189,16 @@ func TestCrashChild(t *testing.T) {
 	}
 }
 func TestProbeRecoveryAndBudget(t *testing.T) {
-	d := t.TempDir()
-	s, _ := Open(d, 0)
+	d := privateTempDir(t)
+	s, e := Open(d, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
 	s.Begin(attempt(), "1")
 	s.Probe(model.ProbeResult{ID: "p1", Bytes: 19, Outcome: "pass"})
 	s.Restart()
 	s.Close()
-	s, e := Open(d, 0)
+	s, e = Open(d, 0)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -191,8 +214,11 @@ func TestProbeRecoveryAndBudget(t *testing.T) {
 }
 
 func TestRefinementIssuanceAndInterruptedRecovery(t *testing.T) {
-	d := t.TempDir()
-	s, _ := Open(d, 0)
+	d := privateTempDir(t)
+	s, e := Open(d, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
 	c := attempt().Candidate
 	if e := s.Refine([]model.Candidate{c}); e != nil {
 		t.Fatal(e)
@@ -203,7 +229,7 @@ func TestRefinementIssuanceAndInterruptedRecovery(t *testing.T) {
 	}
 	s.End("interrupted")
 	s.Close()
-	s, e := Open(d, 0)
+	s, e = Open(d, 0)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -214,7 +240,7 @@ func TestRefinementIssuanceAndInterruptedRecovery(t *testing.T) {
 }
 
 func TestSavedWinnerTransitionAndReplayKeepSearchPosition(t *testing.T) {
-	d := t.TempDir()
+	d := privateTempDir(t)
 	s, err := Open(d, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -264,8 +290,11 @@ func TestSavedWinnerTransitionAndReplayKeepSearchPosition(t *testing.T) {
 }
 
 func TestManifestIntegrityAndPrivateInput(t *testing.T) {
-	d := t.TempDir()
-	s, _ := Open(d, 0)
+	d := privateTempDir(t)
+	s, e := Open(d, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
 	defer s.Close()
 	key := bytes.Repeat([]byte{3}, 32)
 	p := []model.Profile{{Outbound: map[string]any{"synthetic": "secret-marker"}}}
@@ -286,7 +315,7 @@ func TestManifestIntegrityAndPrivateInput(t *testing.T) {
 }
 
 func TestInstallationIdentityIndependentOfSeries(t *testing.T) {
-	d := t.TempDir()
+	d := privateTempDir(t)
 	a, e := IdentityKey(d)
 	if e != nil {
 		t.Fatal(e)
@@ -295,7 +324,7 @@ func TestInstallationIdentityIndependentOfSeries(t *testing.T) {
 	if e != nil || !bytes.Equal(a, b) {
 		t.Fatal("candidate identity changed by new series")
 	}
-	other, e := IdentityKey(t.TempDir())
+	other, e := IdentityKey(privateTempDir(t))
 	if e != nil || bytes.Equal(a, other) {
 		t.Fatal("installation keys not isolated")
 	}

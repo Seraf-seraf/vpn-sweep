@@ -19,7 +19,7 @@ func TestLegacyProbeJournalReplayGolden(t *testing.T) {
 	if e != nil || string(raw) != old {
 		t.Fatal("legacy encoding changed", string(raw), e)
 	}
-	s, e := Open(t.TempDir(), 0)
+	s, e := Open(privateTempDir(t), 0)
 	if e != nil {
 		t.Fatal(e)
 	}
