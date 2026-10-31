@@ -102,6 +102,8 @@ internal class SearchSessionProducer(
 
     override fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3 {
         var pendingPause: PauseDelivery? = null
+        var startWatch: Pair<Active, ControlWatch>? = null
+        var invalid: Active? = null
         val current = synchronized(lock) {
             val value = active ?: return SearchStartV3.REJECTED
             if (blocked || value.state == State.UNKNOWN) return SearchStartV3.UNKNOWN
@@ -109,20 +111,36 @@ internal class SearchSessionProducer(
                 (value.state != State.PAUSED && value.state != State.EMITTING_PAUSE) ||
                 value.control == Control.CANCEL || phaseEpoch <= value.lastEpoch || phaseEpoch <= 0
             ) return SearchStartV3.REJECTED
-            pendingPause = value.pauseDelivery
-            value.watch?.done?.countDown()
-            value.watch = null
-            value.lastEpoch = phaseEpoch
-            value.epoch = phaseEpoch
-            value.control = Control.NONE
-            value.deadline = null
-            value.prepared = false
-            value.phase = null
-            value.cancellation = null
-            value.pauseDelivery = null
-            value.state = State.STARTING
-            value
+            val pending = value.pauseDelivery
+            if (value.state == State.EMITTING_PAUSE && (pending == null || value.deadline == null)) {
+                invalid = value
+                null
+            } else {
+                pendingPause = pending
+                if (pending != null && value.watch == null) {
+                    val watch = ControlWatch(value.epoch, value.deadline!!)
+                    value.watch = watch
+                    startWatch = value to watch
+                }
+                if (pending == null) {
+                    value.watch?.done?.countDown()
+                    value.watch = null
+                    value.deadline = null
+                }
+                value.lastEpoch = phaseEpoch
+                value.epoch = phaseEpoch
+                value.control = Control.NONE
+                value.prepared = false
+                value.phase = null
+                value.cancellation = null
+                value.state = State.STARTING
+                value
+            }
+        } ?: run {
+            invalid?.let { unknown(it) }
+            return SearchStartV3.UNKNOWN
         }
+        startWatch?.let { (owner, watch) -> dispatchWatch(owner, watch) }
         if (!launch {
                 val pause = pendingPause
                 if (pause != null) {
@@ -363,25 +381,44 @@ internal class SearchSessionProducer(
         }
         if (cancelInstead) return finishWithoutRun(current, cancelled = true)
         val terminal = SearchTerminalV3.Paused(current.snapshot.sessionGeneration, epoch, reason, resources)
-        val delivered = try { emit(current, terminal) } finally { delivery!!.done.countDown() }
-        if (!delivered) return
-        val cancelAfter = synchronized(lock) {
-            if (active !== current || current.state == State.UNKNOWN || current.epoch != epoch ||
-                current.state != State.EMITTING_PAUSE || current.pauseDelivery !== delivery
-            ) return
-            current.pauseDelivery = null
-            if (current.control == Control.CANCEL) {
-                current.state = State.FINISHING
-                true
-            } else {
-                current.state = State.PAUSED
-                current.deadline = null
-                current.watch?.done?.countDown()
-                current.watch = null
-                false
+        try {
+            if (!emit(current, terminal)) return
+            val completedAt = nowMillis()
+            var expired = false
+            val cancelAfter = synchronized(lock) {
+                if (active !== current || current.state == State.UNKNOWN || current.pauseDelivery !== delivery) return
+                val deadline = current.deadline
+                if (completedAt < 0 || deadline == null || completedAt >= deadline) {
+                    expired = true
+                    false
+                } else if (current.epoch != epoch) {
+                    current.pauseDelivery = null
+                    if (current.control == Control.NONE) {
+                        current.deadline = null
+                        current.watch?.done?.countDown()
+                        current.watch = null
+                    }
+                    false
+                } else {
+                    if (current.state != State.EMITTING_PAUSE) return
+                    current.pauseDelivery = null
+                    if (current.control == Control.CANCEL) {
+                        current.state = State.FINISHING
+                        true
+                    } else {
+                        current.state = State.PAUSED
+                        current.deadline = null
+                        current.watch?.done?.countDown()
+                        current.watch = null
+                        false
+                    }
+                }
             }
+            if (expired) unknown(current)
+            else if (cancelAfter) finishWithoutRun(current, cancelled = true)
+        } finally {
+            delivery!!.done.countDown()
         }
-        if (cancelAfter) finishWithoutRun(current, cancelled = true)
     }
 
     private fun finishWithoutRun(current: Active, cancelled: Boolean): Unit {
@@ -443,7 +480,7 @@ internal class SearchSessionProducer(
     private fun unknown(current: Active, notify: Boolean = true, watch: ControlWatch? = null): Unit {
         val captured = synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN ||
-                (watch != null && (current.watch !== watch || current.epoch != watch.epoch || current.state == State.TERMINAL))
+                (watch != null && (current.watch !== watch || current.state == State.TERMINAL))
             ) return
             blocked = true
             current.state = State.UNKNOWN
