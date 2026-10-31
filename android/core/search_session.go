@@ -100,6 +100,15 @@ func NewSearchSession(generation int64, manifestBytes, profileBytes []byte, stat
 	if err != nil {
 		return nil, errors.New("invalid_search_space")
 	}
+	for _, profile := range profiles {
+		serialized, err := json.Marshal(profile)
+		if err != nil {
+			return nil, errors.New("invalid_search_input")
+		}
+		if len(serialized) > importer.MaxInputBytes {
+			return nil, errors.New("search_profile_size")
+		}
+	}
 	if _, err = export.SafeDirectory(stagingDir); err != nil {
 		return nil, errors.New("search_staging_unavailable")
 	}
