@@ -34,11 +34,72 @@ import kotlin.concurrent.thread
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ResultActivationCompositionTest {
+    @Test
+    fun currentRevisionAndSnapshotReservationShareTheControllerMonitor(): Unit {
+        val f = Fixture()
+        assertTrue(f.composition.withSourceMutation { ResultRevision("1", "2") })
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val mutation = async {
+            f.composition.withSourceMutation {
+                entered.countDown()
+                check(release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                ResultRevision("3", "2")
+            }
+        }
+        check(entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+        val (read, reader) = asyncWithThread { f.composition.currentRevision() }
+        try {
+            awaitBlockedAt(reader, ResultActivationComposition::class.java.name, "currentRevision")
+        } finally {
+            release.countDown()
+        }
+        assertTrue(mutation.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+        assertEquals(ResultRevision("3", "2"), read.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+        val subscriptionLock = Any()
+        f.port.onStart = {
+            assertFalse(Thread.holdsLock(subscriptionLock))
+            assertFalse(Thread.holdsLock(f.composition.controller))
+        }
+        lateinit var profiles: Input
+        val prepared = synchronized(subscriptionLock) {
+            synchronized(f.composition.controller) {
+                val current = f.composition.currentRevision()!!
+                assertEquals(ResultRevision("3", "2"), current)
+                assertTrue(Thread.holdsLock(subscriptionLock))
+                assertTrue(Thread.holdsLock(f.composition.controller))
+                profiles = Input()
+                f.composition.activation.reserveSearch(current.source.toLong(), current.selection.toLong(), profiles)
+            }
+        } as SearchStartPreparation.Reserved
+        assertEquals(0, f.port.starts)
+        assertEquals(SearchStartV3.ACCEPTED, prepared.dispatch())
+        assertEquals(1, f.port.starts)
+        assertEquals(1, profiles.closes)
+        f.composition.controller.cancel()
+        f.port.cancelled()
+    }
+
+    @Test
+    fun missingOrUnreadableCurrentRevisionCannotStartSearch(): Unit {
+        val f = Fixture()
+        assertNull(f.composition.currentRevision())
+        assertEquals(SearchStartV3.REJECTED, denied(f.composition.activation.reserveSearch(1, 2, Input())))
+        assertEquals(0, f.port.starts)
+        assertTrue(f.composition.withSourceMutation { ResultRevision("1", "2") })
+        f.revisionStorage.failRead = true
+        assertNull(f.composition.currentRevision())
+        assertEquals(SearchStartV3.REJECTED, denied(f.composition.activation.reserveSearch(1, 2, Input())))
+        assertEquals(0, f.port.starts)
+    }
+
     @Test
     fun publishedResultAndVpnReservationUseTheSameComposition(): Unit {
         val f = Fixture()
@@ -443,7 +504,11 @@ class ResultActivationCompositionTest {
         private var observer: SearchSessionObserverV3? = null
         private var generation = 0L
         private var phase = 0L
+        var starts = 0
+        var onStart: () -> Unit = {}
         override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
+            starts++
+            onStart()
             generation = snapshot.sessionGeneration
             phase = phaseEpoch
             this.observer = observer

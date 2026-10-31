@@ -26,6 +26,8 @@ internal class ResultActivationComposition private constructor(
     val controller = SearchController(port, store, marker)
     val activation = ResultActivation(controller, store, storage, revisions, marker, vpnRuns::available)
 
+    fun currentRevision(): ResultRevision? = synchronized(controller) { revisions.load() }
+
     fun withSourceMutation(mutation: () -> ResultRevision): Boolean = activation.withSourceMutation {
         check(marker.markActive() && marker.read() == MarkerState.ACTIVE) { "marker_active_unknown" }
         val previous = revisionStorage.read()
