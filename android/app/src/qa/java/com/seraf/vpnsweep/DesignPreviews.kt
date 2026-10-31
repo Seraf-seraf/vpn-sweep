@@ -11,6 +11,7 @@ import com.seraf.vpnsweep.ui.SubscriptionDialogContent
 import com.seraf.vpnsweep.ui.SubscriptionDialogStatus
 import com.seraf.vpnsweep.ui.SweepColors
 import com.seraf.vpnsweep.ui.SweepTheme
+import com.android.tools.screenshot.PreviewTest
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Box
@@ -73,21 +74,27 @@ private fun HomePreview(state: VpnState, selected: Boolean) {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · главный экран", widthDp = 360, heightDp = 800)
 @Composable private fun PreviewHome() = HomePreview(VpnState(), selected = false)
 
+@PreviewTest
 @Preview(name = "PREVIEW · подключение", widthDp = 360, heightDp = 800)
 @Composable private fun PreviewConnecting() = HomePreview(VpnState(VpnPhase.CONNECTING, "Подключение…"), selected = true)
 
+@PreviewTest
 @Preview(name = "PREVIEW · VPN запущен", widthDp = 360, heightDp = 800)
 @Composable private fun PreviewRunning() = HomePreview(VpnState(VpnPhase.RUNNING, "Туннель запущен"), selected = true)
 
+@PreviewTest
 @Preview(name = "PREVIEW · отключение", widthDp = 360, heightDp = 800)
 @Composable private fun PreviewStopping() = HomePreview(VpnState(VpnPhase.STOPPING, "Отключение…"), selected = true)
 
+@PreviewTest
 @Preview(name = "PREVIEW · крупный шрифт", widthDp = 320, heightDp = 640, fontScale = 2f)
 @Composable private fun PreviewLargeText() = HomePreview(VpnState(), selected = false)
 
+@PreviewTest
 @Preview(name = "PREVIEW · значок приложения", widthDp = 160, heightDp = 160)
 @Composable
 private fun PreviewLauncherIcon() {
@@ -98,6 +105,7 @@ private fun PreviewLauncherIcon() {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · короткая подписка", widthDp = 320, heightDp = 120)
 @Preview(name = "PREVIEW · короткая подписка, крупный шрифт", widthDp = 320, heightDp = 120, fontScale = 2f)
 @Composable
@@ -105,6 +113,7 @@ private fun PreviewShortSubscription() {
     SweepTheme { SubscriptionDialogContent("", SubscriptionDialogStatus.Empty, {}, {}, {}) }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · подписка ниже высоты кнопок", widthDp = 320, heightDp = 79)
 @Preview(name = "PREVIEW · подписка равна высоте кнопок", widthDp = 320, heightDp = 80)
 @Preview(name = "PREVIEW · подписка выше высоты кнопок", widthDp = 320, heightDp = 81)
@@ -116,6 +125,7 @@ private fun PreviewSubscriptionFooterBoundary() {
     SweepTheme { SubscriptionDialogContent("", SubscriptionDialogStatus.Empty, {}, {}, {}) }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · короткий список серверов", widthDp = 320, heightDp = 180)
 @Preview(name = "PREVIEW · короткий список со сводкой", widthDp = 320, heightDp = 250)
 @Preview(name = "PREVIEW · короткий список, крупный шрифт", widthDp = 320, heightDp = 340, fontScale = 2f)
@@ -128,6 +138,7 @@ private fun PreviewShortServers() {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · параметры", widthDp = 360, heightDp = 720)
 @Composable
 private fun PreviewParameters() {
@@ -138,6 +149,7 @@ private fun PreviewParameters() {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · параметры, пример", widthDp = 360, heightDp = 720)
 @Composable
 private fun PreviewParametersExample() {
@@ -148,6 +160,7 @@ private fun PreviewParametersExample() {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · параметры, крупный шрифт", widthDp = 320, heightDp = 640, fontScale = 2f)
 @Composable
 private fun PreviewParametersLargeText() {
@@ -158,6 +171,7 @@ private fun PreviewParametersLargeText() {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · журнал, пример", widthDp = 360, heightDp = 300)
 @Composable
 private fun PreviewEventLogExample() {
@@ -187,27 +201,36 @@ private fun SubscriptionPreview(status: SubscriptionDialogStatus, link: String) 
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · подписка пустая", widthDp = 360, heightDp = 640)
+@Preview(name = "PREVIEW · подписка пустая, крупный шрифт", widthDp = 320, heightDp = 720, fontScale = 2f)
 @Composable private fun PreviewSubscriptionEmpty() = SubscriptionPreview(SubscriptionDialogStatus.Empty, "")
 
+@PreviewTest
 @Preview(name = "PREVIEW · ссылка введена", widthDp = 360, heightDp = 640)
 @Composable private fun PreviewSubscriptionInput() = SubscriptionPreview(SubscriptionDialogStatus.Input, "https://example.com/sub/demo")
 
+@PreviewTest
 @Preview(name = "PREVIEW · загрузка", widthDp = 360, heightDp = 640)
 @Composable private fun PreviewSubscriptionLoading() = SubscriptionPreview(SubscriptionDialogStatus.Loading, "https://example.com/sub/demo")
 
+@PreviewTest
 @Preview(name = "PREVIEW · неверная ссылка", widthDp = 360, heightDp = 640)
 @Composable private fun PreviewSubscriptionInvalid() = SubscriptionPreview(SubscriptionDialogStatus.InvalidUrl, "example")
 
+@PreviewTest
 @Preview(name = "PREVIEW · ошибка загрузки", widthDp = 360, heightDp = 640)
 @Composable private fun PreviewSubscriptionNetworkError() = SubscriptionPreview(SubscriptionDialogStatus.NetworkError, "https://example.com/sub/demo")
 
+@PreviewTest
 @Preview(name = "PREVIEW · ошибка формата", widthDp = 360, heightDp = 640)
 @Composable private fun PreviewSubscriptionMalformed() = SubscriptionPreview(SubscriptionDialogStatus.MalformedData, "https://example.com/sub/demo")
 
+@PreviewTest
 @Preview(name = "PREVIEW · загрузка недоступна", widthDp = 360, heightDp = 640)
 @Composable private fun PreviewSubscriptionUnavailable() = SubscriptionPreview(SubscriptionDialogStatus.Unavailable, "https://example.com/sub/demo")
 
+@PreviewTest
 @Preview(name = "PREVIEW · подписка, крупный шрифт", widthDp = 320, heightDp = 480, fontScale = 2f)
 @Composable private fun PreviewSubscriptionLargeText() = SubscriptionPreview(SubscriptionDialogStatus.InvalidUrl, "example")
 
@@ -220,17 +243,22 @@ private fun ServersPreview(servers: List<ServerChoice>, selected: Set<String>) {
     }
 }
 
+@PreviewTest
 @Preview(name = "PREVIEW · серверы пустые", widthDp = 360, heightDp = 720)
 @Composable private fun PreviewServersEmpty() = ServersPreview(emptyList(), emptySet())
 
+@PreviewTest
 @Preview(name = "PREVIEW · серверы не выбраны", widthDp = 360, heightDp = 720)
 @Composable private fun PreviewServersNone() = ServersPreview(previewServers, emptySet())
 
+@PreviewTest
 @Preview(name = "PREVIEW · часть серверов", widthDp = 360, heightDp = 720)
 @Composable private fun PreviewServersPartial() = ServersPreview(previewServers, setOf("de", "nl", "fr"))
 
+@PreviewTest
 @Preview(name = "PREVIEW · все поддерживаемые серверы", widthDp = 360, heightDp = 720)
 @Composable private fun PreviewServersAll() = ServersPreview(previewServers, setOf("de", "nl", "fi", "fr", "se"))
 
+@PreviewTest
 @Preview(name = "PREVIEW · серверы, крупный шрифт", widthDp = 320, heightDp = 480, fontScale = 2f)
 @Composable private fun PreviewServersLargeText() = ServersPreview(previewServers, setOf("de", "nl"))

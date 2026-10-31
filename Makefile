@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: check test vet build android package scan android-core android-apk android-check android-ui-check
+.PHONY: check test vet build android package scan android-core android-apk android-check android-ui-check android-preview
 check:
 	GO="$(GO)" sh scripts/check.sh
 test:
@@ -24,3 +24,5 @@ android-check: android-core
 	cd android && ./gradlew --no-daemon :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
 android-ui-check: android-core
 	cd android && ./gradlew --no-daemon :app:connectedQaAndroidTest
+android-preview: android-core
+	cd android && ./gradlew --no-daemon --no-configuration-cache :app:updateQaScreenshotTest
