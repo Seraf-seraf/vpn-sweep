@@ -113,7 +113,7 @@ internal class SearchOwnerLease internal constructor(
     private val closeFd: (Int) -> Boolean = { SearchOwnerLock.close(it) },
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
 ) : AutoCloseable, CoordinatorLease {
-    private enum class State { OPEN, SEALED, CLOSING, RELEASED, QUARANTINED }
+    private enum class State { OPEN, SEALED, CLOSING, CLOSED_PENDING, RELEASED, QUARANTINED }
     private val workerOutstanding = AtomicBoolean()
     private val state = AtomicReference(State.OPEN)
     @Volatile private var workerRetired = CountDownLatch(0)
@@ -229,21 +229,29 @@ internal class SearchOwnerLease internal constructor(
         }
         val closed = try { closeFd(original) } catch (_: Exception) { false } catch (_: LinkageError) { false }
         val completed = nowMillis()
-        if (closed && completed >= 0 && completed < deadlineElapsedMillis && state.compareAndSet(State.CLOSING, State.RELEASED)) {
-            if (admission.release(token)) return true
-            state.set(State.QUARANTINED)
-            admission.quarantine(token)
-            return false
-        }
+        if (closed && completed >= 0 && completed < deadlineElapsedMillis &&
+            state.compareAndSet(State.CLOSING, State.CLOSED_PENDING)
+        ) return true
         quarantine()
+        return false
+    }
+
+    // Only in-memory CAS operations: safe for the producer's final decision.
+    fun acceptRelease(): Boolean {
+        if (!state.compareAndSet(State.CLOSED_PENDING, State.RELEASED)) return false
+        if (admission.release(token)) return true
+        state.set(State.QUARANTINED)
+        admission.quarantine(token)
         return false
     }
 
     override fun close(): Unit {
         if (state.get() == State.RELEASED) return
         check(state.get() != State.QUARANTINED) { "owner_quarantined" }
+        check(state.get() != State.CLOSED_PENDING) { "owner_acceptance_pending" }
         check(!workerOutstanding.get()) { "worker_death_unconfirmed" }
         check(releaseUntil(Long.MAX_VALUE)) { "owner_lock_close_failed" }
+        check(acceptRelease()) { "owner_lock_acceptance_failed" }
     }
 }
 

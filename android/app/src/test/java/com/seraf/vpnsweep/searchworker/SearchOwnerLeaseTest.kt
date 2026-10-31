@@ -29,6 +29,8 @@ class SearchOwnerLeaseTest {
             assertFalse(lease.reserveWorker())
             assertTrue(lease.releaseUntil(nowMillis() + 2_000))
             assertEquals(1, closes.get())
+            assertNull(admission.reserve())
+            assertTrue(lease.acceptRelease())
             assertNotNull(admission.reserve())
         } finally { waiter.join(2_000) }
     }

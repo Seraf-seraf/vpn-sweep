@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit
 // A factory retains acquired resources until ownership transfers and must
 // quarantine them itself if it fails before returning a session.
 internal interface SearchPhaseSession {
+    val releaseOwner: SearchOwnerLease?
     fun preparePhase(epoch: Long): Unit
     fun runPhase(epoch: Long): String
     fun cancelPhase(epoch: Long): Boolean
@@ -61,6 +62,7 @@ internal class SearchSessionProducer(
         var control = Control.NONE
         var deadline: Long? = null
         var session: SearchPhaseSession? = null
+        var releaseOwner: SearchOwnerLease? = null
         var prepared = false
         var phase: SearchLocalPhase? = null
         var cancellation: Cancellation? = null
@@ -186,6 +188,18 @@ internal class SearchSessionProducer(
             }
         }
         if (control == null) {
+            try { session.quarantine() } catch (_: Exception) { }
+            return
+        }
+        val releaseOwner = try { session.releaseOwner } catch (_: Exception) { null } catch (_: LinkageError) { null }
+        if (releaseOwner == null) return unknown(current)
+        val attached = synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN) false else {
+                current.releaseOwner = releaseOwner
+                true
+            }
+        }
+        if (!attached) {
             try { session.quarantine() } catch (_: Exception) { }
             return
         }
@@ -459,17 +473,31 @@ internal class SearchSessionProducer(
         synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN || current.state == State.TERMINAL) return
             current.state = State.TERMINAL
-            current.watch?.done?.countDown()
-            current.watch = null
         }
         if (!emit(current, terminal)) return
-        synchronized(lock) { if (active === current && current.state == State.TERMINAL) active = null }
+        val completedAt = nowMillis()
+        val accepted = synchronized(lock) {
+            if (active !== current || current.state != State.TERMINAL) return
+            val deadline = current.deadline
+            if (completedAt < 0 || deadline == null || completedAt >= deadline || current.releaseOwner?.acceptRelease() != true) {
+                false
+            } else {
+                current.watch?.done?.countDown()
+                current.watch = null
+                active = null
+                true
+            }
+        }
+        if (!accepted) unknown(current, notify = false)
     }
 
     private fun emit(current: Active, terminal: SearchTerminalV3): Boolean = try {
         current.observer.onTerminal(terminal)
         true
     } catch (_: Exception) {
+        unknown(current, notify = false)
+        false
+    } catch (_: LinkageError) {
         unknown(current, notify = false)
         false
     }
@@ -484,10 +512,12 @@ internal class SearchSessionProducer(
     }
 
     private fun unknown(current: Active, notify: Boolean = true, watch: ControlWatch? = null): Unit {
+        var deliver = false
         val captured = synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN ||
-                (watch != null && (current.watch !== watch || current.state == State.TERMINAL))
+                (watch != null && current.watch !== watch)
             ) return
+            deliver = notify && current.state != State.TERMINAL
             blocked = true
             current.state = State.UNKNOWN
             current.watch?.done?.countDown()
@@ -497,7 +527,7 @@ internal class SearchSessionProducer(
         captured.second?.revoke()
         launch {
             try { captured.first?.quarantine() } catch (_: Exception) { }
-            if (notify) try {
+            if (deliver) try {
                 current.observer.onTerminal(SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch,
                     SearchFailureV1.INTERRUPTED, captured.third, SearchResultFenceV3.UNKNOWN))
             } catch (_: Exception) { }

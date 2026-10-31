@@ -119,6 +119,8 @@ internal class SearchMobilePhaseSession internal constructor(
     private val quarantineOwner: () -> Unit,
     private val owner: SearchOwnerLease? = null,
 ) : SearchPhaseSession {
+    override val releaseOwner: SearchOwnerLease? get() = owner
+
     constructor(
         session: SearchSession,
         progress: SearchMobilePhaseProgress,

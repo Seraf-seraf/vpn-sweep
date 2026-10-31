@@ -28,6 +28,9 @@ class SearchSessionProducerTest {
     }
 
     private class Owner : SearchPhaseSession {
+        private val admission = SearchOwnerAdmission()
+        private val token = checkNotNull(admission.reserve())
+        override val releaseOwner = SearchOwnerLease(42, admission, token, { true }, { 0 })
         val prepareEntered = CountDownLatch(1)
         val runEntered = CountDownLatch(1)
         val releasePrepare = CountDownLatch(1)
@@ -72,8 +75,11 @@ class SearchSessionProducerTest {
         override fun closeSession(deadlineElapsedMillis: Long): Unit { closed.incrementAndGet() }
         override fun pauseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 = SearchResourceStateV2.PAUSED_LEASE_HELD
         override fun retireResources(deadlineElapsedMillis: Long): SearchResourceStateV2 = SearchResourceStateV2.PAUSED_LEASE_HELD
-        override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 { released.incrementAndGet(); return SearchResourceStateV2.RELEASED }
-        override fun quarantine(): Unit { quarantined.incrementAndGet(); quarantineReached.countDown() }
+        override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 {
+            released.incrementAndGet()
+            return if (releaseOwner.releaseUntil(deadlineElapsedMillis)) SearchResourceStateV2.RELEASED else SearchResourceStateV2.QUARANTINED
+        }
+        override fun quarantine(): Unit { releaseOwner.quarantine(); quarantined.incrementAndGet(); quarantineReached.countDown() }
     }
 
     private class Observer(private val failTerminal: Boolean = false) : SearchSessionObserverV3 {

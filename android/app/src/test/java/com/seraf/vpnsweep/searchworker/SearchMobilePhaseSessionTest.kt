@@ -18,6 +18,7 @@ import java.io.InputStream
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.*
@@ -320,6 +321,8 @@ class SearchMobilePhaseSessionTest {
         session.closeSession(deadline)
         assertEquals(SearchResourceStateV2.RELEASED, session.releaseResources(deadline))
         assertEquals(1, closes.get())
+        assertNull(admission.reserve())
+        assertTrue(lease.acceptRelease())
         assertNotNull(admission.reserve())
     }
 
@@ -341,6 +344,7 @@ class SearchMobilePhaseSessionTest {
         val deadline = clock() + 2_000
         session.closeSession(deadline)
         assertEquals(SearchResourceStateV2.RELEASED, session.releaseResources(deadline))
+        assertTrue(lease.acceptRelease())
     }
 
     @Test fun producerKeepsRealOwnerThroughReceiptAndSessionClose(): Unit {
@@ -348,9 +352,11 @@ class SearchMobilePhaseSessionTest {
         val token = checkNotNull(admission.reserve())
         val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
         val trace = Collections.synchronizedList(mutableListOf<String>())
+        val runThread = AtomicReference<Thread>()
         val lease = SearchOwnerLease(42, admission, token, { trace.add("anchor-close"); true }, clock)
         val done = CountDownLatch(1)
         val terminal = AtomicReference<SearchTerminalV3>()
+        val admissionHeldAtTerminal = AtomicBoolean()
         val observer = object : SearchSessionObserverV3 {
             override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
             override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
@@ -361,12 +367,19 @@ class SearchMobilePhaseSessionTest {
                 offer.result.close()
                 return SearchResultReceiptV3.COMMITTED_CLOSED
             }
-            override fun onTerminal(value: SearchTerminalV3): Unit { terminal.set(value); done.countDown() }
+            override fun onTerminal(value: SearchTerminalV3): Unit {
+                val competing = admission.reserve()
+                if (competing != null) admission.release(competing)
+                admissionHeldAtTerminal.set(competing == null)
+                terminal.set(value)
+                done.countDown()
+            }
         }
         val producer = SearchSessionProducer(2_000, { snapshot, deliver ->
             snapshot.profiles.open().use { it.readBytes() }
             val progress = SearchMobilePhaseProgress(clock, deliver)
             SearchMobilePhaseSession({}, {
+                runThread.set(Thread.currentThread())
                 check(lease.reserveWorker())
                 trace.add("worker-retired")
                 lease.workerDeathConfirmed()
@@ -376,8 +389,217 @@ class SearchMobilePhaseSessionTest {
         }, clock)
         assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
         assertTrue(done.await(3, TimeUnit.SECONDS))
+        runThread.get().join(3_000)
         assertTrue(terminal.get() is SearchTerminalV3.Complete)
+        assertTrue(admissionHeldAtTerminal.get())
         assertEquals(listOf("worker-retired", "open", "receipt", "session-close", "anchor-close"), trace.toList())
         assertNotNull(admission.reserve())
+    }
+
+    @Test fun unknownBeforeReleaseReturnCannotFreeProcessAdmission(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val lease = SearchOwnerLease(42, admission, token, { true }, clock)
+        val releaseReturned = CountDownLatch(1)
+        val continueRelease = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val ownerQuarantined = CountDownLatch(1)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "success" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, { ownerQuarantined.countDown() }, lease)
+        val wrapped = object : SearchPhaseSession by session {
+            override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 {
+                val result = session.releaseResources(deadlineElapsedMillis)
+                releaseReturned.countDown()
+                check(continueRelease.await(3, TimeUnit.SECONDS))
+                return result
+            }
+        }
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { terminal.countDown() }
+        }
+        val producer = SearchSessionProducer(200, { snapshot, _ ->
+            snapshot.profiles.open().close()
+            wrapped
+        }, clock)
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
+            assertTrue(releaseReturned.await(2, TimeUnit.SECONDS))
+            val acquired = admission.reserve()
+            if (acquired != null) admission.release(acquired)
+            assertNull("admission became free before cleanup outcome", acquired)
+            assertTrue(terminal.await(2, TimeUnit.SECONDS))
+            assertTrue(ownerQuarantined.await(2, TimeUnit.SECONDS))
+            assertTrue(admission.isQuarantined())
+        } finally { continueRelease.countDown() }
+    }
+
+    @Test fun terminalFailureCannotFreeProcessAdmission(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val lease = SearchOwnerLease(42, admission, token, { true }, clock)
+        val terminal = CountDownLatch(1)
+        val quarantined = CountDownLatch(1)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "success" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, { quarantined.countDown() }, lease)
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { terminal.countDown(); throw IOException("synthetic") }
+        }
+        val producer = SearchSessionProducer(2_000, { snapshot, _ ->
+            snapshot.profiles.open().close()
+            session
+        }, clock)
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
+        assertTrue(terminal.await(2, TimeUnit.SECONDS))
+        assertTrue(quarantined.await(2, TimeUnit.SECONDS))
+        assertTrue(admission.isQuarantined())
+        assertNull(admission.reserve())
+    }
+
+    @Test fun unknownBeforePhysicalCloseReturnsCannotFreeProcessAdmission(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val entered = CountDownLatch(1)
+        val continueClose = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val quarantined = CountDownLatch(1)
+        val lease = SearchOwnerLease(42, admission, token, {
+            entered.countDown()
+            check(continueClose.await(3, TimeUnit.SECONDS))
+            true
+        }, clock)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "success" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, { quarantined.countDown() }, lease)
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { terminal.countDown() }
+        }
+        val producer = SearchSessionProducer(200, { snapshot, _ -> snapshot.profiles.open().close(); session }, clock)
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            assertTrue(terminal.await(2, TimeUnit.SECONDS))
+            assertTrue(quarantined.await(2, TimeUnit.SECONDS))
+            assertTrue(admission.isQuarantined())
+        } finally { continueClose.countDown() }
+        assertNull(admission.reserve())
+    }
+
+    @Test fun terminalCallbackTimeoutKeepsProcessAdmissionQuarantined(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val lease = SearchOwnerLease(42, admission, token, { true }, clock)
+        val entered = CountDownLatch(1)
+        val continueTerminal = CountDownLatch(1)
+        val quarantined = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "success" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, { quarantined.countDown() }, lease)
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit {
+                calls.incrementAndGet()
+                entered.countDown()
+                check(continueTerminal.await(3, TimeUnit.SECONDS))
+            }
+        }
+        val producer = SearchSessionProducer(200, { snapshot, _ -> snapshot.profiles.open().close(); session }, clock)
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            assertTrue(quarantined.await(2, TimeUnit.SECONDS))
+            assertTrue(admission.isQuarantined())
+            assertNull(admission.reserve())
+            assertEquals(1, calls.get())
+        } finally { continueTerminal.countDown() }
+    }
+
+    @Test fun ownerLossWinsWhileQuarantineIsDelayedAndCloseReturns(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val enteredClose = CountDownLatch(1)
+        val continueClose = CountDownLatch(1)
+        val enteredQuarantine = CountDownLatch(1)
+        val continueQuarantine = CountDownLatch(1)
+        val releaseReturned = CountDownLatch(1)
+        val lease = SearchOwnerLease(42, admission, token, {
+            enteredClose.countDown()
+            check(continueClose.await(3, TimeUnit.SECONDS))
+            true
+        }, clock)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "success" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, {}, lease)
+        val wrapped = object : SearchPhaseSession by session {
+            override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 {
+                val result = session.releaseResources(deadlineElapsedMillis)
+                releaseReturned.countDown()
+                return result
+            }
+            override fun quarantine(): Unit {
+                enteredQuarantine.countDown()
+                check(continueQuarantine.await(3, TimeUnit.SECONDS))
+                session.quarantine()
+            }
+        }
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit = Unit
+        }
+        val producer = SearchSessionProducer(2_000, { snapshot, _ -> snapshot.profiles.open().close(); wrapped }, clock)
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
+            assertTrue(enteredClose.await(1, TimeUnit.SECONDS))
+            producer.ownerLost(7)
+            assertTrue(enteredQuarantine.await(1, TimeUnit.SECONDS))
+            continueClose.countDown()
+            assertTrue(releaseReturned.await(1, TimeUnit.SECONDS))
+            val competing = admission.reserve()
+            if (competing != null) admission.release(competing)
+            assertNull("owner loss must win even before asynchronous quarantine", competing)
+        } finally {
+            continueClose.countDown()
+            continueQuarantine.countDown()
+        }
     }
 }
