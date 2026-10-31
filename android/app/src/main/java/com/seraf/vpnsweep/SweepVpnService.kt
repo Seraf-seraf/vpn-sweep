@@ -1,11 +1,11 @@
 package com.seraf.vpnsweep
 
 import com.seraf.vpnsweep.diagnostics.DiagnosticsStatus
+import com.seraf.vpnsweep.vpn.AppVpnRegistry
 import com.seraf.vpnsweep.vpn.VpnCancellation
 import com.seraf.vpnsweep.vpn.VpnRun
 import com.seraf.vpnsweep.vpn.VpnRunFailure
 import com.seraf.vpnsweep.vpn.VpnRunOperations
-import com.seraf.vpnsweep.vpn.VpnRunRegistry
 import com.seraf.vpnsweep.vpn.VpnServiceLifecycle
 import android.app.Notification
 import android.app.NotificationChannel
@@ -229,7 +229,7 @@ class SweepVpnService : VpnService() {
     }
 
     companion object {
-        private val sessions = VpnRunRegistry()
+        private val sessions = AppVpnRegistry.instance
         const val START = "com.seraf.vpnsweep.START"
         const val STOP = "com.seraf.vpnsweep.STOP"
         const val CONFIG_NAME = "integration-result.json"
