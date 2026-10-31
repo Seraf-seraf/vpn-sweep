@@ -126,12 +126,13 @@ internal class SearchSessionProducer(
     }
 
     fun ownerLost(sessionGeneration: Long): Unit {
-        val current = synchronized(lock) {
-            active?.takeIf {
-                it.snapshot.sessionGeneration == sessionGeneration && it.state != State.TERMINAL && it.state != State.UNKNOWN
-            }
-        } ?: return
-        unknown(current)
+        val pending = synchronized(lock) {
+            val current = active ?: return
+            if (current.snapshot.sessionGeneration != sessionGeneration) return
+            val actions = markUnknown(current, notify = true, watch = null) ?: return
+            current to actions
+        }
+        dispatchUnknown(pending.first, pending.second)
     }
 
     override fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3 {

@@ -411,11 +411,12 @@ class SearchSessionProducerTest {
         assertEquals(1, owner.released.get())
     }
 
-    @Test fun ownerLossAfterFinalTerminalIsChosenDoesNotReplayIt(): Unit {
+    @Test fun ownerLossBeforeTerminalAcceptanceRejectsAndDoesNotReplayIt(): Unit {
         val owner = Owner()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val count = AtomicInteger()
+        val saved = AtomicReference<SearchTerminalV3>()
         val observer = object : SearchSessionObserverV3 {
             override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
             override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
@@ -425,6 +426,7 @@ class SearchSessionProducerTest {
             }
             override fun onTerminal(terminal: SearchTerminalV3): Unit {
                 count.incrementAndGet()
+                saved.set(terminal)
                 entered.countDown()
                 check(release.await(3, TimeUnit.SECONDS))
             }
@@ -432,9 +434,52 @@ class SearchSessionProducerTest {
         val producer = producer(owner)
         assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
         assertTrue(entered.await(2, TimeUnit.SECONDS))
-        producer.ownerLost(7)
-        release.countDown()
-        owner.runThread.get().join(3_000)
+        try {
+            producer.ownerLost(7)
+            assertFalse(accept(producer, saved.get()))
+            assertTrue(owner.quarantineReached.await(2, TimeUnit.SECONDS))
+            assertFalse(owner.admissionAvailable())
+        } finally {
+            release.countDown()
+            owner.runThread.get().join(3_000)
+        }
+        assertFalse(owner.runThread.get().isAlive)
+        assertEquals(1, count.get())
+        assertEquals(1, owner.quarantined.get())
+    }
+
+    @Test fun ownerLossAfterTerminalAcceptanceDoesNotReopenOrReplayIt(): Unit {
+        val owner = Owner()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val count = AtomicInteger()
+        val saved = AtomicReference<SearchTerminalV3>()
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(terminal: SearchTerminalV3): Unit {
+                count.incrementAndGet()
+                saved.set(terminal)
+                entered.countDown()
+                check(release.await(3, TimeUnit.SECONDS))
+            }
+        }
+        val producer = producer(owner)
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        try {
+            assertTrue(accept(producer, saved.get()))
+            producer.ownerLost(7)
+            assertTrue(owner.admissionAvailable())
+            assertFalse(accept(producer, saved.get()))
+        } finally {
+            release.countDown()
+            owner.runThread.get().join(3_000)
+        }
         assertFalse(owner.runThread.get().isAlive)
         assertEquals(1, count.get())
         assertEquals(0, owner.quarantined.get())
