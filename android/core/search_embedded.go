@@ -156,7 +156,7 @@ func (w *SearchEmbeddedWorker) open(profileBytes, parameterBytes []byte, startup
 	var params map[string]any
 	var err error
 	launched := false
-	if len(profileBytes) == 0 || len(profileBytes) > importer.MaxInputBytes || len(parameterBytes) > importer.MaxInputBytes ||
+	if len(profileBytes) == 0 || len(profileBytes) > importer.MaxInputBytes ||
 		model.Decode(profileBytes, &profile) != nil || model.Decode(parameterBytes, &params) != nil ||
 		params == nil || importer.Validate(profile) != nil || capability.Check(profile, params) != nil ||
 		startupMillis < 1 || startupMillis > maxSearchStartupMillis || cleanupMillis < 1 || cleanupMillis > maxSearchCleanupMillis {

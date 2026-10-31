@@ -214,7 +214,6 @@ func TestAndroidSearchEmbeddedReadinessCloseFailureQuarantines(t *testing.T) {
 }
 
 func TestAndroidSearchEmbeddedAcceptsLargeValidParameters(t *testing.T) {
-	_, guard := installFakeOwner(t)
 	input, err := importer.Parse([]byte("ss://YWVzLTEyOC1nY206c3ludGhldGlj@synthetic.invalid:8388"), "uri")
 	if err != nil {
 		t.Fatal(err)
@@ -223,31 +222,51 @@ func TestAndroidSearchEmbeddedAcceptsLargeValidParameters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delay := strings.Repeat("0", importer.MaxInputBytes)
-	params, err := json.Marshal(map[string]any{
-		"noise": true,
-		"noises": []any{map[string]any{
-			"type": "rand", "packet": "1", "delay": delay, "applyTo": "ip",
-		}},
-	})
-	if err != nil || len(params) <= importer.MaxInputBytes {
-		t.Fatal("test parameters did not exceed the profile input limit")
+	encode := func(delay string) ([]byte, error) {
+		return json.Marshal(map[string]any{
+			"noise": true,
+			"noises": []any{map[string]any{
+				"type": "rand", "packet": "1", "delay": delay, "applyTo": "ip",
+			}},
+		})
 	}
-	var starts atomic.Int32
-	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, actualProfile model.Profile, actualParams map[string]any) (searchCore, *SearchWorkerProbes, error) {
-		starts.Add(1)
-		noises, ok := actualParams["noises"].([]any)
-		if !ok || len(noises) != 1 {
-			return nil, nil, errors.New("unexpected_noise_parameters")
-		}
-		noise, ok := noises[0].(map[string]any)
-		if !ok || actualProfile.Outbound["protocol"] != "shadowsocks" || actualParams["noise"] != true || noise["delay"] != delay {
-			return nil, nil, errors.New("unexpected_noise_parameters")
-		}
-		return nil, nil, model.Err("core_config_rejected", "core")
-	})
-	if status := worker.OpenStatus(profile, params, maxSearchStartupMillis, 1000); status != SearchWorkerCandidateConfigRejected || starts.Load() != 1 {
-		t.Fatalf("valid large parameters status=%d starts=%d", status, starts.Load())
+	sample, err := encode("0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	overhead := len(sample) - 1
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{name: "below", size: importer.MaxInputBytes - 1},
+		{name: "at", size: importer.MaxInputBytes},
+		{name: "above", size: importer.MaxInputBytes + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, guard := installFakeOwner(t)
+			delay := strings.Repeat("0", tc.size-overhead)
+			params, err := encode(delay)
+			if err != nil || len(params) != tc.size {
+				t.Fatal("incorrect parameter size")
+			}
+			var starts atomic.Int32
+			worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, actualProfile model.Profile, actualParams map[string]any) (searchCore, *SearchWorkerProbes, error) {
+				starts.Add(1)
+				noises, ok := actualParams["noises"].([]any)
+				if !ok || len(noises) != 1 {
+					return nil, nil, errors.New("unexpected_noise_parameters")
+				}
+				noise, ok := noises[0].(map[string]any)
+				if !ok || actualProfile.Outbound["protocol"] != "shadowsocks" || actualParams["noise"] != true || noise["delay"] != delay {
+					return nil, nil, errors.New("unexpected_noise_parameters")
+				}
+				return nil, nil, model.Err("core_config_rejected", "core")
+			})
+			if status := worker.OpenStatus(profile, params, maxSearchStartupMillis, 1000); status != SearchWorkerCandidateConfigRejected || starts.Load() != 1 {
+				t.Fatalf("valid parameters status=%d starts=%d", status, starts.Load())
+			}
+		})
 	}
 }
 
@@ -263,7 +282,7 @@ func TestAndroidSearchEmbeddedRejectsInputAndBudgetBoundaries(t *testing.T) {
 		{name: "empty_profile", params: params, startup: 1000, cleanup: 1000},
 		{name: "oversize_profile", profile: make([]byte, importer.MaxInputBytes+1), params: params, startup: 1000, cleanup: 1000},
 		{name: "empty_params", profile: profile, startup: 1000, cleanup: 1000},
-		{name: "oversize_params", profile: profile, params: make([]byte, importer.MaxInputBytes+1), startup: 1000, cleanup: 1000},
+		{name: "oversize_invalid_params", profile: profile, params: make([]byte, importer.MaxInputBytes+1), startup: 1000, cleanup: 1000},
 		{name: "startup_zero", profile: profile, params: params, startup: 0, cleanup: 1000},
 		{name: "startup_above_max", profile: profile, params: params, startup: maxSearchStartupMillis + 1, cleanup: 1000},
 		{name: "cleanup_zero", profile: profile, params: params, startup: 1000, cleanup: 0},
