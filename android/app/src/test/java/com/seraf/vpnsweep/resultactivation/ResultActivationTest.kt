@@ -181,6 +181,8 @@ class ResultActivationTest {
             f.marker.failClearAfterWrite = failureAfterWrite
             f.port.stopped(SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED)
 
+            assertEquals(1, f.port.terminalAccepts)
+            assertEquals(1, f.marker.clearCalls)
             assertEquals(SearchPhase.INTERRUPTED, f.controller.state.value.phase)
             assertFalse(f.activation.ready())
             assertEquals(if (failureAfterWrite) MarkerState.CLEAR else MarkerState.ACTIVE, f.marker.value)
@@ -203,6 +205,7 @@ class ResultActivationTest {
             assertEquals(SearchPhase.IDLE, recoveredController.state.value.phase)
             assertEquals(0, recoveryPort.starts)
             assertTrue(recovered.ready())
+            assertEquals(0, recoveryPort.starts)
             f.revisionStorage.value = ResultRevision("3", "2")
             assertFalse(recovered.ready())
             f.revisionStorage.value = current
@@ -617,6 +620,7 @@ class ResultActivationTest {
         var readUnknown = false
         var failClear = false
         var failClearAfterWrite = false
+        var clearCalls = 0
         override fun read(): MarkerState {
             if (failRead) throw IOException("synthetic")
             if (readUnknown) return MarkerState.UNKNOWN
@@ -624,6 +628,7 @@ class ResultActivationTest {
         }
         override fun markActive(): Boolean { value = MarkerState.ACTIVE; return true }
         override fun markClear(): Boolean {
+            clearCalls++
             if (failClear) return false
             value = MarkerState.CLEAR
             return !failClearAfterWrite
@@ -702,7 +707,8 @@ class ResultActivationTest {
     }
 
     private class Port : SearchSessionPortV4 {
-        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
+        var terminalAccepts = 0
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean { terminalAccepts++; return true }
         var starts = 0
         var observer: SearchSessionObserverV3? = null
         var generation = 0L
