@@ -930,13 +930,14 @@ class SubscriptionControllerTest {
         override fun cancel(generation: Long): Unit { cancellations.add(generation) }
     }
 
-    private class FakeSearchPort : SearchSessionPortV3 {
+    private class FakeSearchPort : SearchSessionPortV4 {
         var snapshot: SearchSnapshotV1? = null
         var starts = 0
         var result = SearchStartV3.ACCEPTED
         var throwOnStart = false
         var onStart: (SearchSessionObserverV3) -> Unit = {}
         val cancellations = mutableListOf<Pair<Long, Long>>()
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true
         override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
             this.snapshot = snapshot
             starts++
