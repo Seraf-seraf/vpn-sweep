@@ -19,9 +19,18 @@ internal class VpnServiceLifecycle {
 
     fun epoch(): Long? = synchronized(lock) { if (destroyed || revocations != 0) null else revokeEpoch }
 
-    fun reserve(registry: VpnRunRegistry, epoch: Long, stopping: () -> Unit): VpnRun? = synchronized(lock) {
+    fun reserve(
+        registry: VpnRunRegistry,
+        epoch: Long,
+        deferDelivery: (() -> Unit) -> Unit = { it() },
+        onReserved: () -> Unit = {},
+        stopping: () -> Unit,
+    ): VpnRun? = synchronized(lock) {
         if (destroyed || revocations != 0 || revokeEpoch != epoch) return@synchronized null
-        registry.reserve(stopping)?.also { connection = it }
+        registry.reserve(deferDelivery, stopping)?.also {
+            connection = it
+            onReserved()
+        }
     }
 
     fun current(): VpnRun? = synchronized(lock) { connection }

@@ -42,14 +42,21 @@ class SweepVpnService : VpnService() {
             if (lifecycle.current()?.stop() != true) stopRejected(startId)
             return START_NOT_STICKY
         }
-        val run = lifecycle.reserve(sessions, epoch) {
-            VpnStatus.update(VpnState(VpnPhase.STOPPING, "Отключение…"))
+        val diagnosticsSession = Any()
+        val run = DiagnosticsStatus.withDeferredDelivery {
+            lifecycle.reserve(sessions, epoch,
+                deferDelivery = { DiagnosticsStatus.withDeferredDelivery(it) },
+                onReserved = { DiagnosticsStatus.reserve(diagnosticsSession) },
+            ) {
+                DiagnosticsStatus.stopping(diagnosticsSession)
+                VpnStatus.update(VpnState(VpnPhase.STOPPING, "Отключение…"))
+            }
         }
         if (run == null) {
             if (!lifecycle.hasActiveConnection()) stopRejected(startId)
             return START_NOT_STICKY
         }
-        run.launch(scope, ConnectionOperations()) {
+        run.launch(scope, ConnectionOperations(diagnosticsSession)) {
             startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
             run.publishIfActive { VpnStatus.update(VpnState(VpnPhase.CONNECTING, "Подключение…")) }
         }
@@ -86,7 +93,7 @@ class SweepVpnService : VpnService() {
         val digest: String,
     )
 
-    private inner class ConnectionOperations : VpnRunOperations<Preparation, ParcelFileDescriptor> {
+    private inner class ConnectionOperations(private val diagnosticsSession: Any) : VpnRunOperations<Preparation, ParcelFileDescriptor> {
         override fun prepare(run: VpnRun): Preparation {
             val manager = getSystemService(ConnectivityManager::class.java)
             val network = manager.activeNetwork ?: error("network_unavailable")
@@ -138,7 +145,10 @@ class SweepVpnService : VpnService() {
                     Mobile.tunUplinkBytes(),
                     Mobile.tunDownlinkBytes(),
                 )
-                run.publishIfActive { VpnStatus.update(state) }
+                run.publishIfActive {
+                    DiagnosticsStatus.running(diagnosticsSession)
+                    VpnStatus.update(state)
+                }
                 delay(STATUS_INTERVAL_MS)
             }
         }
@@ -176,7 +186,9 @@ class SweepVpnService : VpnService() {
                 VpnRunFailure.ServiceCleanup -> "Ошибка остановки VPN-сервиса"
                 null -> null
             }
-            VpnStatus.update(message?.let { VpnState(VpnPhase.ERROR, it) } ?: VpnState())
+            DiagnosticsStatus.publishIfCurrent(diagnosticsSession) {
+                VpnStatus.update(message?.let { VpnState(VpnPhase.ERROR, it) } ?: VpnState())
+            }
         }
     }
 

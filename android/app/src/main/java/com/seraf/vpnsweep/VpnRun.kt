@@ -29,9 +29,12 @@ internal class VpnRunRegistry(private val cancellation: (Job) -> Unit = VpnCance
     private val lock = Any()
     private var current: VpnRun? = null
 
-    fun reserve(stopping: () -> Unit): VpnRun? = guarded {
+    fun reserve(
+        deferDelivery: (() -> Unit) -> Unit = { it() },
+        stopping: () -> Unit,
+    ): VpnRun? = guarded {
         if (current != null) return@guarded null
-        VpnRun(this, stopping).also { current = it }
+        VpnRun(this, stopping, deferDelivery).also { current = it }
     }
 
     fun <T> guarded(action: () -> T): T = synchronized(lock, action)
@@ -78,6 +81,7 @@ internal interface VpnRunOperations<P : Any, T : Any> {
 internal class VpnRun(
     private val registry: VpnRunRegistry,
     private val stopping: () -> Unit,
+    private val deferDelivery: (() -> Unit) -> Unit,
 ) {
     private var stopped = false
     private var finished = false
@@ -114,11 +118,14 @@ internal class VpnRun(
 
     fun stop(): Boolean {
         var pending: Job? = null
-        val wasActive = registry.guarded {
-            if (finished) false else {
-                markStoppingLocked()
-                pending = cancellationLocked()
-                true
+        var wasActive = false
+        deferDelivery {
+            wasActive = registry.guarded {
+                if (finished) false else {
+                    markStoppingLocked()
+                    pending = cancellationLocked()
+                    true
+                }
             }
         }
         pending?.let(registry::scheduleCancellation)
@@ -145,8 +152,8 @@ internal class VpnRun(
 
     fun isActive(): Boolean = registry.guarded { !finished }
 
-    fun publishIfActive(publish: () -> Unit): Unit = registry.guarded {
-        if (!stopped && !finished) publish()
+    fun publishIfActive(publish: () -> Unit): Unit = deferDelivery {
+        registry.guarded { if (!stopped && !finished) publish() }
     }
 
     fun finishLocked(): Unit {
@@ -193,9 +200,12 @@ internal class VpnRun(
         } finally {
             withContext(NonCancellable) {
                 try {
-                    val failed = registry.guarded {
-                        markStoppingLocked()
-                        statusFailed
+                    var failed = false
+                    deferDelivery {
+                        failed = registry.guarded {
+                            markStoppingLocked()
+                            statusFailed
+                        }
                     }
                     if (failed && failure == null) failure = VpnRunFailure.Status
                     try {
@@ -226,7 +236,9 @@ internal class VpnRun(
                             if (failure == null || failure is VpnRunFailure.Operation) {
                                 failure = VpnRunFailure.ServiceCleanup
                             }
-                            registry.release(this@VpnRun) { operations.finished(failure) }
+                            deferDelivery {
+                                registry.release(this@VpnRun) { operations.finished(failure) }
+                            }
                         }
                     }
                     try {

@@ -11,6 +11,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -30,14 +31,21 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             val state by VpnStatus.state.collectAsStateWithLifecycle()
+            val diagnosticsOwner = remember { DiagnosticsStatus.newOwner() }
+            DisposableEffect(diagnosticsOwner) {
+                diagnosticsOwner.attach()
+                onDispose { diagnosticsOwner.close() }
+            }
+            val observedDiagnostics by diagnosticsOwner.state.collectAsStateWithLifecycle(
+                initialValue = diagnosticsOwner.currentState,
+            )
+            val diagnostics = diagnosticsOwner.current(observedDiagnostics)
             val scope = rememberCoroutineScope()
             var selected by remember { mutableStateOf(File(noBackupFilesDir, SweepVpnService.CONFIG_NAME).exists()) }
             var importing by remember { mutableStateOf(false) }
             val importOwner = remember { ImportUiOwner() }
             var message by remember { mutableStateOf("") }
             var permissionMessage by remember { mutableStateOf("") }
-            var testing by remember { mutableStateOf(false) }
-            var checkResults by remember { mutableStateOf(emptyList<String>()) }
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
             val busy = state.phase in setOf(VpnPhase.CONNECTING, VpnPhase.RUNNING, VpnPhase.STOPPING)
@@ -96,8 +104,8 @@ class MainActivity : ComponentActivity() {
                     selected = selected,
                     importing = importing,
                     message = message,
-                    testing = testing,
-                    checkResults = checkResults,
+                    testing = diagnostics.testing,
+                    checkResults = diagnostics.results,
                     onPower = {
                         if (busy) {
                             startService(Intent(this@MainActivity, SweepVpnService::class.java).setAction(SweepVpnService.STOP))
@@ -106,23 +114,33 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onImport = { document.launch(arrayOf("application/json", "text/*", "application/octet-stream")) },
-                    onRunChecks = {
-                        testing = true
-                        checkResults = emptyList()
-                        scope.launch {
+                    onRunChecks = onRunChecks@{
+                        val token = diagnosticsOwner.begin() ?: return@onRunChecks
+                        val appContext = applicationContext
+                        val job = diagnosticsOwner.launch {
+                            var successful = false
                             try {
-                                withContext(Dispatchers.IO) {
-                                    val checkContext = coroutineContext
-                                    IntegrationChecks.run(getSystemService(ConnectivityManager::class.java)) { result ->
-                                        checkContext.ensureActive()
-                                        runOnUiThread { checkResults = checkResults + result }
+                                val checkContext = coroutineContext
+                                checkContext.ensureActive()
+                                if (!diagnosticsOwner.admit(token)) {
+                                    throw CancellationException("diagnostics_stale")
+                                }
+                                IntegrationChecks.run(appContext.getSystemService(ConnectivityManager::class.java)) { result ->
+                                    checkContext.ensureActive()
+                                    if (!diagnosticsOwner.report(token, result)) {
+                                        throw CancellationException("diagnostics_stale")
                                     }
                                 }
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
+                                successful = true
                             } finally {
-                                testing = false
+                                diagnosticsOwner.finish(token, successful)
                             }
+                        }
+                        if (diagnosticsOwner.attachJob(token, job)) {
+                            if (!job.start()) diagnosticsOwner.finish(token, successful = false)
+                        } else {
+                            diagnosticsOwner.cancel(job)
+                            diagnosticsOwner.finish(token, successful = false)
                         }
                     },
                     onSubscription = { subscriptionOpen = true },
