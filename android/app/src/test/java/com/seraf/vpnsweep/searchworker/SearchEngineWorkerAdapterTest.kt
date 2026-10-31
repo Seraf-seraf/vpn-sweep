@@ -9,6 +9,7 @@ import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.*
@@ -224,5 +225,53 @@ internal class SearchEngineWorkerAdapterTest {
             assertEquals(Mobile.SearchWorkerReady, adapter.close(1, 500))
             assertEquals(1, port.closeCount.get())
         }
+    }
+
+    @Test
+    fun unknownCancelDuringOpenAttemptsCleanupAndRemainsQuarantined(): Unit {
+        val entered = CountDownLatch(1)
+        val releaseOpen = CountDownLatch(1)
+        val cleanupStarted = CountDownLatch(1)
+        val port = Port().apply {
+            openAction = { entered.countDown(); check(releaseOpen.await(2, TimeUnit.SECONDS)) }
+            cancelAction = { throw IOException("synthetic") }
+            closeAction = { cleanupStarted.countDown() }
+        }
+        val adapter = adapter(port, Lease())
+        val result = AtomicReference<Long>()
+        val worker = Thread { result.set(open(adapter)) }
+        worker.start()
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            adapter.cancel(1)
+            assertTrue(cleanupStarted.await(1, TimeUnit.SECONDS))
+            assertEquals(Mobile.SearchWorkerDeliveryUnknown, adapter.failure(1))
+            releaseOpen.countDown()
+            worker.join(2000)
+            assertFalse(worker.isAlive)
+            assertEquals(Mobile.SearchWorkerDeliveryUnknown, result.get())
+            assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
+            assertEquals(1, port.closeCount.get())
+        } finally { releaseOpen.countDown() }
+    }
+
+    @Test
+    fun interruptedPortCallPreservesThreadInterruptAndQuarantines(): Unit {
+        val port = Port().apply { openAction = { throw InterruptedException() } }
+        val lease = Lease()
+        val adapter = adapter(port, lease)
+        val result = AtomicReference<Long>()
+        val interruptPreserved = AtomicBoolean()
+        val worker = Thread {
+            result.set(open(adapter))
+            interruptPreserved.set(Thread.currentThread().isInterrupted)
+        }
+        worker.start()
+        worker.join(2000)
+        assertFalse(worker.isAlive)
+        assertEquals(Mobile.SearchWorkerDeliveryUnknown, result.get())
+        assertTrue(interruptPreserved.get())
+        assertEquals(1, lease.closes)
+        assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
     }
 }

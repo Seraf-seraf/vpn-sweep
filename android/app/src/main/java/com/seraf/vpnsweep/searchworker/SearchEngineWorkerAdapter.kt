@@ -85,6 +85,9 @@ internal class SearchEngineWorkerAdapter(
         }
         val client = try {
             createRound(identity)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
         } catch (_: Exception) {
             null
         } catch (_: LinkageError) {
@@ -110,6 +113,9 @@ internal class SearchEngineWorkerAdapter(
         }
         val outcome = try {
             client.port.open(identity, network, client.lease, input, remainingStartup, cleanupMillis)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
         } catch (_: Exception) {
             null
         } catch (_: LinkageError) {
@@ -174,6 +180,9 @@ internal class SearchEngineWorkerAdapter(
         val input = FrameInput(callHeader(remaining, round.toInt(), request.size), request)
         val reply = try {
             current.client!!.port.execute(current.identity, op, input)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
         } catch (_: Exception) {
             null
         } catch (_: LinkageError) {
@@ -277,19 +286,22 @@ internal class SearchEngineWorkerAdapter(
             Thread({
                 try {
                     round.client!!.port.cancel(round.identity)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } catch (_: Exception) {
-                    fail(round, Mobile.SearchWorkerDeliveryUnknown)
+                    failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } catch (_: LinkageError) {
-                    fail(round, Mobile.SearchWorkerDeliveryUnknown)
+                    failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } finally {
                     done.countDown()
                 }
             }, "search-round-cancel").apply { isDaemon = true }.start()
         } catch (_: Exception) {
-            fail(round, Mobile.SearchWorkerDeliveryUnknown)
+            failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
         } catch (_: LinkageError) {
-            fail(round, Mobile.SearchWorkerDeliveryUnknown)
+            failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
         }
     }
