@@ -15,23 +15,36 @@ internal class VpnRunRegistry {
     private val lock = Any()
     private var current: VpnRun? = null
 
-    fun reserve(): VpnRun? = guarded {
+    fun reserve(stopping: () -> Unit): VpnRun? = guarded {
         if (current != null) return@guarded null
-        VpnRun(this).also { current = it }
+        VpnRun(this, stopping).also { current = it }
     }
 
     fun <T> guarded(action: () -> T): T = synchronized(lock, action)
 
-    fun release(run: VpnRun): Unit = guarded {
-        if (current === run) current = null
+    fun claim(run: VpnRun): Boolean = guarded {
+        if (current !== run) return@guarded false
         run.finishLocked()
+        current = null
+        true
+    }
+
+    fun release(run: VpnRun, publishTerminal: () -> Unit): Unit = guarded {
+        if (current === run) {
+            run.finishLocked()
+            current = null
+            publishTerminal()
+        }
     }
 }
 
 internal sealed interface VpnRunFailure {
     class Operation(val exception: Exception) : VpnRunFailure
+    data object Foreground : VpnRunFailure
+    data object Status : VpnRunFailure
     data object Stop : VpnRunFailure
     data object Close : VpnRunFailure
+    data object ServiceCleanup : VpnRunFailure
 }
 
 internal interface VpnRunOperations<P : Any, T : Any> {
@@ -40,20 +53,34 @@ internal interface VpnRunOperations<P : Any, T : Any> {
     fun establish(prepared: P): T
     fun start(prepared: P, tunnel: T): Unit
     suspend fun monitor(prepared: P, run: VpnRun): Unit
-    fun stopping(): Unit
     fun stop(): Unit
     fun close(tunnel: T): Unit
+    suspend fun cleanupService(run: VpnRun, complete: (Exception?) -> Unit): Unit
     fun finished(failure: VpnRunFailure?): Unit
 }
 
-internal class VpnRun(private val registry: VpnRunRegistry) {
+internal class VpnRun(
+    private val registry: VpnRunRegistry,
+    private val stopping: () -> Unit,
+) {
     private var stopped = false
     private var finished = false
+    private var statusFailed = false
     private var job: Job? = null
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    fun <P : Any, T : Any> launch(scope: CoroutineScope, operations: VpnRunOperations<P, T>): Job {
-        val job = scope.launch(start = CoroutineStart.ATOMIC) { execute(operations) }
+    fun <P : Any, T : Any> launch(
+        scope: CoroutineScope,
+        operations: VpnRunOperations<P, T>,
+        promote: () -> Unit = {},
+    ): Job {
+        val initialFailure = try {
+            promote()
+            null
+        } catch (_: Exception) {
+            VpnRunFailure.Foreground
+        }
+        val job = scope.launch(start = CoroutineStart.ATOMIC) { execute(operations, initialFailure) }
         attach(job)
         return job
     }
@@ -72,13 +99,24 @@ internal class VpnRun(private val registry: VpnRunRegistry) {
         var pending: Job? = null
         val wasActive = registry.guarded {
             if (finished) false else {
-                stopped = true
+                markStoppingLocked()
                 pending = job
                 true
             }
         }
         pending?.cancel()
         return wasActive
+    }
+
+    private fun markStoppingLocked(): Unit {
+        if (!stopped) {
+            stopped = true
+            try {
+                stopping()
+            } catch (_: Exception) {
+                statusFailed = true
+            }
+        }
     }
 
     fun isActive(): Boolean = registry.guarded { !finished }
@@ -92,6 +130,8 @@ internal class VpnRun(private val registry: VpnRunRegistry) {
         job = null
     }
 
+    fun claimRelease(): Boolean = registry.claim(this)
+
     fun checkActive(): Unit = registry.guarded {
         if (stopped || finished) throw CancellationException("vpn_stopped")
     }
@@ -102,21 +142,26 @@ internal class VpnRun(private val registry: VpnRunRegistry) {
         checkActive()
     }
 
-    private suspend fun <P : Any, T : Any> execute(operations: VpnRunOperations<P, T>): Unit {
+    private suspend fun <P : Any, T : Any> execute(
+        operations: VpnRunOperations<P, T>,
+        initialFailure: VpnRunFailure?,
+    ): Unit {
         var tunnel: T? = null
-        var failure: VpnRunFailure? = null
+        var failure = initialFailure
         try {
-            coroutineContext.ensureActive()
-            checkActive()
-            val prepared = operations.prepare(this)
-            admit()
-            operations.setUnderlying(prepared)
-            admit()
-            tunnel = operations.establish(prepared)
-            admit()
-            operations.start(prepared, tunnel)
-            admit()
-            operations.monitor(prepared, this)
+            if (failure == null) {
+                coroutineContext.ensureActive()
+                checkActive()
+                val prepared = operations.prepare(this)
+                admit()
+                operations.setUnderlying(prepared)
+                admit()
+                tunnel = operations.establish(prepared)
+                admit()
+                operations.start(prepared, tunnel)
+                admit()
+                operations.monitor(prepared, this)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (exception: Exception) {
@@ -124,24 +169,49 @@ internal class VpnRun(private val registry: VpnRunRegistry) {
         } finally {
             withContext(NonCancellable) {
                 try {
+                    val failed = registry.guarded {
+                        markStoppingLocked()
+                        statusFailed
+                    }
+                    if (failed && failure == null) failure = VpnRunFailure.Status
                     try {
-                        operations.stopping()
+                        operations.stop()
+                    } catch (_: Exception) {
+                        failure = VpnRunFailure.Stop
                     } finally {
                         try {
-                            operations.stop()
+                            tunnel?.let { operations.close(it) }
                         } catch (_: Exception) {
-                            failure = VpnRunFailure.Stop
-                        } finally {
-                            try {
-                                tunnel?.let { operations.close(it) }
-                            } catch (_: Exception) {
-                                failure = VpnRunFailure.Close
+                            failure = VpnRunFailure.Close
+                        }
+                    }
+                } finally {
+                    var complete = false
+                    val finish: (Exception?) -> Unit = { exception ->
+                        if (!complete) {
+                            complete = true
+                            if (exception != null && (failure == null || failure is VpnRunFailure.Operation)) {
+                                failure = VpnRunFailure.ServiceCleanup
                             }
                             operations.finished(failure)
                         }
                     }
-                } finally {
-                    registry.release(this@VpnRun)
+                    val fallback: (Exception) -> Unit = { _ ->
+                        if (!complete) {
+                            complete = true
+                            if (failure == null || failure is VpnRunFailure.Operation) {
+                                failure = VpnRunFailure.ServiceCleanup
+                            }
+                            registry.release(this@VpnRun) { operations.finished(failure) }
+                        }
+                    }
+                    try {
+                        operations.cleanupService(this@VpnRun, finish)
+                    } catch (exception: Exception) {
+                        fallback(exception)
+                    } finally {
+                        if (!complete) fallback(IllegalStateException("vpn_cleanup_incomplete"))
+                    }
                 }
             }
         }

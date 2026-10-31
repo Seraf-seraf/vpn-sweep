@@ -16,15 +16,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.seraf.vpnsweep.core.mobile.Mobile
 import com.seraf.vpnsweep.core.mobile.Protector
 import java.io.File
 
 class SweepVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val connectionLock = Any()
-    @Volatile private var connection: VpnRun? = null
-    private var terminated = false
+    private val lifecycle = VpnServiceLifecycle()
 
     override fun onCreate(): Unit {
         super.onCreate()
@@ -34,49 +33,49 @@ class SweepVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lifecycle.started(startId)
         if (intent?.action == STOP) {
-            if (connection?.stop() != true) stopSelf(startId)
+            if (lifecycle.current()?.stop() != true) stopRejected(startId)
             return START_NOT_STICKY
         }
-        if (intent?.action != START || prepare(this) != null) {
-            stopSelf(startId)
+        val epoch = lifecycle.epoch()
+        if (intent?.action != START || epoch == null || prepare(this) != null) {
+            if (lifecycle.current()?.stop() != true) stopRejected(startId)
             return START_NOT_STICKY
         }
-        val run = synchronized(connectionLock) {
-            if (terminated) null else sessions.reserve()?.also { connection = it }
+        val run = lifecycle.reserve(sessions, epoch) {
+            VpnStatus.update(VpnState(VpnPhase.STOPPING, "Отключение…"))
         }
         if (run == null) {
-            if (connection?.isActive() != true) stopSelf(startId)
+            if (!lifecycle.hasActiveConnection()) stopRejected(startId)
             return START_NOT_STICKY
         }
-        try {
+        run.launch(scope, ConnectionOperations()) {
             startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
-        } catch (error: Throwable) {
-            sessions.release(run)
-            throw error
+            run.publishIfActive { VpnStatus.update(VpnState(VpnPhase.CONNECTING, "Подключение…")) }
         }
-        run.publishIfActive { VpnStatus.update(VpnState(VpnPhase.CONNECTING, "Подключение…")) }
-        run.launch(scope, ConnectionOperations())
         return START_NOT_STICKY
     }
 
     override fun onRevoke(): Unit {
-        val run = synchronized(connectionLock) {
-            terminated = true
-            connection
+        val run = lifecycle.beginRevoke()
+        try {
+            run?.stop()
+            super.onRevoke()
+        } finally {
+            lifecycle.endRevoke()
         }
-        run?.stop()
-        super.onRevoke()
     }
 
     override fun onDestroy(): Unit {
-        val run = synchronized(connectionLock) {
-            terminated = true
-            connection
-        }
+        val run = lifecycle.destroy()
         run?.stop()
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun stopRejected(startId: Int): Unit {
+        scope.launch(Dispatchers.Main.immediate) { stopSelfResult(startId) }
     }
 
     private data class Preparation(
@@ -145,13 +144,19 @@ class SweepVpnService : VpnService() {
             }
         }
 
-        override fun stopping(): Unit {
-            VpnStatus.update(VpnState(VpnPhase.STOPPING, "Отключение…"))
-        }
-
         override fun stop(): Unit { Mobile.stop() }
 
         override fun close(tunnel: ParcelFileDescriptor): Unit { tunnel.close() }
+
+        override suspend fun cleanupService(run: VpnRun, complete: (Exception?) -> Unit): Unit {
+            lifecycle.cleanup(
+                run = run,
+                dispatcher = Dispatchers.Main.immediate,
+                stopForeground = { stopForeground(STOP_FOREGROUND_REMOVE) },
+                stopSelf = { startId -> stopSelfResult(startId) },
+                complete = complete,
+            )
+        }
 
         override fun finished(failure: VpnRunFailure?): Unit {
             // Never expose core messages, the configuration or endpoint names.
@@ -165,13 +170,14 @@ class SweepVpnService : VpnService() {
                     "socket_protection_failed" -> "Не удалось защитить сетевой сокет; VPN остановлен"
                     else -> "Не удалось запустить VPN. Проверьте выбранный результат"
                 }
+                VpnRunFailure.Foreground -> "Не удалось запустить VPN-сервис"
+                VpnRunFailure.Status -> "Ошибка обновления состояния VPN"
                 VpnRunFailure.Stop -> "Ошибка остановки ядра"
                 VpnRunFailure.Close -> "Ошибка закрытия VPN-интерфейса"
+                VpnRunFailure.ServiceCleanup -> "Ошибка остановки VPN-сервиса"
                 null -> null
             }
             VpnStatus.update(message?.let { VpnState(VpnPhase.ERROR, it) } ?: VpnState())
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
     }
 
