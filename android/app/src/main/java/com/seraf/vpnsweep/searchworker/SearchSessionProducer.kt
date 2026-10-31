@@ -9,7 +9,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
 import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
 import com.seraf.vpnsweep.searchprotocol.SearchResultReceiptV3
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
-import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV4
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
@@ -41,8 +41,9 @@ internal interface SearchPhaseSession {
 internal class SearchSessionProducer(
     private val cleanupMillis: Long,
     private val createSession: (SearchSnapshotV1, (Long, SearchProgressV1) -> Unit) -> SearchPhaseSession,
+    // Must be a local, nonblocking elapsed-realtime clock, including in tests.
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
-) : SearchSessionPortV3 {
+) : SearchSessionPortV4 {
     private enum class State { STARTING, RUNNING, FINISHING, EMITTING_PAUSE, PAUSED, TERMINAL, UNKNOWN }
     private enum class Control { NONE, PAUSE, CANCEL }
     private class Cancellation(val epoch: Long) {
@@ -55,6 +56,12 @@ internal class SearchSessionProducer(
     private class PauseDelivery {
         val done = CountDownLatch(1)
     }
+    private class UnknownActions(
+        val session: SearchPhaseSession?,
+        val phase: SearchLocalPhase?,
+        val resources: SearchResourceStateV2,
+        val deliver: Boolean,
+    )
     private class Active(val snapshot: SearchSnapshotV1, val observer: SearchSessionObserverV3, epoch: Long) {
         var state = State.STARTING
         var epoch = epoch
@@ -68,6 +75,7 @@ internal class SearchSessionProducer(
         var cancellation: Cancellation? = null
         var watch: ControlWatch? = null
         var pauseDelivery: PauseDelivery? = null
+        var terminal: SearchTerminalV3? = null
         var resources = SearchResourceStateV2.QUARANTINED
     }
 
@@ -93,6 +101,29 @@ internal class SearchSessionProducer(
 
     override fun pause(sessionGeneration: Long, phaseEpoch: Long): Unit = control(sessionGeneration, phaseEpoch, Control.PAUSE)
     override fun cancel(sessionGeneration: Long, phaseEpoch: Long): Unit = control(sessionGeneration, phaseEpoch, Control.CANCEL)
+
+    override fun acceptTerminal(terminal: SearchTerminalV3): Boolean {
+        var failed: Pair<Active, UnknownActions>? = null
+        val accepted = synchronized(lock) {
+            val current = active ?: return false
+            if (current.state != State.TERMINAL || current.terminal !== terminal ||
+                terminal.sessionGeneration != current.snapshot.sessionGeneration || terminal.phaseEpoch != current.epoch
+            ) return false
+            val now = try { nowMillis() } catch (_: Exception) { -1L } catch (_: LinkageError) { -1L }
+            val deadline = current.deadline
+            if (now < 0 || deadline == null || now >= deadline || current.releaseOwner?.acceptRelease() != true) {
+                markUnknown(current, notify = false, watch = null)?.let { failed = current to it }
+                false
+            } else {
+                current.watch?.done?.countDown()
+                current.watch = null
+                active = null
+                true
+            }
+        }
+        failed?.let { (current, actions) -> dispatchUnknown(current, actions) }
+        return accepted
+    }
 
     fun ownerLost(sessionGeneration: Long): Unit {
         val current = synchronized(lock) {
@@ -473,22 +504,9 @@ internal class SearchSessionProducer(
         synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN || current.state == State.TERMINAL) return
             current.state = State.TERMINAL
+            current.terminal = terminal
         }
-        if (!emit(current, terminal)) return
-        val completedAt = nowMillis()
-        val accepted = synchronized(lock) {
-            if (active !== current || current.state != State.TERMINAL) return
-            val deadline = current.deadline
-            if (completedAt < 0 || deadline == null || completedAt >= deadline || current.releaseOwner?.acceptRelease() != true) {
-                false
-            } else {
-                current.watch?.done?.countDown()
-                current.watch = null
-                active = null
-                true
-            }
-        }
-        if (!accepted) unknown(current, notify = false)
+        emit(current, terminal)
     }
 
     private fun emit(current: Active, terminal: SearchTerminalV3): Boolean = try {
@@ -512,24 +530,27 @@ internal class SearchSessionProducer(
     }
 
     private fun unknown(current: Active, notify: Boolean = true, watch: ControlWatch? = null): Unit {
-        var deliver = false
-        val captured = synchronized(lock) {
-            if (active !== current || current.state == State.UNKNOWN ||
-                (watch != null && current.watch !== watch)
-            ) return
-            deliver = notify && current.state != State.TERMINAL
-            blocked = true
-            current.state = State.UNKNOWN
-            current.watch?.done?.countDown()
-            current.watch = null
-            Triple(current.session, current.phase, current.resources)
-        }
-        captured.second?.revoke()
+        val actions = synchronized(lock) { markUnknown(current, notify, watch) } ?: return
+        dispatchUnknown(current, actions)
+    }
+
+    private fun markUnknown(current: Active, notify: Boolean, watch: ControlWatch?): UnknownActions? {
+        if (active !== current || current.state == State.UNKNOWN || (watch != null && current.watch !== watch)) return null
+        val deliver = notify && current.state != State.TERMINAL
+        blocked = true
+        current.state = State.UNKNOWN
+        current.watch?.done?.countDown()
+        current.watch = null
+        return UnknownActions(current.session, current.phase, current.resources, deliver)
+    }
+
+    private fun dispatchUnknown(current: Active, actions: UnknownActions): Unit {
+        actions.phase?.revoke()
         launch {
-            try { captured.first?.quarantine() } catch (_: Exception) { }
-            if (deliver) try {
+            try { actions.session?.quarantine() } catch (_: Exception) { }
+            if (actions.deliver) try {
                 current.observer.onTerminal(SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch,
-                    SearchFailureV1.INTERRUPTED, captured.third, SearchResultFenceV3.UNKNOWN))
+                    SearchFailureV1.INTERRUPTED, actions.resources, SearchResultFenceV3.UNKNOWN))
             } catch (_: Exception) { }
         }
     }

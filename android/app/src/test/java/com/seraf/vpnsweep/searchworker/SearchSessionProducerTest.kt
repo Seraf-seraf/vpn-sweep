@@ -80,6 +80,11 @@ class SearchSessionProducerTest {
             return if (releaseOwner.releaseUntil(deadlineElapsedMillis)) SearchResourceStateV2.RELEASED else SearchResourceStateV2.QUARANTINED
         }
         override fun quarantine(): Unit { releaseOwner.quarantine(); quarantined.incrementAndGet(); quarantineReached.countDown() }
+        fun admissionAvailable(): Boolean {
+            val next = admission.reserve() ?: return false
+            admission.release(next)
+            return true
+        }
     }
 
     private class Observer(private val failTerminal: Boolean = false) : SearchSessionObserverV3 {
@@ -104,10 +109,151 @@ class SearchSessionProducerTest {
     }
 
     private fun snapshot(input: Input): SearchSnapshotV1 = SearchSnapshotV1(7, 11, 13, input)
+    private fun accept(port: SearchSessionPortV3, terminal: SearchTerminalV3): Boolean =
+        (port as? SearchSessionPortV4)?.acceptTerminal(terminal) ?: false
     private fun producer(owner: Owner): SearchSessionProducer = SearchSessionProducer(2_000, { snapshot, _ ->
         snapshot.profiles.open().use { it.readBytes() }
         owner
     }, { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+
+    @Test fun terminalRemainsPendingUntilExactObjectIsAccepted(): Unit {
+        val owner = Owner()
+        val delivered = CountDownLatch(1)
+        val saved = AtomicReference<SearchTerminalV3>()
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { saved.set(value); delivered.countDown() }
+        }
+        val port = producer(owner)
+        assertEquals(SearchStartV3.ACCEPTED, port.start(snapshot(Input()), 1, observer))
+        assertTrue(delivered.await(2, TimeUnit.SECONDS))
+        owner.runThread.get().join(2_000)
+        assertFalse(owner.runThread.get().isAlive)
+        assertFalse("Unit return cannot confirm delivery", owner.admissionAvailable())
+        val exact = saved.get() as SearchTerminalV3.Complete
+        assertFalse(accept(port, exact.copy()))
+        assertFalse(owner.admissionAvailable())
+        assertTrue(accept(port, exact))
+        assertTrue(owner.admissionAvailable())
+        assertFalse(accept(port, exact))
+    }
+
+    @Test fun terminalAcceptedBeforeCallbackThrowsStaysAccepted(): Unit {
+        val owner = Owner()
+        val done = CountDownLatch(1)
+        val accepted = AtomicBoolean()
+        lateinit var port: SearchSessionProducer
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit {
+                accepted.set(accept(port, value))
+                done.countDown()
+                throw IOException("synthetic")
+            }
+        }
+        port = producer(owner)
+        assertEquals(SearchStartV3.ACCEPTED, port.start(snapshot(Input()), 1, observer))
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        owner.runThread.get().join(2_000)
+        assertTrue(accepted.get())
+        assertEquals(0, owner.quarantined.get())
+        assertTrue(owner.admissionAvailable())
+    }
+
+    @Test fun expiredTerminalCannotBeAcceptedOrReleaseAdmission(): Unit {
+        val owner = Owner()
+        val delivered = CountDownLatch(1)
+        val saved = AtomicReference<SearchTerminalV3>()
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { saved.set(value); delivered.countDown() }
+        }
+        val port = SearchSessionProducer(100, { snap, _ -> snap.profiles.open().close(); owner },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        assertEquals(SearchStartV3.ACCEPTED, port.start(snapshot(Input()), 1, observer))
+        assertTrue(delivered.await(2, TimeUnit.SECONDS))
+        assertTrue(owner.quarantineReached.await(2, TimeUnit.SECONDS))
+        assertFalse(accept(port, saved.get()))
+        assertFalse(owner.admissionAvailable())
+    }
+
+    @Test fun terminalCannotUseTimeSampledBeforeWaitingForDecisionLock(): Unit {
+        val owner = Owner()
+        val delivered = CountDownLatch(1)
+        val saved = AtomicReference<SearchTerminalV3>()
+        val clock = java.util.concurrent.atomic.AtomicLong(1_000)
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { saved.set(value); delivered.countDown() }
+        }
+        val port = SearchSessionProducer(2_000, { snap, _ -> snap.profiles.open().close(); owner }, clock::get)
+        assertEquals(SearchStartV3.ACCEPTED, port.start(snapshot(Input()), 1, observer))
+        assertTrue(delivered.await(2, TimeUnit.SECONDS))
+        owner.runThread.get().join(2_000)
+        val decisionLock = checkNotNull(port.javaClass.getDeclaredField("lock").apply { isAccessible = true }.get(port))
+        val started = CountDownLatch(1)
+        val result = AtomicReference<Boolean>()
+        val acceptor = Thread { started.countDown(); result.set(accept(port, saved.get())) }
+        synchronized(decisionLock) {
+            acceptor.start()
+            assertTrue(started.await(1, TimeUnit.SECONDS))
+            val until = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+            while (acceptor.state != Thread.State.BLOCKED && System.nanoTime() < until) Thread.yield()
+            assertEquals(Thread.State.BLOCKED, acceptor.state)
+            clock.set(3_000)
+        }
+        acceptor.join(2_000)
+        assertFalse(acceptor.isAlive)
+        assertEquals(false, result.get())
+        assertTrue(owner.quarantineReached.await(2, TimeUnit.SECONDS))
+        assertFalse(owner.admissionAvailable())
+    }
+
+    @Test fun terminalAcceptanceChecksExactDeadlineBoundary(): Unit {
+        for ((time, expected) in listOf(2_999L to true, 3_000L to false, 3_001L to false)) {
+            val owner = Owner()
+            val delivered = CountDownLatch(1)
+            val saved = AtomicReference<SearchTerminalV3>()
+            val clock = java.util.concurrent.atomic.AtomicLong(1_000)
+            val observer = object : SearchSessionObserverV3 {
+                override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+                override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                    offer.result.open().close()
+                    offer.result.close()
+                    return SearchResultReceiptV3.COMMITTED_CLOSED
+                }
+                override fun onTerminal(value: SearchTerminalV3): Unit { saved.set(value); delivered.countDown() }
+            }
+            val port = SearchSessionProducer(2_000, { snap, _ -> snap.profiles.open().close(); owner }, clock::get)
+            assertEquals(SearchStartV3.ACCEPTED, port.start(snapshot(Input()), 1, observer))
+            assertTrue(delivered.await(2, TimeUnit.SECONDS))
+            owner.runThread.get().join(2_000)
+            clock.set(time)
+            assertEquals(expected, accept(port, saved.get()))
+            if (!expected) assertTrue(owner.quarantineReached.await(2, TimeUnit.SECONDS))
+            assertEquals(expected, owner.admissionAvailable())
+        }
+    }
 
     @Test fun successUsesRealLocalFenceAndTransfersProfilesOnce(): Unit {
         val owner = Owner()

@@ -357,6 +357,7 @@ class SearchMobilePhaseSessionTest {
         val done = CountDownLatch(1)
         val terminal = AtomicReference<SearchTerminalV3>()
         val admissionHeldAtTerminal = AtomicBoolean()
+        lateinit var producer: SearchSessionProducer
         val observer = object : SearchSessionObserverV3 {
             override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
             override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
@@ -371,11 +372,12 @@ class SearchMobilePhaseSessionTest {
                 val competing = admission.reserve()
                 if (competing != null) admission.release(competing)
                 admissionHeldAtTerminal.set(competing == null)
+                check(producer.acceptTerminal(value))
                 terminal.set(value)
                 done.countDown()
             }
         }
-        val producer = SearchSessionProducer(2_000, { snapshot, deliver ->
+        producer = SearchSessionProducer(2_000, { snapshot, deliver ->
             snapshot.profiles.open().use { it.readBytes() }
             val progress = SearchMobilePhaseProgress(clock, deliver)
             SearchMobilePhaseSession({}, {
