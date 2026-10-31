@@ -98,15 +98,22 @@ func (c *searchDNSConn) query(packet []byte) (response []byte, err error) {
 			response, err = nil, errors.New("search_network_unavailable")
 		}
 	}()
+	if !searchCurrent(c.owner) {
+		return nil, errors.New("search_network_unavailable")
+	}
+	if err := c.ctx.Err(); err != nil {
+		return nil, err
+	}
 	remaining := remainingMillis(c.ctx)
 	if remaining == 0 {
 		return nil, context.DeadlineExceeded
 	}
 	response, err = c.owner.search.QueryDNS(packet, remaining)
+	current := searchCurrent(c.owner)
 	if contextErr := c.ctx.Err(); contextErr != nil {
 		return nil, contextErr
 	}
-	if err != nil || !searchCurrent(c.owner) {
+	if err != nil || !current {
 		c.owner.revokeSearch()
 		return nil, errors.New("search_network_unavailable")
 	}

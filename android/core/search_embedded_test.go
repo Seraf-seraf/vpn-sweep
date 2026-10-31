@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
@@ -15,6 +17,77 @@ type fakeEmbeddedCore struct {
 	closes       atomic.Int32
 	closeEntered chan struct{}
 	closeRelease chan struct{}
+}
+
+type blockedCurrentNetwork struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (n *blockedCurrentNetwork) Current() bool {
+	n.once.Do(func() { close(n.entered) })
+	<-n.release
+	return true
+}
+func (*blockedCurrentNetwork) QueryDNS([]byte, int64) ([]byte, error)    { return nil, nil }
+func (*blockedCurrentNetwork) AllowSocket(int, int, string, string) bool { return false }
+
+func TestAndroidSearchEmbeddedBlockedEpochCheckQuarantinesWithinBudget(t *testing.T) {
+	owner := &blockedCurrentNetwork{entered: make(chan struct{}), release: make(chan struct{})}
+	ownerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	guard := &protection{search: owner, searchContext: ownerCtx, searchCancel: cancel}
+	previous := activeProtection.Swap(guard)
+	defer activeProtection.Store(previous)
+	worker := newSearchEmbeddedWorker(guard, func(ctx context.Context, _ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	})
+	profile, params := embeddedInput(t)
+	done := make(chan int, 1)
+	go func() { done <- worker.OpenStatus(profile, params, 20, 20) }()
+	<-owner.entered
+	select {
+	case got := <-done:
+		close(owner.release)
+		if got != SearchWorkerCleanupIncomplete {
+			t.Fatalf("blocked owner status=%d", got)
+		}
+	case <-time.After(time.Second):
+		close(owner.release)
+		<-done
+		t.Fatal("blocked owner exceeded startup and cleanup budgets")
+	}
+	if err := worker.Close(1000); err != nil {
+		t.Fatal("released owner did not finish cleanup", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedStartupBudgetQuarantinesBlockedStart(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		close(entered)
+		<-release
+		return nil, nil, errSearchCoreCreation
+	})
+	profile, params := embeddedInput(t)
+	done := make(chan error, 1)
+	go func() { done <- worker.Open(profile, params, 20, 20) }()
+	<-entered
+	select {
+	case err := <-done:
+		close(release)
+		if err == nil || err.Error() != "worker_cleanup_incomplete" {
+			t.Fatalf("blocked start reported confirmed cleanup: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-done
+		t.Fatal("Open exceeded startup and cleanup budgets")
+	}
 }
 
 func (c *fakeEmbeddedCore) Close() error {
@@ -40,7 +113,7 @@ func TestAndroidSearchEmbeddedWorkerOneStartAndCleanup(t *testing.T) {
 	_, guard := installFakeOwner(t)
 	instance := &fakeEmbeddedCore{}
 	starts := 0
-	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
+	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
 		starts++
 		probes, err := newSearchWorkerProbes("127.0.0.1:1080", "user", "password")
 		return instance, probes, err
@@ -70,7 +143,7 @@ func TestAndroidSearchEmbeddedWorkerOneStartAndCleanup(t *testing.T) {
 func TestAndroidSearchEmbeddedOpenCleansPartialStart(t *testing.T) {
 	_, guard := installFakeOwner(t)
 	instance := &fakeEmbeddedCore{}
-	worker := newSearchEmbeddedWorker(guard, func(context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
 		return instance, nil, errors.New("search_core_start_failed")
 	})
 	profile, params := embeddedInput(t)
@@ -84,7 +157,7 @@ func TestAndroidSearchEmbeddedOpenCleansPartialStart(t *testing.T) {
 
 func TestAndroidSearchEmbeddedUnknownCoreCleanupStaysQuarantined(t *testing.T) {
 	_, guard := installFakeOwner(t)
-	worker := newSearchEmbeddedWorker(guard, func(context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
 		return nil, nil, errSearchCoreCreation
 	})
 	profile, params := embeddedInput(t)
@@ -100,7 +173,7 @@ func TestAndroidSearchEmbeddedCancelDuringStartCleansBeforeReturn(t *testing.T) 
 	_, guard := installFakeOwner(t)
 	instance := &fakeEmbeddedCore{}
 	started := make(chan struct{})
-	worker := newSearchEmbeddedWorker(guard, func(ctx context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
+	worker := newSearchEmbeddedWorker(guard, func(ctx context.Context, _ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
 		close(started)
 		<-ctx.Done()
 		return instance, nil, errors.New("search_start_interrupted")
@@ -118,7 +191,7 @@ func TestAndroidSearchEmbeddedCancelDuringStartCleansBeforeReturn(t *testing.T) 
 func TestAndroidSearchEmbeddedCloseTimeoutDoesNotConfirmCleanup(t *testing.T) {
 	_, guard := installFakeOwner(t)
 	instance := &fakeEmbeddedCore{closeEntered: make(chan struct{}), closeRelease: make(chan struct{})}
-	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
+	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
 		probes, err := newSearchWorkerProbes("127.0.0.1:1080", "user", "password")
 		return instance, probes, err
 	})
@@ -138,14 +211,61 @@ func TestAndroidSearchEmbeddedCloseTimeoutDoesNotConfirmCleanup(t *testing.T) {
 	}
 }
 
-func TestAndroidSearchEmbeddedProductionStartFailsClosedWithoutResolver(t *testing.T) {
-	owner, guard := installFakeOwner(t)
-	worker := newSearchEmbeddedWorker(guard, startSearchEmbedded)
+func TestAndroidSearchEmbeddedUnrecognizedStartErrorIsSanitized(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		return nil, nil, errors.New("private payload must not escape")
+	})
 	profile, params := embeddedInput(t)
-	if err := worker.Open(profile, params, 1000, 1000); err == nil || err.Error() != "search_resolver_unavailable" {
-		t.Fatalf("unavailable resolver was accepted: %v", err)
+	if err := worker.Open(profile, params, 1000, 1000); err == nil || err.Error() != "search_worker_unavailable" {
+		t.Fatalf("unrecognized error was not sanitized: %v", err)
 	}
-	if len(owner.roles) != 0 {
-		t.Fatal("disabled start created a socket")
+}
+
+func TestAndroidSearchEmbeddedAttemptExpiryCancelsProbes(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeEmbeddedCore{}
+	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		probes, err := newSearchWorkerProbes("127.0.0.1:1080", "user", "password")
+		return instance, probes, err
+	})
+	worker.cancel()
+	worker.ctx, worker.cancel = context.WithTimeout(guard.searchContext, 100*time.Millisecond)
+	profile, params := embeddedInput(t)
+	if err := worker.Open(profile, params, 1000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	probes, err := worker.Probes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-worker.ctx.Done()
+	select {
+	case <-probes.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expired attempt did not cancel probes")
+	}
+	if _, err := worker.Probes(); err == nil {
+		t.Fatal("expired attempt exposed probes")
+	}
+	if err := worker.Close(1000); err != nil || instance.closes.Load() != 1 {
+		t.Fatal("expired attempt was not cleaned", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedStatusPreservesTypedRetryability(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		_, guard := installFakeOwner(t)
+		worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+			return nil, nil, &model.Error{Code: "core_start_failed", Phase: "core", Retryable: retry}
+		})
+		profile, params := embeddedInput(t)
+		want := SearchWorkerCandidateStartFailed
+		if retry {
+			want |= SearchWorkerRetryableFlag
+		}
+		if status := worker.OpenStatus(profile, params, 1000, 1000); status != want {
+			t.Fatalf("retry=%v status=%d want=%d", retry, status, want)
+		}
 	}
 }

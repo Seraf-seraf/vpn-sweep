@@ -17,9 +17,81 @@ const (
 )
 
 type searchCore interface{ Close() error }
-type searchStarter func(context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error)
+type searchStarter func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error)
 
-var errSearchCoreCreation = errors.New("search_core_initialization_failed")
+var (
+	errSearchCoreCreation    = errors.New("search_core_initialization_failed")
+	errSearchResourceCleanup = errors.New("worker_cleanup_incomplete")
+	errInvalidSearchInput    = errors.New("invalid_search_input")
+)
+
+type searchEmbeddedError struct{ status int }
+
+func (e *searchEmbeddedError) Error() string {
+	switch e.status &^ SearchWorkerRetryableFlag {
+	case SearchWorkerBusy:
+		return "search_worker_already_used"
+	case SearchWorkerOwnerLost:
+		return "search_owner_lost"
+	case SearchWorkerCleanupIncomplete:
+		return "worker_cleanup_incomplete"
+	case SearchWorkerCapabilityUnavailable:
+		return "worker_capability_unavailable"
+	case SearchWorkerCandidateConfigRejected:
+		return "core_config_rejected"
+	case SearchWorkerCandidateStartFailed:
+		return "core_start_failed"
+	case SearchWorkerCandidateStartTimeout:
+		return "core_start_timeout"
+	case SearchWorkerCandidateExitedBeforeReady:
+		return "core_exited_before_ready"
+	case SearchWorkerCancelled:
+		return "search_start_interrupted"
+	case SearchWorkerDeadline:
+		return "search_attempt_deadline"
+	default:
+		return "search_worker_unavailable"
+	}
+}
+
+func searchEmbeddedStatus(err error) int {
+	if err == nil {
+		return SearchWorkerReady
+	}
+	var result *searchEmbeddedError
+	if errors.As(err, &result) {
+		return result.status
+	}
+	return SearchWorkerUnavailable
+}
+
+func sanitizeSearchEmbeddedError(err error) error {
+	var failure *model.Error
+	if errors.As(err, &failure) && failure != nil {
+		var status int
+		switch failure.Code {
+		case "core_config_rejected":
+			status = SearchWorkerCandidateConfigRejected
+		case "core_start_failed":
+			status = SearchWorkerCandidateStartFailed
+		case "core_start_timeout":
+			status = SearchWorkerCandidateStartTimeout
+		case "core_exited_before_ready":
+			status = SearchWorkerCandidateExitedBeforeReady
+		default:
+			return &searchEmbeddedError{SearchWorkerUnavailable}
+		}
+		if failure.Retryable {
+			status |= SearchWorkerRetryableFlag
+		}
+		return &searchEmbeddedError{status}
+	}
+	var result *searchEmbeddedError
+	if errors.As(err, &result) && result != nil {
+		return result
+	}
+	return &searchEmbeddedError{SearchWorkerUnavailable}
+}
 
 type SearchEmbeddedWorker struct {
 	mu                 sync.Mutex
@@ -34,6 +106,7 @@ type SearchEmbeddedWorker struct {
 	closeDone          chan struct{}
 	core               searchCore
 	probes             *SearchWorkerProbes
+	startErr           error
 	closeErr           error
 	unknownCoreCleanup bool
 }
@@ -62,64 +135,136 @@ func newSearchEmbeddedWorker(owner *protection, start searchStarter) *SearchEmbe
 }
 
 func (w *SearchEmbeddedWorker) Open(profileBytes, parameterBytes []byte, startupMillis, cleanupMillis int64) error {
+	return w.open(profileBytes, parameterBytes, startupMillis, cleanupMillis)
+}
+
+func (w *SearchEmbeddedWorker) OpenStatus(profileBytes, parameterBytes []byte, startupMillis, cleanupMillis int64) int {
+	return searchEmbeddedStatus(w.open(profileBytes, parameterBytes, startupMillis, cleanupMillis))
+}
+
+func (w *SearchEmbeddedWorker) open(profileBytes, parameterBytes []byte, startupMillis, cleanupMillis int64) error {
 	w.mu.Lock()
 	if w.started || w.closing {
 		w.mu.Unlock()
-		return errors.New("search_worker_already_used")
+		return &searchEmbeddedError{SearchWorkerBusy}
 	}
 	w.started = true
 	w.mu.Unlock()
+	startedAt := time.Now()
 
 	var profile model.Profile
 	var params map[string]any
-	var instance searchCore
-	var probes *SearchWorkerProbes
 	var err error
-	if len(profileBytes) == 0 || len(profileBytes) > importer.MaxInputBytes ||
+	launched := false
+	if len(profileBytes) == 0 || len(profileBytes) > importer.MaxInputBytes || len(parameterBytes) > importer.MaxInputBytes ||
 		model.Decode(profileBytes, &profile) != nil || model.Decode(parameterBytes, &params) != nil ||
 		params == nil || importer.Validate(profile) != nil || capability.Check(profile, params) != nil ||
 		startupMillis < 1 || startupMillis > maxSearchStartupMillis || cleanupMillis < 1 || cleanupMillis > maxSearchCleanupMillis {
-		err = errors.New("invalid_search_input")
-	} else if !searchCurrent(w.owner) {
-		err = errors.New("search_owner_lost")
+		err = errInvalidSearchInput
+	} else if searchEmbeddedOwnerLost(w.owner) {
+		err = &searchEmbeddedError{SearchWorkerOwnerLost}
 	} else {
-		ctx, cancel := context.WithTimeout(w.ctx, time.Duration(startupMillis)*time.Millisecond)
-		instance, probes, err = w.start(ctx, w.owner, profile, params)
-		if err == nil && ctx.Err() != nil {
-			err = errors.New("search_start_interrupted")
+		ctx, cancel := context.WithDeadline(w.ctx, startedAt.Add(time.Duration(startupMillis)*time.Millisecond))
+		if ctx.Err() == nil {
+			launched = true
+			go w.startCore(ctx, profile, params)
+			select {
+			case <-w.openDone:
+			case <-ctx.Done():
+			}
+		}
+		if searchEmbeddedOwnerLost(w.owner) {
+			err = &searchEmbeddedError{SearchWorkerOwnerLost}
+		} else {
+			w.mu.Lock()
+			if errors.Is(w.ctx.Err(), context.DeadlineExceeded) {
+				err = &searchEmbeddedError{SearchWorkerDeadline}
+			} else if w.ctx.Err() != nil {
+				err = &searchEmbeddedError{SearchWorkerCancelled}
+			} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				err = &searchEmbeddedError{SearchWorkerCandidateStartTimeout}
+			} else if w.startErr != nil {
+				err = sanitizeSearchEmbeddedError(w.startErr)
+			} else if w.core == nil || w.probes == nil || w.closing {
+				err = &searchEmbeddedError{SearchWorkerUnavailable}
+			} else {
+				w.ready = true
+			}
+			w.mu.Unlock()
 		}
 		cancel()
 	}
-	current := searchCurrent(w.owner)
-	w.mu.Lock()
-	w.core, w.probes = instance, probes
-	w.unknownCoreCleanup = errors.Is(err, errSearchCoreCreation)
-	if err == nil && (instance == nil || probes == nil || w.closing || w.ctx.Err() != nil || !current) {
-		err = errors.New("search_start_interrupted")
-	}
-	if err == nil {
-		w.ready = true
-	}
-	close(w.openDone)
-	w.mu.Unlock()
 	if err != nil {
+		if !launched {
+			w.mu.Lock()
+			close(w.openDone)
+			w.mu.Unlock()
+		}
+		if cleanupMillis < 1 || cleanupMillis > maxSearchCleanupMillis {
+			w.cancel()
+			return err
+		}
 		if closeErr := w.Close(cleanupMillis); closeErr != nil {
-			return closeErr
+			return &searchEmbeddedError{SearchWorkerCleanupIncomplete}
 		}
 		return err
 	}
 	return nil
 }
 
+func searchEmbeddedOwnerLost(owner *protection) bool {
+	if owner == nil || owner.search == nil {
+		return true
+	}
+	if activeProtection.Load() != owner {
+		owner.revokeSearch()
+		return true
+	}
+	return owner.searchRevoked.Load()
+}
+
+func (w *SearchEmbeddedWorker) startCore(ctx context.Context, profile model.Profile, params map[string]any) {
+	var instance searchCore
+	var probes *SearchWorkerProbes
+	var err error
+	defer func() {
+		if recover() != nil {
+			instance, probes, err = nil, nil, errSearchCoreCreation
+		}
+		w.mu.Lock()
+		w.core, w.probes, w.startErr = instance, probes, err
+		w.unknownCoreCleanup = errors.Is(err, errSearchCoreCreation) || errors.Is(err, errSearchResourceCleanup)
+		if probes != nil {
+			context.AfterFunc(w.ctx, probes.Cancel)
+		}
+		close(w.openDone)
+		w.mu.Unlock()
+	}()
+	if err = ctx.Err(); err != nil {
+		return
+	}
+	if !searchCurrent(w.owner) {
+		err = &searchEmbeddedError{SearchWorkerOwnerLost}
+		return
+	}
+	if err = ctx.Err(); err != nil {
+		return
+	}
+	instance, probes, err = w.start(ctx, w.ctx, w.owner, profile, params)
+	if err == nil && ctx.Err() == nil && !searchCurrent(w.owner) {
+		err = &searchEmbeddedError{SearchWorkerOwnerLost}
+	}
+}
+
 func (w *SearchEmbeddedWorker) Probes() (*SearchWorkerProbes, error) {
 	w.mu.Lock()
-	if !w.ready || w.closing {
+	if !w.ready || w.closing || w.ctx.Err() != nil {
 		w.mu.Unlock()
 		return nil, errors.New("search_worker_not_ready")
 	}
 	probes := w.probes
 	w.mu.Unlock()
-	if !searchCurrent(w.owner) {
+	if !searchCurrent(w.owner) || w.ctx.Err() != nil {
 		return nil, errors.New("search_worker_not_ready")
 	}
 	return probes, nil
@@ -129,8 +274,8 @@ func (w *SearchEmbeddedWorker) Cancel() {
 	w.mu.Lock()
 	w.ready = false
 	probes := w.probes
-	w.mu.Unlock()
 	w.cancel()
+	w.mu.Unlock()
 	if probes != nil {
 		probes.Cancel()
 	}
@@ -176,22 +321,23 @@ func (w *SearchEmbeddedWorker) closeResources() {
 	w.mu.Lock()
 	instance, probes, unknown := w.core, w.probes, w.unknownCoreCleanup
 	w.mu.Unlock()
+	var err error
+	defer func() {
+		if recover() != nil {
+			err = errors.New("worker_cleanup_incomplete")
+		}
+		w.mu.Lock()
+		w.closeErr = err
+		close(w.closeDone)
+		w.mu.Unlock()
+	}()
 	if probes != nil {
 		probes.Cancel()
 	}
-	var err error
 	if unknown {
 		err = errors.New("worker_cleanup_incomplete")
 	}
 	if instance != nil && instance.Close() != nil {
 		err = errors.New("worker_cleanup_incomplete")
 	}
-	w.mu.Lock()
-	w.closeErr = err
-	close(w.closeDone)
-	w.mu.Unlock()
-}
-
-func startSearchEmbedded(context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
-	return nil, nil, errors.New("search_resolver_unavailable")
 }

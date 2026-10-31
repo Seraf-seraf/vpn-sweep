@@ -7,11 +7,123 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+type changingDNSOwner struct {
+	current    atomic.Bool
+	calls      atomic.Int32
+	loseOnCall bool
+}
+
+type fakeRemainingContext struct {
+	context.Context
+	millis atomic.Int64
+}
+
+func (c *fakeRemainingContext) Deadline() (time.Time, bool) {
+	return time.Now().Add(time.Duration(c.millis.Load()) * time.Millisecond), true
+}
+
+type blockedBudgetDNSOwner struct {
+	block   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+	budget  chan int64
+}
+
+func (o *blockedBudgetDNSOwner) Current() bool {
+	if o.block.Swap(false) {
+		close(o.entered)
+		<-o.release
+	}
+	return true
+}
+func (*blockedBudgetDNSOwner) AllowSocket(int, int, string, string) bool { return false }
+func (o *blockedBudgetDNSOwner) QueryDNS(_ []byte, remaining int64) ([]byte, error) {
+	o.budget <- remaining
+	return nil, nil
+}
+
+func TestAndroidSearchDNSRecomputesRemainingAfterBlockedEpochCheck(t *testing.T) {
+	owner := &blockedBudgetDNSOwner{entered: make(chan struct{}), release: make(chan struct{}), budget: make(chan int64, 1)}
+	ownerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	round, stop := context.WithTimeout(ownerCtx, time.Minute)
+	defer stop()
+	guard := &protection{search: owner, searchContext: ownerCtx, searchCancel: cancel, searchRound: round}
+	previous := activeProtection.Swap(guard)
+	defer activeProtection.Store(previous)
+	raw, err := searchDNSConnection(round, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	conn := raw.(*searchDNSConn)
+	clock := &fakeRemainingContext{Context: conn.ctx}
+	clock.millis.Store(60000)
+	conn.ctx = clock
+	owner.block.Store(true)
+	done := make(chan error, 1)
+	go func() { _, err := conn.query([]byte{1}); done <- err }()
+	<-owner.entered
+	clock.millis.Store(10000)
+	close(owner.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if remaining := <-owner.budget; remaining < 9000 || remaining > 10000 {
+		t.Fatalf("callback received stale budget: %d", remaining)
+	}
+}
+
+func (o *changingDNSOwner) Current() bool                           { return o.current.Load() }
+func (*changingDNSOwner) AllowSocket(int, int, string, string) bool { return false }
+func (o *changingDNSOwner) QueryDNS([]byte, int64) ([]byte, error) {
+	o.calls.Add(1)
+	if o.loseOnCall {
+		o.current.Store(false)
+	}
+	return nil, nil
+}
+
+func TestAndroidSearchDNSRechecksEpochAroundCallback(t *testing.T) {
+	for _, loseOnCall := range []bool{false, true} {
+		t.Run(fmt.Sprint(loseOnCall), func(t *testing.T) {
+			owner := &changingDNSOwner{loseOnCall: loseOnCall}
+			owner.current.Store(true)
+			ownerCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			round, stop := context.WithTimeout(ownerCtx, time.Second)
+			defer stop()
+			guard := &protection{search: owner, searchContext: ownerCtx, searchCancel: cancel, searchRound: round}
+			previous := activeProtection.Swap(guard)
+			defer activeProtection.Store(previous)
+			conn, err := searchDNSConnection(round, guard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if !loseOnCall {
+				owner.current.Store(false)
+			}
+			if _, err := conn.(*searchDNSConn).query([]byte{1}); err == nil {
+				t.Fatal("stale epoch accepted")
+			}
+			want := int32(0)
+			if loseOnCall {
+				want = 1
+			}
+			if owner.calls.Load() != want || guard.current() {
+				t.Fatal("callback used a stale epoch or failed to revoke it")
+			}
+		})
+	}
+}
 
 type fakeRawDNSOwner struct {
 	mu        sync.Mutex
