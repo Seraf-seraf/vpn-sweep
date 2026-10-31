@@ -39,8 +39,12 @@ type completion struct {
 }
 
 func verify(dir string, c completion) error {
+	return verifyWith(dir, c, private.Read)
+}
+
+func verifyWith(dir string, c completion, read func(string, int64) ([]byte, error)) error {
 	for name, want := range map[string]string{"working.json": c.ConfigSHA256, "report.json": c.ReportSHA256, "verification.json": c.VerificationSHA256} {
-		b, e := private.Read(filepath.Join(dir, name), 16<<20)
+		b, e := read(filepath.Join(dir, name), 16<<20)
 		if e != nil {
 			return e
 		}
@@ -53,6 +57,10 @@ func verify(dir string, c completion) error {
 }
 
 func readCompletion(dir string) (completion, bool, error) {
+	return readCompletionWith(dir, private.Read)
+}
+
+func readCompletionWith(dir string, read func(string, int64) ([]byte, error)) (completion, bool, error) {
 	var c completion
 	path := filepath.Join(dir, "COMPLETE.json")
 	if _, err := os.Lstat(path); os.IsNotExist(err) {
@@ -60,14 +68,14 @@ func readCompletion(dir string) (completion, bool, error) {
 	} else if err != nil {
 		return c, false, model.Err("export_unavailable", "export")
 	}
-	b, err := private.Read(path, 4096)
+	b, err := read(path, 4096)
 	if err != nil {
 		return c, false, err
 	}
 	if model.Decode(b, &c) != nil || c.Version != 1 || c.CandidateID == "" {
 		return c, false, model.Err("export_integrity_failed", "export")
 	}
-	if err = verify(dir, c); err != nil {
+	if err = verifyWith(dir, c, read); err != nil {
 		return c, false, err
 	}
 	return c, true, nil
@@ -125,6 +133,10 @@ func SafeDirectory(path string) (string, error) {
 	if e != nil {
 		return "", e
 	}
+	return safeResolvedDirectory(d)
+}
+
+func safeResolvedDirectory(d string) (string, error) {
 	real, e := filepath.EvalSymlinks(d)
 	if e != nil {
 		return "", model.Err("output_unavailable", "export")

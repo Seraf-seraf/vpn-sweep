@@ -126,10 +126,32 @@ func Canonical(params map[string]any) map[string]any {
 	return out
 }
 
+func fragmentParameters(p model.Profile, params map[string]any) map[string]any {
+	if p.Fragment == nil {
+		return params
+	}
+	if _, explicit := params["fragment"]; explicit {
+		return params
+	}
+	out := make(map[string]any, len(params)+4)
+	for k, v := range params {
+		out[k] = v
+	}
+	out["fragment"] = true
+	out["length"] = p.Fragment.Length
+	out["interval"] = p.Fragment.Interval
+	out["packets"] = p.Fragment.Packets
+	delete(out, "maxSplit")
+	if p.Fragment.MaxSplit != nil {
+		out["maxSplit"] = *p.Fragment.MaxSplit
+	}
+	return out
+}
+
 // Effective resolves client defaults from the same Mux settings used by Render.
 // Explicit mux replaces source settings; omitted mux preserves the imported baseline.
 func Effective(p model.Profile, params map[string]any) map[string]any {
-	q := Canonical(params)
+	q := Canonical(fragmentParameters(p, params))
 	if q["fragment"] == nil {
 		q["fragment"] = false
 	}
@@ -188,31 +210,54 @@ func Normalize(name string, v any) any {
 	}
 	return v
 }
+
+func checkFragmentSettings(sec, network string, params map[string]any) error {
+	if params["fragment"] != true {
+		return nil
+	}
+	if network != "" && network != "tcp" && network != "raw" && network != "ws" && network != "grpc" {
+		return model.Err("fragment_not_applicable", "capability")
+	}
+	if params["length"] == nil || params["interval"] == nil || params["packets"] == nil {
+		return model.Err("missing_fragment_fields", "capability")
+	}
+	if params["packets"] == "tlshello" && sec != "tls" && sec != "reality" {
+		return model.Err("tlshello_not_applicable", "capability")
+	}
+	return nil
+}
+
 func Check(p model.Profile, params map[string]any) error {
 	if e := importer.Validate(p); e != nil {
 		return e
+	}
+	s, _ := p.Outbound["streamSettings"].(map[string]any)
+	sec, _ := s["security"].(string)
+	network, _ := s["network"].(string)
+	if p.Fragment != nil {
+		source := fragmentParameters(p, nil)
+		for _, k := range []string{"fragment", "length", "interval", "packets", "maxSplit"} {
+			if v, exists := source[k]; exists {
+				if e := ValidateValue(k, v); e != nil {
+					return e
+				}
+			}
+		}
+		if e := checkFragmentSettings(sec, network, source); e != nil {
+			return e
+		}
 	}
 	for k, v := range params {
 		if e := ValidateValue(k, v); e != nil {
 			return e
 		}
 	}
-	s, _ := p.Outbound["streamSettings"].(map[string]any)
-	sec, _ := s["security"].(string)
-	network, _ := s["network"].(string)
+	params = fragmentParameters(p, params)
 	if params["fingerprint"] != nil && sec != "tls" && sec != "reality" {
 		return model.Err("fingerprint_not_applicable", "capability")
 	}
-	if params["fragment"] == true {
-		if network != "" && network != "tcp" && network != "raw" && network != "ws" && network != "grpc" {
-			return model.Err("fragment_not_applicable", "capability")
-		}
-		if params["length"] == nil || params["interval"] == nil || params["packets"] == nil {
-			return model.Err("missing_fragment_fields", "capability")
-		}
-		if params["packets"] == "tlshello" && sec != "tls" && sec != "reality" {
-			return model.Err("tlshello_not_applicable", "capability")
-		}
+	if e := checkFragmentSettings(sec, network, params); e != nil {
+		return e
 	}
 	proto := p.Outbound["protocol"]
 	sourceMux, _ := p.Outbound["mux"].(map[string]any)
@@ -251,7 +296,7 @@ func Check(p model.Profile, params map[string]any) error {
 // Render preserves the source server outbound, replacing only declared client settings.
 // The only direct Freedom outbound is a dialer for the endpoint, never a route for probes.
 func Render(p model.Profile, params map[string]any, socksAddr, user, pass string) ([]byte, error) {
-	params = Canonical(params)
+	params = Canonical(fragmentParameters(p, params))
 	if e := Check(p, params); e != nil {
 		return nil, e
 	}

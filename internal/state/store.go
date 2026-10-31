@@ -390,8 +390,11 @@ func (s *Store) History(w io.Writer) error {
 	return scanner.Err()
 }
 func (s *Store) SaveManifest(m model.Manifest, profiles []model.Profile, key []byte) error {
-	if m.Version != model.SchemaVersion {
+	if m.Version != model.SchemaVersion && m.Version != model.FragmentProfileSchemaVersion {
 		return model.Err("unsupported_manifest_version", "state")
+	}
+	if !model.SupportsProfileSchemaVersion(m.Version, profiles) {
+		return model.Err("profile_schema_mismatch", "state")
 	}
 	for _, name := range []string{"manifest.json", "profiles.json", "identity.key"} {
 		if _, e := os.Lstat(filepath.Join(s.Dir, name)); e == nil {
@@ -414,7 +417,7 @@ func (s *Store) LoadManifest() (model.Manifest, []model.Profile, []byte, error) 
 		return m, p, nil, e
 	}
 	var envelope manifestEnvelope
-	if e = model.Decode(b, &envelope); e != nil || envelope.Manifest.Version != model.SchemaVersion {
+	if e = model.Decode(b, &envelope); e != nil || (envelope.Manifest.Version != model.SchemaVersion && envelope.Manifest.Version != model.FragmentProfileSchemaVersion) {
 		return m, p, nil, model.Err("unsupported_manifest_version", "state")
 	}
 	m = envelope.Manifest
@@ -424,6 +427,9 @@ func (s *Store) LoadManifest() (model.Manifest, []model.Profile, []byte, error) 
 	}
 	if e = model.Decode(b, &p); e != nil {
 		return m, p, nil, e
+	}
+	if !model.SupportsProfileSchemaVersion(m.Version, p) {
+		return m, p, nil, model.Err("profile_schema_mismatch", "state")
 	}
 	k, e := private.Read(filepath.Join(s.Dir, "identity.key"), 32)
 	if e != nil || len(k) != 32 {

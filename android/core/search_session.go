@@ -61,6 +61,9 @@ type SearchSession struct {
 	store         *state.Store
 	stagingDir    string
 	cancel        context.CancelFunc
+	phaseEpoch    int64
+	phaseContext  context.Context
+	phaseCancel   context.CancelFunc
 	closed        bool
 	running       bool
 	resultReady   bool
@@ -131,7 +134,7 @@ func NewSearchSession(generation int64, manifestBytes, profileBytes []byte, stat
 
 func (s *SearchSession) Run() (string, error) {
 	s.mu.Lock()
-	if s.closed || s.running || s.openingResult || s.resultReady || s.resultClaimed {
+	if s.closed || s.running || s.phaseContext != nil || s.openingResult || s.resultReady || s.resultClaimed {
 		s.mu.Unlock()
 		return "busy", errors.New("search_busy")
 	}
@@ -139,11 +142,55 @@ func (s *SearchSession) Run() (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.mu.Unlock()
+	return s.runContext(ctx, cancel, false)
+}
+
+func (s *SearchSession) PreparePhase(epoch int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if epoch <= 0 || epoch <= s.phaseEpoch || s.closed || s.running || s.phaseContext != nil ||
+		s.openingResult || s.resultReady || s.resultClaimed {
+		return errors.New("search_busy")
+	}
+	s.phaseEpoch = epoch
+	s.phaseContext, s.phaseCancel = context.WithCancel(context.Background())
+	return nil
+}
+
+func (s *SearchSession) RunPhase(epoch int64) (string, error) {
+	s.mu.Lock()
+	if s.closed || s.running || s.phaseContext == nil || s.phaseEpoch != epoch ||
+		s.openingResult || s.resultReady || s.resultClaimed {
+		s.mu.Unlock()
+		return "busy", errors.New("search_busy")
+	}
+	ctx, cancel := s.phaseContext, s.phaseCancel
+	s.running = true
+	s.cancel = cancel
+	s.mu.Unlock()
+	return s.runContext(ctx, cancel, true)
+}
+
+func (s *SearchSession) CancelPhase(epoch int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phaseContext == nil || s.phaseEpoch != epoch {
+		return false
+	}
+	s.phaseCancel()
+	return true
+}
+
+func (s *SearchSession) runContext(ctx context.Context, cancel context.CancelFunc, phase bool) (string, error) {
 	status, err := s.runner.Run(ctx)
 	cancel()
 	s.mu.Lock()
 	s.running = false
 	s.cancel = nil
+	if phase {
+		s.phaseContext = nil
+		s.phaseCancel = nil
+	}
 	s.resultReady = err == nil && status == "success"
 	s.mu.Unlock()
 	if err != nil {
@@ -164,7 +211,7 @@ func (s *SearchSession) Cancel() {
 func (s *SearchSession) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running || s.openingResult {
+	if s.running || s.phaseContext != nil || s.openingResult {
 		return errors.New("search_still_running")
 	}
 	if s.closed {
