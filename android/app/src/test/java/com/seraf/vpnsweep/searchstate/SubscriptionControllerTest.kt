@@ -248,6 +248,66 @@ class SubscriptionControllerTest {
     }
 
     @Test
+    fun startExceptionFailsRequestAndAllowsRetry(): Unit {
+        val port = FakeSubscriptionPort()
+        val controller = legacyController(port, search(), { true }, { true }, { ResultRevision("1", "2") })
+        port.onStart = { _, _ -> throw IllegalStateException("synthetic") }
+
+        val failed = controller.loadWithReceipt("synthetic")
+
+        assertEquals(SubscriptionStartV1.REJECTED, failed.status)
+        assertNull(failed.generation)
+        assertEquals(SubscriptionPhase.FAILED, controller.state.value.phase)
+        assertEquals(SubscriptionFailureV1.INTERNAL, controller.state.value.failure)
+        assertFalse(controller.state.value.requestActive)
+        assertEquals(1L, controller.state.value.generation)
+
+        port.onStart = { _, _ -> }
+        val retry = controller.loadWithReceipt("synthetic")
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, retry.status)
+        assertEquals(2L, retry.generation)
+        assertEquals(SubscriptionPhase.LOADING, controller.state.value.phase)
+        assertTrue(controller.state.value.requestActive)
+        controller.cancel()
+        assertEquals(listOf(2L), port.cancellations)
+    }
+
+    @Test
+    fun startExceptionAfterCancelPreservesNextGenerationAndRejectsStaleCallback(): Unit {
+        val port = FakeSubscriptionPort()
+        lateinit var controller: SubscriptionController
+        port.onStart = { _, _ ->
+            controller.cancel()
+            throw IllegalStateException("synthetic")
+        }
+        controller = legacyController(port, search(), { true }, { true }, { ResultRevision("1", "2") })
+
+        val cancelled = controller.loadWithReceipt("synthetic")
+        val staleObserver = port.observer!!
+
+        assertEquals(SubscriptionStartV1.REJECTED, cancelled.status)
+        assertNull(cancelled.generation)
+        assertEquals(SubscriptionPhase.CANCELLED, controller.state.value.phase)
+        assertFalse(controller.state.value.requestActive)
+        assertTrue(port.cancellations.isEmpty())
+
+        port.onStart = { _, _ -> }
+        val retry = controller.loadWithReceipt("synthetic")
+        val late = Snapshot(listOf(record("stale", true)))
+        staleObserver.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, late)
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, retry.status)
+        assertEquals(2L, retry.generation)
+        assertTrue(late.closed)
+        assertEquals(SubscriptionPhase.LOADING, controller.state.value.phase)
+        assertEquals(2L, controller.state.value.generation)
+        assertTrue(controller.state.value.requestActive)
+        controller.cancel()
+        assertEquals(listOf(2L), port.cancellations)
+    }
+
+    @Test
     fun selectionCommitAndSearchReadRevisionsUnderSameGuard(): Unit {
         val port = FakeSubscriptionPort()
         val runtime = FakeSearchPort()

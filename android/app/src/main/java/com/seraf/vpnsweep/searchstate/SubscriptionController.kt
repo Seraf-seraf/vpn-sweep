@@ -85,7 +85,19 @@ internal class SubscriptionController(
                 mutableState.value = visibleState(SubscriptionPhase.LOADING)
             }
         }
-        val result = port.start(current.generation, input, this)
+        val result = try {
+            port.start(current.generation, input, this)
+        } catch (failure: Throwable) {
+            synchronized(this) {
+                current.dispatching = false
+                if (request === current) {
+                    request = null
+                    mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                }
+            }
+            if (failure !is Exception) throw failure
+            return SubscriptionLoadResult(SubscriptionStartV1.REJECTED)
+        }
         val sendCancel = synchronized(this) {
             current.dispatching = false
             if (result != SubscriptionStartV1.ACCEPTED && request === current) {
