@@ -300,11 +300,10 @@ internal class SearchEngineWorkerAdapter(
     }
 
     override fun close(generation: Long, cleanupMillis: Long): Long {
-        val started = nowNanos()
         val current = synchronized(lock) {
             val value = active
             if (value == null || value.identity.workerGeneration != generation || value.state != State.READY) return Mobile.SearchWorkerCleanupIncomplete
-            recordCleanupStart(value, started)
+            recordCleanupStart(value)
             if (cleanupMillis == this.cleanupMillis && !value.inFlight && fatal == null) value.state = State.CLOSING
             value
         }
@@ -317,7 +316,6 @@ internal class SearchEngineWorkerAdapter(
     }
 
     override fun cancel(generation: Long): Unit {
-        val started = nowNanos()
         val current = synchronized(lock) {
             if (generation <= 0) return
             val value = active
@@ -329,7 +327,7 @@ internal class SearchEngineWorkerAdapter(
                 return
             }
             value.cancelled = true
-            recordCleanupStart(value, started)
+            recordCleanupStart(value)
             value.openingWake?.countDown()
             value.callWake?.countDown()
             if (!value.dispatched || value.state == State.CLOSING || value.state == State.RETIRING || value.cancelling != null) return
@@ -341,13 +339,12 @@ internal class SearchEngineWorkerAdapter(
 
     // The real coordinator must call this on owner loss or worker death.
     fun revoked(generation: Long, reason: WorkerFatalV2): Unit {
-        val started = nowNanos()
         val pending = synchronized(lock) {
             val value = active ?: return
             if (value.identity.workerGeneration != generation) return
             if (fatal == null) fatal = fatalCode(reason)
             value.cancelled = true
-            recordCleanupStart(value, started)
+            recordCleanupStart(value)
             value.openingWake?.countDown()
             value.callWake?.countDown()
             val shouldCancel = value.dispatched && value.state != State.CLOSING && value.cancelling == null
@@ -405,15 +402,13 @@ internal class SearchEngineWorkerAdapter(
         }
     }
 
-    private fun recordCleanupStart(round: Round, started: Long): Long {
-        val current = round.cleanupStarted
-        if (current == null || started - current < 0) round.cleanupStarted = started
-        return round.cleanupStarted!!
-    }
+    private fun recordCleanupStart(round: Round): Long =
+        round.cleanupStarted ?: nowNanos().also { round.cleanupStarted = it }
 
     private fun cleanupStart(round: Round): Long {
-        val started = nowNanos()
-        return synchronized(lock) { recordCleanupStart(round, started) }
+        synchronized(lock) { round.cleanupStarted }?.let { return it }
+        val sampled = nowNanos()
+        return synchronized(lock) { round.cleanupStarted ?: sampled.also { round.cleanupStarted = it } }
     }
 
     private fun remainingMillis(start: Long, budget: Long): Long {
@@ -544,7 +539,8 @@ internal class SearchEngineWorkerAdapter(
         val pending = synchronized(lock) { round.cancelling } ?: return true
         return try {
             val remaining = remainingCleanupNanos(start)
-            remaining > 0 && pending.await(remaining, TimeUnit.NANOSECONDS) && synchronized(lock) { fatal == null }
+            remaining > 0 && pending.await(remaining, TimeUnit.NANOSECONDS) && remainingCleanupNanos(start) > 0 &&
+                synchronized(lock) { fatal == null }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             false
@@ -562,7 +558,8 @@ internal class SearchEngineWorkerAdapter(
                 finally { done.countDown() }
             }, "search-round-close").apply { isDaemon = true }.start()
             val remaining = remainingCleanupNanos(start)
-            return remaining > 0 && done.await(remaining, TimeUnit.NANOSECONDS) && result.get() == WorkerCloseV1.CLEAN_AND_DEAD
+            return remaining > 0 && done.await(remaining, TimeUnit.NANOSECONDS) && remainingCleanupNanos(start) > 0 &&
+                result.get() == WorkerCloseV1.CLEAN_AND_DEAD
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             return false
@@ -574,11 +571,10 @@ internal class SearchEngineWorkerAdapter(
     }
 
     private fun failAndCancel(round: Round, code: Long): Long {
-        val started = nowNanos()
         val shouldCancel = synchronized(lock) {
             if (fatal == null) fatal = code
             round.cancelled = true
-            recordCleanupStart(round, started)
+            recordCleanupStart(round)
             round.openingWake?.countDown()
             round.callWake?.countDown()
             if (!round.dispatched || round.cancelling != null) false else {

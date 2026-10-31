@@ -809,6 +809,86 @@ internal class SearchEngineWorkerAdapterTest {
     }
 
     @Test
+    fun delayedCancelFixesDeadlineBeforeConcurrentCloseCanDispatch(): Unit {
+        val now = AtomicLong(TimeUnit.MILLISECONDS.toNanos(1_000))
+        val clockRead = CountDownLatch(1)
+        val releaseClock = CountDownLatch(1)
+        val closeStarted = CountDownLatch(1)
+        val closeDispatched = CountDownLatch(1)
+        val releaseClose = CountDownLatch(1)
+        val trap = AtomicBoolean(false)
+        val clock = {
+            val sampled = now.get()
+            if (Thread.currentThread().name == "test-delayed-cancel" && trap.compareAndSet(false, true)) {
+                clockRead.countDown()
+                check(releaseClock.await(3, TimeUnit.SECONDS))
+            }
+            sampled
+        }
+        val port = Port().apply {
+            closeAction = { closeDispatched.countDown(); check(releaseClose.await(3, TimeUnit.SECONDS)) }
+        }
+        val adapter = adapter(port, Lease(), cleanup = 500, clock = clock)
+        assertEquals(Mobile.SearchWorkerReady, open(adapter))
+        val cancel = Thread({ adapter.cancel(1) }, "test-delayed-cancel")
+        val closed = AtomicReference<Long>()
+        val closer = Thread {
+            closeStarted.countDown()
+            closed.set(adapter.close(1, 500))
+        }
+        cancel.start()
+        try {
+            assertTrue(clockRead.await(2, TimeUnit.SECONDS))
+            now.set(TimeUnit.MILLISECONDS.toNanos(1_100))
+            closer.start()
+            assertTrue(closeStarted.await(2, TimeUnit.SECONDS))
+            val limit = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (closer.state != Thread.State.BLOCKED && closeDispatched.count != 0L && System.nanoTime() < limit) Thread.yield()
+            assertEquals("close must wait for the cleanup start decision", Thread.State.BLOCKED, closer.state)
+            assertEquals(1L, closeDispatched.count)
+            releaseClock.countDown()
+            assertTrue(closeDispatched.await(2, TimeUnit.SECONDS))
+            assertEquals(1_500L, port.closeDeadline)
+            now.set(TimeUnit.MILLISECONDS.toNanos(1_501))
+            releaseClose.countDown()
+            closer.join(3000)
+            assertFalse(closer.isAlive)
+            assertEquals(Mobile.SearchWorkerCleanupIncomplete, closed.get())
+            assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
+        } finally {
+            releaseClock.countDown()
+            releaseClose.countDown()
+            cancel.join(3000)
+            if (closer.state != Thread.State.NEW) closer.join(3000)
+        }
+    }
+
+    @Test
+    fun closeBeforeCancelKeepsItsOriginalCleanupDeadline(): Unit {
+        val now = AtomicLong(TimeUnit.MILLISECONDS.toNanos(1_000))
+        val dispatched = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val port = Port().apply { closeAction = { dispatched.countDown(); check(release.await(3, TimeUnit.SECONDS)) } }
+        val adapter = adapter(port, Lease(), cleanup = 500, clock = now::get)
+        assertEquals(Mobile.SearchWorkerReady, open(adapter))
+        val closed = AtomicReference<Long>()
+        val closer = Thread { closed.set(adapter.close(1, 500)) }
+        closer.start()
+        try {
+            assertTrue(dispatched.await(2, TimeUnit.SECONDS))
+            now.set(TimeUnit.MILLISECONDS.toNanos(1_100))
+            adapter.cancel(1)
+            assertEquals(1_500L, port.closeDeadline)
+            now.set(TimeUnit.MILLISECONDS.toNanos(1_499))
+            release.countDown()
+            closer.join(3000)
+            assertFalse(closer.isAlive)
+            assertEquals(Mobile.SearchWorkerReady, closed.get())
+            assertEquals(0, port.cancelCount.get())
+        } finally { release.countDown(); closer.join(3000) }
+    }
+
+    @Test
     fun completedReplyWinsBeforeLaterCancelAndWorkerStillCloses(): Unit {
         val cancelled = CountDownLatch(1)
         val reply = Reply("{}".toByteArray())
