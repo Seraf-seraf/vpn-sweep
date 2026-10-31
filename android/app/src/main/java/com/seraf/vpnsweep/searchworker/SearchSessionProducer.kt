@@ -1,0 +1,449 @@
+package com.seraf.vpnsweep.searchworker
+
+import android.os.SystemClock
+import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
+import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
+import com.seraf.vpnsweep.searchprotocol.SearchPauseReasonV1
+import com.seraf.vpnsweep.searchprotocol.SearchProgressV1
+import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
+import com.seraf.vpnsweep.searchprotocol.SearchResultFenceV3
+import com.seraf.vpnsweep.searchprotocol.SearchResultReceiptV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
+import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
+import com.seraf.vpnsweep.searchprotocol.SearchStartV3
+import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
+import java.io.FilterInputStream
+import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+// The factory owns one session and the lease/network resources used by it.
+// It must consume profiles synchronously; the producer closes the input.
+// Pause and release states require confirmed worker death and FD disposition;
+// quarantine must stop further work and forbid unconfirmed lease release.
+// A factory that fails after acquiring resources must quarantine them itself.
+internal interface SearchPhaseSession {
+    fun preparePhase(epoch: Long): Unit
+    fun runPhase(epoch: Long): String
+    fun cancelPhase(epoch: Long): Boolean
+    fun openVerifiedResult(): LocalOpenedResult
+    fun closeSession(): Unit
+    fun pauseResources(): SearchResourceStateV2
+    fun releaseResources(): SearchResourceStateV2
+    fun quarantine(): Unit
+}
+
+internal class SearchSessionProducer(
+    private val cleanupMillis: Long,
+    private val createSession: (SearchSnapshotV1, (SearchProgressV1) -> Unit) -> SearchPhaseSession,
+    private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
+) : SearchSessionPortV3 {
+    private enum class State { STARTING, RUNNING, FINISHING, EMITTING_PAUSE, PAUSED, TERMINAL, UNKNOWN }
+    private enum class Control { NONE, PAUSE, CANCEL }
+    private class Cancellation(val epoch: Long) {
+        val done = CountDownLatch(1)
+        @Volatile var accepted: Boolean? = null
+    }
+    private class Active(val snapshot: SearchSnapshotV1, val observer: SearchSessionObserverV3, epoch: Long) {
+        var state = State.STARTING
+        var epoch = epoch
+        var lastEpoch = epoch
+        var control = Control.NONE
+        var deadline: Long? = null
+        var session: SearchPhaseSession? = null
+        var prepared = false
+        var phase: SearchLocalPhase? = null
+        var cancellation: Cancellation? = null
+        var resources = SearchResourceStateV2.QUARANTINED
+    }
+
+    private val lock = Any()
+    private var active: Active? = null
+    private var blocked = false
+
+    init { require(cleanupMillis in 1..60_000) }
+
+    override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
+        if (snapshot.sessionGeneration <= 0 || phaseEpoch <= 0) return SearchStartV3.REJECTED
+        val current = synchronized(lock) {
+            if (blocked) return SearchStartV3.BUSY
+            if (active != null) return SearchStartV3.BUSY
+            Active(snapshot, observer, phaseEpoch).also { active = it }
+        }
+        if (!launch { createAndRun(current) }) {
+            synchronized(lock) { blocked = true; current.state = State.UNKNOWN }
+            return SearchStartV3.UNKNOWN
+        }
+        return SearchStartV3.ACCEPTED
+    }
+
+    override fun pause(sessionGeneration: Long, phaseEpoch: Long): Unit = control(sessionGeneration, phaseEpoch, Control.PAUSE)
+    override fun cancel(sessionGeneration: Long, phaseEpoch: Long): Unit = control(sessionGeneration, phaseEpoch, Control.CANCEL)
+
+    fun ownerLost(sessionGeneration: Long): Unit {
+        val current = synchronized(lock) {
+            active?.takeIf {
+                it.snapshot.sessionGeneration == sessionGeneration && it.state != State.TERMINAL && it.state != State.UNKNOWN
+            }
+        } ?: return
+        unknown(current)
+    }
+
+    override fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3 {
+        val current = synchronized(lock) {
+            val value = active ?: return SearchStartV3.REJECTED
+            if (blocked || value.state == State.UNKNOWN) return SearchStartV3.UNKNOWN
+            if (value.snapshot.sessionGeneration != sessionGeneration || value.state != State.PAUSED ||
+                phaseEpoch <= value.lastEpoch || phaseEpoch <= 0
+            ) return SearchStartV3.REJECTED
+            value.lastEpoch = phaseEpoch
+            value.epoch = phaseEpoch
+            value.control = Control.NONE
+            value.deadline = null
+            value.prepared = false
+            value.phase = null
+            value.cancellation = null
+            value.state = State.STARTING
+            value
+        }
+        if (!launch { runPhase(current, phaseEpoch) }) {
+            unknown(current)
+            return SearchStartV3.UNKNOWN
+        }
+        return SearchStartV3.ACCEPTED
+    }
+
+    private fun createAndRun(current: Active): Unit {
+        val profiles = OwnedProfiles(current.snapshot.profiles)
+        val snapshot = SearchSnapshotV1(
+            current.snapshot.sessionGeneration, current.snapshot.sourceRevision, current.snapshot.selectionRevision, profiles,
+        )
+        val session = try {
+            createSession(snapshot) { progress -> progress(current, progress) }
+        } catch (failure: Throwable) {
+            try { profiles.close() } catch (_: Exception) { }
+            unknown(current)
+            rethrowProducerFatal(failure)
+            return
+        }
+        try {
+            profiles.close()
+        } catch (_: Exception) {
+            try { session.quarantine() } catch (_: Exception) { }
+            unknown(current)
+            return
+        }
+        val control = synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN) null else {
+                current.session = session
+                current.control
+            }
+        }
+        if (control == null) {
+            try { session.quarantine() } catch (_: Exception) { }
+            return
+        }
+        when (control) {
+            Control.CANCEL -> finishWithoutRun(current, cancelled = true)
+            Control.PAUSE -> emitPause(current, SearchPauseReasonV1.USER_REQUEST)
+            Control.NONE -> runPhase(current, current.epoch)
+        }
+    }
+
+    private fun runPhase(current: Active, epoch: Long): Unit {
+        val session = synchronized(lock) {
+            if (active !== current || current.epoch != epoch || current.state != State.STARTING) return
+            current.session ?: return
+        }
+        try {
+            session.preparePhase(epoch)
+        } catch (failure: Throwable) {
+            unknown(current)
+            rethrowProducerFatal(failure)
+            return
+        }
+        var launchCancel: Cancellation? = null
+        val existing = synchronized(lock) {
+            if (active !== current || current.epoch != epoch || current.state == State.UNKNOWN) return
+            current.prepared = true
+            if (current.control != Control.NONE && current.cancellation == null) {
+                Cancellation(epoch).also { current.cancellation = it; launchCancel = it }
+            } else current.cancellation
+        }
+        launchCancel?.let { dispatchCancel(current, session, it) }
+        if (existing != null && !awaitCancel(current, existing, requireAccepted = true)) {
+            unknown(current)
+            return
+        }
+        val phase = SearchLocalPhase(
+            current.snapshot.sessionGeneration, epoch, current.snapshot.sourceRevision, current.snapshot.selectionRevision,
+            current.observer, { session.runPhase(epoch) }, session::openVerifiedResult,
+            { if (cleanup(current) { session.closeSession(); true } != true) throw IOException("session_cleanup_unknown") },
+            { (cleanup(current) { session.releaseResources() } ?: SearchResourceStateV2.QUARANTINED)
+                .also { result -> synchronized(lock) { current.resources = result } } },
+        )
+        val cancelBeforeRun = synchronized(lock) {
+            if (active !== current || current.epoch != epoch || current.state == State.UNKNOWN) return
+            current.phase = phase
+            current.state = State.RUNNING
+            current.control == Control.CANCEL
+        }
+        if (cancelBeforeRun) phase.revoke()
+        val outcome = phase.execute()
+        if (outcome == LocalPhaseOutcome.NotStarted) {
+            val pending = synchronized(lock) { current.cancellation }
+            if (pending == null || !awaitCancel(current, pending, requireAccepted = true)) {
+                unknown(current)
+                return
+            }
+            try { session.runPhase(epoch) } catch (failure: Throwable) {
+                unknown(current)
+                rethrowProducerFatal(failure)
+                return
+            }
+            finishWithoutRun(current, cancelled = true)
+            return
+        }
+        val cancellation = synchronized(lock) {
+            if (active !== current || current.epoch != epoch || current.state == State.UNKNOWN) return
+            current.state = State.FINISHING
+            current.cancellation
+        }
+        if (cancellation != null && !awaitCancel(current, cancellation, requireAccepted = false)) {
+            unknown(current)
+            return
+        }
+        when (outcome) {
+            LocalPhaseOutcome.Paused -> emitPause(current, SearchPauseReasonV1.BUDGET)
+            LocalPhaseOutcome.Interrupted -> {
+                val (control, accepted) = synchronized(lock) { current.control to (current.cancellation?.accepted == true) }
+                when {
+                    control == Control.PAUSE && accepted -> emitPause(current, SearchPauseReasonV1.USER_REQUEST)
+                    control == Control.CANCEL && accepted -> finishWithoutRun(current, cancelled = true)
+                    else -> finishWithoutRun(current, cancelled = false)
+                }
+            }
+            LocalPhaseOutcome.Stopped -> finishWithoutRun(current, cancelled = false)
+            LocalPhaseOutcome.Unknown, LocalPhaseOutcome.NotStarted -> unknown(current)
+            is LocalPhaseOutcome.Handoff -> finishHandoff(current, outcome)
+        }
+    }
+
+    private fun control(generation: Long, epoch: Long, requested: Control): Unit {
+        val now = nowMillis()
+        var phase: SearchLocalPhase? = null
+        var dispatch: Triple<Active, SearchPhaseSession, Cancellation>? = null
+        var finishPaused: Active? = null
+        var failed: Active? = null
+        synchronized(lock) {
+            val current = active ?: return
+            if (current.snapshot.sessionGeneration != generation || current.epoch != epoch ||
+                current.state == State.TERMINAL || current.state == State.UNKNOWN
+            ) return
+            if (current.control == Control.CANCEL || current.control == requested) return
+            if (now < 0 || now > Long.MAX_VALUE - cleanupMillis) {
+                failed = current
+            } else {
+                if (current.deadline == null) current.deadline = now + cleanupMillis
+                current.control = requested
+                if (requested == Control.CANCEL) phase = current.phase
+                if (current.state == State.PAUSED && requested == Control.CANCEL) {
+                    current.state = State.FINISHING
+                    finishPaused = current
+                } else if (current.prepared && (current.state == State.STARTING || current.state == State.RUNNING) && current.cancellation == null) {
+                    val owner = current.session
+                    if (owner == null) failed = current else {
+                        val cancellation = Cancellation(epoch)
+                        current.cancellation = cancellation
+                        dispatch = Triple(current, owner, cancellation)
+                    }
+                }
+            }
+        }
+        phase?.revoke()
+        failed?.let { unknown(it) }
+        dispatch?.let { (current, session, cancellation) -> dispatchCancel(current, session, cancellation) }
+        finishPaused?.let { current -> if (!launch { finishWithoutRun(current, cancelled = true) }) unknown(current) }
+    }
+
+    private fun dispatchCancel(current: Active, session: SearchPhaseSession, cancellation: Cancellation): Unit {
+        if (!launch {
+                try {
+                    cancellation.accepted = session.cancelPhase(cancellation.epoch)
+                } catch (_: Exception) {
+                    cancellation.accepted = null
+                } finally {
+                    cancellation.done.countDown()
+                }
+            }) {
+            cancellation.done.countDown()
+            unknown(current)
+        }
+    }
+
+    private fun awaitCancel(current: Active, cancellation: Cancellation, requireAccepted: Boolean): Boolean {
+        val deadline = synchronized(lock) { current.deadline } ?: return false
+        val now = nowMillis()
+        if (now < 0 || deadline <= now) return false
+        val done = try { cancellation.done.await(deadline - now, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        val after = nowMillis()
+        return done && after >= 0 && after < deadline && cancellation.accepted != null && (!requireAccepted || cancellation.accepted == true)
+    }
+
+    private fun emitPause(current: Active, reason: SearchPauseReasonV1): Unit {
+        val session = synchronized(lock) { current.session } ?: return unknown(current)
+        val resources = cleanup(current) { session.pauseResources() } ?: SearchResourceStateV2.QUARANTINED
+        if (resources != SearchResourceStateV2.PAUSED_LEASE_HELD) return unknown(current)
+        val cancelInstead = synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN) return
+            if (current.control == Control.CANCEL) true else {
+                current.state = State.EMITTING_PAUSE
+                false
+            }
+        }
+        if (cancelInstead) return finishWithoutRun(current, cancelled = true)
+        val terminal = SearchTerminalV3.Paused(current.snapshot.sessionGeneration, current.epoch, reason, resources)
+        if (!emit(current, terminal)) return
+        val cancelAfter = synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN) return
+            if (current.control == Control.CANCEL) {
+                current.state = State.FINISHING
+                true
+            } else {
+                current.state = State.PAUSED
+                false
+            }
+        }
+        if (cancelAfter) finishWithoutRun(current, cancelled = true)
+    }
+
+    private fun finishWithoutRun(current: Active, cancelled: Boolean): Unit {
+        val session = synchronized(lock) { current.session } ?: return unknown(current)
+        val resources = cleanup(current) {
+            session.closeSession()
+            session.releaseResources()
+        } ?: SearchResourceStateV2.QUARANTINED
+        if (resources != SearchResourceStateV2.RELEASED) return unknown(current)
+        val terminal = if (cancelled) SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, resources, SearchResultFenceV3.CONFIRMED)
+        else SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch, SearchFailureV1.INTERRUPTED, resources, SearchResultFenceV3.CONFIRMED)
+        finish(current, terminal)
+    }
+
+    private fun finishHandoff(current: Active, outcome: LocalPhaseOutcome.Handoff): Unit {
+        val resources = synchronized(lock) { current.resources }
+        if (resources != SearchResourceStateV2.RELEASED || outcome.localFence != SearchResultFenceV3.CONFIRMED) return unknown(current)
+        val terminal = when (val handoff = outcome.result) {
+            is HandoffResult.Delivered -> when (handoff.receipt) {
+                SearchResultReceiptV3.COMMITTED_CLOSED -> SearchTerminalV3.Complete(current.snapshot.sessionGeneration, current.epoch, resources, outcome.localFence)
+                SearchResultReceiptV3.CANCELLED_CLOSED -> SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, resources, outcome.localFence)
+                SearchResultReceiptV3.FAILED_CLOSED, SearchResultReceiptV3.IGNORED_CLOSED -> SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch, SearchFailureV1.INTERRUPTED, resources, outcome.localFence)
+                SearchResultReceiptV3.UNKNOWN -> return unknown(current)
+            }
+            HandoffResult.Discarded -> SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, resources, outcome.localFence)
+            HandoffResult.Rejected, HandoffResult.Unknown -> return unknown(current)
+        }
+        finish(current, terminal)
+    }
+
+    private fun finish(current: Active, terminal: SearchTerminalV3): Unit {
+        synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN || current.state == State.TERMINAL) return
+            current.state = State.TERMINAL
+        }
+        if (!emit(current, terminal)) return
+        synchronized(lock) { if (active === current && current.state == State.TERMINAL) active = null }
+    }
+
+    private fun emit(current: Active, terminal: SearchTerminalV3): Boolean = try {
+        current.observer.onTerminal(terminal)
+        true
+    } catch (_: Exception) {
+        unknown(current, notify = false)
+        false
+    }
+
+    private fun progress(current: Active, progress: SearchProgressV1): Unit {
+        val epoch = synchronized(lock) {
+            if (active !== current || current.state != State.RUNNING || progress.sessionGeneration != current.snapshot.sessionGeneration) return
+            current.epoch
+        }
+        try { current.observer.onProgress(epoch, progress) } catch (_: Exception) { }
+    }
+
+    private fun unknown(current: Active, notify: Boolean = true): Unit {
+        val captured = synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN) return
+            blocked = true
+            current.state = State.UNKNOWN
+            Triple(current.session, current.phase, current.resources)
+        }
+        captured.second?.revoke()
+        launch {
+            try { captured.first?.quarantine() } catch (_: Exception) { }
+            if (notify) try {
+                current.observer.onTerminal(SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch,
+                    SearchFailureV1.INTERRUPTED, captured.third, SearchResultFenceV3.UNKNOWN))
+            } catch (_: Exception) { }
+        }
+    }
+
+    private fun launch(block: () -> Unit): Boolean = try {
+        Thread(block, "search-session-phase").apply { isDaemon = true }.start()
+        true
+    } catch (_: Exception) { false } catch (_: LinkageError) { false }
+
+    private fun <T : Any> cleanup(current: Active, action: () -> T): T? {
+        val now = nowMillis()
+        if (now < 0 || now > Long.MAX_VALUE - cleanupMillis) return null
+        val deadline = synchronized(lock) {
+            if (active !== current || current.state == State.UNKNOWN) return null
+            current.deadline ?: (now + cleanupMillis).also { current.deadline = it }
+        }
+        if (deadline <= now) return null
+        val done = CountDownLatch(1)
+        val value = java.util.concurrent.atomic.AtomicReference<T?>()
+        if (!launch {
+                try { value.set(action()) } catch (_: Exception) { } catch (_: LinkageError) { }
+                finally { done.countDown() }
+            }) return null
+        val signalled = try { done.await(deadline - now, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        val after = nowMillis()
+        return if (signalled && after >= 0 && after < deadline) value.get() else null
+    }
+}
+
+private fun rethrowProducerFatal(failure: Throwable): Unit {
+    if (failure is VirtualMachineError || failure is ThreadDeath) throw failure
+}
+
+private class OwnedProfiles(private val source: PrivateInputV1) : PrivateInputV1 {
+    private var opened = false
+    private var stream: InputStream? = null
+    private val closeSource = LeaseCloseOnce { source.close() }
+    private val closeAll = LeaseCloseOnce {
+        var failed: Throwable? = null
+        try { stream?.close() } catch (failure: Throwable) { failed = failure }
+        try { closeSource.close() } catch (failure: Throwable) { if (failed == null) failed = failure }
+        failed?.let { throw IOException("profile_close_unknown", it) }
+    }
+
+    @Synchronized override fun open(): InputStream {
+        check(!opened) { "profile_already_opened" }
+        opened = true
+        val input = source.open()
+        val once = LeaseCloseOnce { input.close() }
+        return object : FilterInputStream(input) {
+            override fun close(): Unit = once.close()
+        }.also { stream = it }
+    }
+
+    override fun close(): Unit = closeAll.close()
+}
