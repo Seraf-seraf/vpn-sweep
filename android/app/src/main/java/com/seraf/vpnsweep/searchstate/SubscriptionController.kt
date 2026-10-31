@@ -52,10 +52,16 @@ internal class SubscriptionController(
     private var uncertainSearchInput: PrivateInputV1? = null
 
     @Synchronized
-    fun restore(snapshot: SubscriptionSnapshotV1, selectedIds: Set<String>, revision: ResultRevision): Boolean {
+    fun restore(
+        snapshot: SubscriptionSnapshotV1,
+        selectedIds: Set<String>,
+        revision: ResultRevision,
+        requestGeneration: Long = 1L,
+    ): Boolean {
         val restored = try {
             synchronized(composition.controller) {
                 if (installed != null || request != null || pendingClose.isNotEmpty() || uncertainSearchInput != null) return@synchronized false
+                if (requestGeneration <= 0 || requestGeneration < nextGeneration) return@synchronized false
                 if (composition.currentRevision() != revision) return@synchronized false
                 val records = snapshot.records.toList()
                 if (!validRecords(records)) return@synchronized false
@@ -66,6 +72,7 @@ internal class SubscriptionController(
                 installed = snapshot
                 installedRecords = records
                 this.selectedIds = selection
+                nextGeneration = requestGeneration
                 mutableState.value = visibleState(SubscriptionPhase.READY)
                 true
             }
@@ -85,6 +92,7 @@ internal class SubscriptionController(
     fun loadWithReceipt(input: String): SubscriptionLoadResult {
         val current = synchronized(this) {
             if (request != null || pendingClose.isNotEmpty() || uncertainSearchInput != null) return SubscriptionLoadResult(SubscriptionStartV1.BUSY)
+            if (nextGeneration == Long.MAX_VALUE) return SubscriptionLoadResult(SubscriptionStartV1.REJECTED)
             Request(++nextGeneration).also {
                 request = it
                 mutableState.value = visibleState(SubscriptionPhase.LOADING)

@@ -242,7 +242,7 @@ internal class AppComposition(context: Context) {
         val generation = synchronized(lock) { currentRequestGeneration } ?: throw IOException("subscription_generation")
         val owner = acquireOwner() ?: throw IOException("search_owner_unavailable")
         try {
-            val revision = storage.commitSource(snapshot)
+            val revision = storage.commitSource(snapshot, generation)
             val receipt = AcceptedSubscriptionReceiptV1.fromCommittedSnapshot(generation, snapshot, revision)
                 ?: throw IOException("subscription_receipt")
             synchronized(lock) {
@@ -281,8 +281,26 @@ internal class AppComposition(context: Context) {
     private fun restoreSubscription(): Unit {
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return
         val recovered: RecoveredSubscription = storage.recover(revision) ?: return
-        val accepted = subscriptions.restore(recovered.snapshot, recovered.selectedIds, recovered.revision)
-        if (!accepted) recovered.snapshot.close()
+        val receipt = AcceptedSubscriptionReceiptV1.fromCommittedSnapshot(
+            recovered.requestGeneration,
+            recovered.snapshot,
+            recovered.revision,
+        ) ?: run {
+            recovered.snapshot.close()
+            return
+        }
+        if (!subscriptions.restore(
+                recovered.snapshot,
+                recovered.selectedIds,
+                recovered.revision,
+                recovered.requestGeneration,
+            )
+        ) return
+        synchronized(lock) {
+            acceptedSnapshot = receipt
+            activeSearch = null
+            completedSearch = null
+        }
     }
 
     private inner class GenerationSubscriptionPort(

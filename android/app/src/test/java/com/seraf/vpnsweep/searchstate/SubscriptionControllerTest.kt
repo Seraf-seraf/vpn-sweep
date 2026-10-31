@@ -722,10 +722,11 @@ class SubscriptionControllerTest {
                 val controller = SubscriptionController(port, fixture.composition, { error("unexpected source commit") }, { error("unexpected selection commit") })
                 val snapshot = Snapshot(listOf(record("a", true)))
                 val ids = if (withSelection) mutableSetOf("a") else mutableSetOf()
-                assertTrue(controller.restore(snapshot, ids, revision))
+                assertTrue(controller.restore(snapshot, ids, revision, requestGeneration = 17))
                 ids.clear()
                 assertEquals(if (withSelection) setOf("a") else emptySet<String>(), controller.state.value.selectedIds)
                 assertEquals(SubscriptionPhase.READY, controller.state.value.phase)
+                assertEquals(17L, controller.state.value.generation)
                 assertEquals(revision, fixture.revisions.value)
                 assertEquals(0, fixture.revisions.writes)
                 assertEquals(0, fixture.marker.activeCalls)
@@ -740,6 +741,27 @@ class SubscriptionControllerTest {
                 }
             }
         }
+    }
+
+    @Test
+    fun recoveredGenerationRemainsTheReceiptGenerationAndNewRequestsAdvanceIt(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val revision = ResultRevision("1", "2")
+        fixture.revisions.value = revision
+        val controller = SubscriptionController(
+            port,
+            fixture.composition,
+            { error("unexpected source commit") },
+            { error("unexpected selection commit") },
+        )
+        assertTrue(controller.restore(Snapshot(listOf(record("a", true))), setOf("a"), revision, requestGeneration = 41))
+        assertEquals(41L, controller.state.value.generation)
+        var dispatchedGeneration: Long? = null
+        port.onStart = { generation, _ -> dispatchedGeneration = generation }
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        assertEquals(42L, dispatchedGeneration)
     }
 
     @Test

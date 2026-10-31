@@ -16,7 +16,9 @@ import java.security.SecureRandom
 private const val MAX_RECORDS = 10_000
 private const val MAX_METADATA_BYTES = 400_000L
 private const val MAX_SNAPSHOT_BYTES = 44L + 8L * 1024L * 1024L + MAX_RECORDS * 49L
-private const val METADATA_VERSION = 1
+private const val METADATA_VERSION = 2
+private const val LEGACY_METADATA_VERSION = 1
+private const val LEGACY_REQUEST_GENERATION = 1L
 private const val DIGEST_BYTES = 32
 private val ID_PATTERN = Regex("[0-9a-f]{32}")
 
@@ -24,7 +26,10 @@ internal class RecoveredSubscription(
     val snapshot: SubscriptionSnapshotV1,
     val selectedIds: Set<String>,
     val revision: ResultRevision,
+    val requestGeneration: Long,
 )
+
+private class StoredSelection(val selectedIds: Set<String>, val requestGeneration: Long)
 
 internal interface SubscriptionSnapshotFiles {
     fun write(snapshot: SubscriptionSnapshotV1, file: File): Unit
@@ -39,9 +44,10 @@ internal class SubscriptionStorage(
 ) {
     private val random = SecureRandom()
 
-    fun commitSource(snapshot: SubscriptionSnapshotV1): ResultRevision {
+    fun commitSource(snapshot: SubscriptionSnapshotV1, requestGeneration: Long): ResultRevision {
+        if (requestGeneration <= 0) throw IOException("subscription_generation")
         check(snapshot.records.any { it.supported }) { "subscription_snapshot" }
-        return store(snapshot, emptySet(), null)
+        return store(snapshot, emptySet(), null, requestGeneration)
     }
 
     fun commitSelection(selectedIds: Set<String>): ResultRevision {
@@ -51,7 +57,7 @@ internal class SubscriptionStorage(
             if (!validSelection(recovered.snapshot, selectedIds) || selectedIds.isEmpty()) {
                 throw IOException("subscription_selection")
             }
-            return store(recovered.snapshot, selectedIds, previous.source)
+            return store(recovered.snapshot, selectedIds, previous.source, recovered.requestGeneration)
         } finally {
             recovered.snapshot.close()
         }
@@ -66,11 +72,11 @@ internal class SubscriptionStorage(
             val payload = File(directory, "snapshot")
             if (!payload.isFile || payload.length() !in 1..MAX_SNAPSHOT_BYTES) return null
             snapshot = files.read(payload)
-            if (!snapshot.records.any { it.supported } || !validSelection(snapshot, metadata)) {
+            if (!snapshot.records.any { it.supported } || !validSelection(snapshot, metadata.selectedIds)) {
                 snapshot.close()
                 return null
             }
-            return RecoveredSubscription(snapshot, metadata, revision)
+            return RecoveredSubscription(snapshot, metadata.selectedIds, revision, metadata.requestGeneration)
         } catch (_: Exception) {
             try {
                 snapshot?.close()
@@ -80,7 +86,13 @@ internal class SubscriptionStorage(
         }
     }
 
-    private fun store(snapshot: SubscriptionSnapshotV1, selectedIds: Set<String>, source: String?): ResultRevision {
+    private fun store(
+        snapshot: SubscriptionSnapshotV1,
+        selectedIds: Set<String>,
+        source: String?,
+        requestGeneration: Long,
+    ): ResultRevision {
+        if (requestGeneration <= 0) throw IOException("subscription_generation")
         if (!validSelection(snapshot, selectedIds)) throw IOException("subscription_selection")
         if (!root.isDirectory && !root.mkdirs() && !root.isDirectory) throw IOException("subscription_storage")
         files.syncDirectory(root.parentFile ?: throw IOException("subscription_storage"))
@@ -96,7 +108,7 @@ internal class SubscriptionStorage(
             files.write(snapshot, payload)
             if (!payload.isFile || payload.length() !in 1..MAX_SNAPSHOT_BYTES) throw IOException("subscription_snapshot")
             FileOutputStream(payload, true).use { it.fd.sync() }
-            val data = metadata(revision, selectedIds)
+            val data = metadata(revision, selectedIds, requestGeneration)
             FileOutputStream(File(directory, "selection")).use {
                 it.write(data)
                 it.fd.sync()
@@ -112,12 +124,13 @@ internal class SubscriptionStorage(
         }
     }
 
-    private fun metadata(revision: ResultRevision, selectedIds: Set<String>): ByteArray {
+    private fun metadata(revision: ResultRevision, selectedIds: Set<String>, requestGeneration: Long): ByteArray {
         val bytes = ByteArrayOutputStream()
         DataOutputStream(bytes).use { output ->
             output.writeInt(METADATA_VERSION)
             output.writeUTF(revision.source)
             output.writeUTF(revision.selection)
+            output.writeLong(requestGeneration)
             output.writeInt(selectedIds.size)
             for (id in selectedIds.sorted()) output.writeUTF(id)
         }
@@ -125,7 +138,7 @@ internal class SubscriptionStorage(
         return body + MessageDigest.getInstance("SHA-256").digest(body)
     }
 
-    private fun readMetadata(file: File, revision: ResultRevision): Set<String>? {
+    private fun readMetadata(file: File, revision: ResultRevision): StoredSelection? {
         if (!file.isFile) return null
         val length = file.length()
         if (length !in DIGEST_BYTES.toLong()..MAX_METADATA_BYTES) return null
@@ -138,7 +151,14 @@ internal class SubscriptionStorage(
         val body = bytes.copyOfRange(0, end)
         if (!MessageDigest.isEqual(MessageDigest.getInstance("SHA-256").digest(body), bytes.copyOfRange(end, bytes.size))) return null
         DataInputStream(ByteArrayInputStream(body)).use { input ->
-            if (input.readInt() != METADATA_VERSION || input.readUTF() != revision.source || input.readUTF() != revision.selection) return null
+            val version = input.readInt()
+            if (version != METADATA_VERSION && version != LEGACY_METADATA_VERSION) return null
+            if (input.readUTF() != revision.source || input.readUTF() != revision.selection) return null
+            val requestGeneration = if (version == METADATA_VERSION) {
+                input.readLong().takeIf { it > 0 } ?: return null
+            } else {
+                LEGACY_REQUEST_GENERATION
+            }
             val count = input.readInt()
             if (count !in 0..MAX_RECORDS) return null
             val selected = LinkedHashSet<String>()
@@ -147,7 +167,7 @@ internal class SubscriptionStorage(
                 if (!ID_PATTERN.matches(id) || !selected.add(id)) return null
             }
             if (input.read() != -1) return null
-            return selected
+            return StoredSelection(selected, requestGeneration)
         }
     }
 
