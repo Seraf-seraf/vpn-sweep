@@ -254,7 +254,7 @@ private class AndroidDnsRequest : DnsRequest<Network> {
         DnsResolver.getInstance().rawQuery(
             network,
             packet,
-            0,
+            DnsResolver.FLAG_EMPTY,
             Executor { it.run() },
             signal,
             object : DnsResolver.Callback<ByteArray> {

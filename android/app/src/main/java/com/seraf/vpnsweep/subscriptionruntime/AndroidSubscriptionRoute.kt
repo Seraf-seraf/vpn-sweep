@@ -92,7 +92,7 @@ internal class AndroidSubscriptionRoute private constructor(
             DnsResolver.getInstance().rawQuery(
                 selected,
                 packet.copyOf(),
-                0,
+                DnsResolver.FLAG_EMPTY,
                 Executor { it.run() },
                 query.signal,
                 object : DnsResolver.Callback<ByteArray> {
