@@ -85,6 +85,33 @@ internal class SearchWorkerServiceWireTest {
         }
     }
 
+    @Test
+    fun expiredDuringProbeAcquisitionDoesNotDispatchCall(): Unit {
+        var now = 100L
+        var calls = 0
+        assertThrows(IOException::class.java) {
+            callWithWorkerDeadline(150, { now }, { now = 151; Unit }) { _, _ -> calls++ }
+        }
+        assertEquals(0, calls)
+    }
+
+    @Test
+    fun callUsesOnlyBudgetRemainingAfterProbeAcquisition(): Unit {
+        var now = 100L
+        val budget = callWithWorkerDeadline(150, { now }, { now = 149; Unit }) { _, remaining -> remaining }
+        assertEquals(1L, budget)
+    }
+
+    @Test
+    fun exactDeadlineDuringProbeAcquisitionDoesNotDispatchCall(): Unit {
+        var now = 100L
+        var calls = 0
+        assertThrows(IOException::class.java) {
+            callWithWorkerDeadline(150, { now }, { now = 150; Unit }) { _, _ -> calls++ }
+        }
+        assertEquals(0, calls)
+    }
+
     private fun frame(write: DataOutputStream.() -> Unit): ByteArray {
         val output = ByteArrayOutputStream()
         DataOutputStream(output).use { stream -> write(stream) }

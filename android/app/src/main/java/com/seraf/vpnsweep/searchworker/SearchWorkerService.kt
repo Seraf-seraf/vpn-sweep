@@ -65,6 +65,19 @@ internal class WorkerCallFrame(
     val request: ByteArray,
 )
 
+internal fun <P, R> callWithWorkerDeadline(
+    deadline: Long,
+    now: () -> Long,
+    acquire: () -> P,
+    invoke: (P, Long) -> R,
+): R {
+    if (deadline <= now()) throw WorkerFrameDeadline()
+    val target = acquire()
+    val current = now()
+    if (deadline <= current) throw WorkerFrameDeadline()
+    return invoke(target, deadline - current)
+}
+
 // The descriptor itself is authenticated and closed by the caller. These
 // readers consume exactly the declared frame and never interpret its contents.
 internal fun readWorkerOpenFrame(input: InputStream, length: Long, now: () -> Long): WorkerOpenFrame {
@@ -389,12 +402,13 @@ internal class SearchWorkerService : Service() {
                                 throw IOException("worker_operation_invalid")
                             }
                             operationStarted = true
-                            val probes = embedded.probes()
-                            val bytes = when (operation.toLong()) {
-                                Mobile.SearchWorkerCheck -> probes.check(frame.request, frame.round.toLong(), budgetMillis)
-                                Mobile.SearchWorkerUDP -> probes.udp(frame.request, frame.round.toLong(), budgetMillis)
-                                Mobile.SearchWorkerMedia -> probes.media(frame.request, frame.round.toLong(), budgetMillis)
-                                else -> throw IOException("worker_operation_invalid")
+                            val bytes = callWithWorkerDeadline(frame.deadline, SystemClock::elapsedRealtime, embedded::probes) { probes, budget ->
+                                when (operation.toLong()) {
+                                    Mobile.SearchWorkerCheck -> probes.check(frame.request, frame.round.toLong(), budget)
+                                    Mobile.SearchWorkerUDP -> probes.udp(frame.request, frame.round.toLong(), budget)
+                                    Mobile.SearchWorkerMedia -> probes.media(frame.request, frame.round.toLong(), budget)
+                                    else -> throw IOException("worker_operation_invalid")
+                                }
                             }
                             if (bytes == null || bytes.isEmpty()) throw IOException("worker_reply_invalid")
                             result = bytes
