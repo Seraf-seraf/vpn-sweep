@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Seraf-seraf/vpn-sweep/internal/capability"
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
@@ -52,10 +53,14 @@ func TestAndroidDefaultSearchManifestUsesExistingCLIDefaults(t *testing.T) {
 
 func TestAndroidDefaultSearchManifestPreservesFragmentSchema(t *testing.T) {
 	var profiles []model.Profile
-	if err := model.Decode(manifestProfile, &profiles); err != nil {
+	inputProfile := []byte(`[{"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"synthetic.invalid","port":443,"users":[{"id":"synthetic","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"synthetic.invalid"}}}}]`)
+	if err := model.Decode(inputProfile, &profiles); err != nil {
 		t.Fatal(err)
 	}
 	profiles[0].Fragment = &model.FragmentBaseline{Length: "100-200", Interval: "10-20", Packets: "tlshello"}
+	if err := capability.Check(profiles[0], nil); err != nil {
+		t.Fatal("synthetic fragment profile is not applicable", err)
+	}
 	input, err := json.Marshal(profiles)
 	if err != nil {
 		t.Fatal(err)
