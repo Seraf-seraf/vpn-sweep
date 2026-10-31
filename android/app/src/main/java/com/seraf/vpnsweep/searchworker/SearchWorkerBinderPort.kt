@@ -45,6 +45,7 @@ internal fun createSearchWorkerRound(
 private const val FRAME_HEADER_BYTES = 16
 private const val FRAME_BUFFER_BYTES = 8 * 1024
 private const val MAX_CLEANUP_MILLIS = 60_000L
+private const val CANCELLED_BEFORE_BIND = -1
 
 internal class SearchWorkerBinderPort(
     private val coordinator: SearchWorkerCoordinator,
@@ -61,6 +62,9 @@ internal class SearchWorkerBinderPort(
     private var cancelled = false
     private var cancelPending = false
     private var cancelConfirmed = false
+    private var cleanupDeadline: Long? = null
+    private var cleanupBudgetMillis = 0L
+    private var callWake: CountDownLatch? = null
     private var bindingStarted = false
     private var inFlight = false
     private var pendingReply: ReceivedFdInput? = null
@@ -78,25 +82,55 @@ internal class SearchWorkerBinderPort(
             cleanupMillis !in 1..MAX_CLEANUP_MILLIS || !validFrame(frame)
         ) return WorkerOpenV2.Fatal(WorkerFatalV2.CAPABILITY_UNAVAILABLE)
         val deadline = minOf(startupDeadlineElapsedMillis, frame.deadlineElapsedMillis)
-        val reserved = synchronized(lock) {
-            if (state != State.NEW || cancelled) false else {
-                state = State.OPENING
-                true
+        val reservation = synchronized(lock) {
+            when {
+                state != State.NEW -> 0
+                cancelled -> {
+                    state = State.CLOSING
+                    1
+                }
+                else -> {
+                    state = State.OPENING
+                    cleanupBudgetMillis = cleanupMillis
+                    2
+                }
             }
         }
-        if (!reserved) return WorkerOpenV2.Fatal(WorkerFatalV2.BUSY)
+        if (reservation == 0) return WorkerOpenV2.Fatal(WorkerFatalV2.BUSY)
+        if (reservation == 1) {
+            val end = synchronized(lock) { cleanupDeadline } ?: return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
+            val closed = bounded(end, {}) { duplicate.close(); true }
+            val retired = synchronized(lock) {
+                if (closed != true || state != State.CLOSING) false else {
+                    state = State.RETIRED
+                    true
+                }
+            }
+            return if (retired) WorkerOpenV2.Interrupted(WorkerInterruptedV2.CANCELLED)
+            else WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
+        }
         val status = bounded(deadline, {}) {
             val descriptor = stageFrame(frame, deadline)
             try {
-                val mayBind = synchronized(lock) {
-                    if (state != State.OPENING || cancelled) false else {
-                        bindingStarted = true
-                        true
+                val bindDecision = synchronized(lock) {
+                    when {
+                        state != State.OPENING -> 0
+                        cancelled -> 1
+                        else -> {
+                            bindingStarted = true
+                            2
+                        }
                     }
                 }
-                if (!mayBind || !coordinator.bind()) throw IOException("worker_admission_unknown")
+                if (bindDecision == 1) {
+                    duplicate.close()
+                    return@bounded CANCELLED_BEFORE_BIND
+                }
+                if (bindDecision != 2 || !coordinator.bind()) throw IOException("worker_admission_unknown")
                 val binder = coordinator.awaitConfirmed(deadline) ?: throw IOException("worker_admission_unknown")
                 requireTime(deadline)
+                val dispatch = synchronized(lock) { state == State.OPENING && !cancelled }
+                if (!dispatch) throw IOException("worker_delivery_unknown")
                 val code = statusTransaction(binder, SearchWorkerIpcV2.OPEN_FD) { request ->
                     request.writeWorkerIdentity(identity, network)
                     request.writeLong(startupDeadlineElapsedMillis)
@@ -111,6 +145,16 @@ internal class SearchWorkerBinderPort(
                 descriptor.close()
             }
         } ?: return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY)
+        if (status == CANCELLED_BEFORE_BIND) {
+            val retired = synchronized(lock) {
+                if (state != State.OPENING || !cancelled || bindingStarted) false else {
+                    state = State.RETIRED
+                    true
+                }
+            }
+            return if (retired) WorkerOpenV2.Interrupted(WorkerInterruptedV2.CANCELLED)
+            else WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
+        }
         if (status.toLong() != Mobile.SearchWorkerReady) {
             failClosed()
             return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY)
@@ -138,13 +182,31 @@ internal class SearchWorkerBinderPort(
             }
         }
         if (!reserved) return WorkerReplyV1.Quarantined.also { failClosed() }
-        val reply = bounded(frame.deadlineElapsedMillis, ::discardReply) {
-            val descriptor = stageFrame(frame, frame.deadlineElapsedMillis)
+        val operationDeadline = frame.deadlineElapsedMillis
+        val reply = awaitCall(operationDeadline, ::discardReply) {
+            val descriptor = try {
+                stageFrame(frame, operationDeadline)
+            } catch (_: WorkerFrameDeadline) {
+                return@awaitCall WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
+            }
             var result: WorkerReplyV1? = null
             try {
                 val binder = coordinator.confirmedBinder() ?: throw IOException("worker_owner_unknown")
-                requireTime(frame.deadlineElapsedMillis)
-                val produced = callTransaction(binder, operation, frame, descriptor)
+                try {
+                    requireTime(operationDeadline)
+                } catch (_: WorkerFrameDeadline) {
+                    return@awaitCall WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
+                }
+                val dispatch = synchronized(lock) {
+                    when {
+                        state != State.READY || !inFlight -> 0
+                        cancelled -> 1
+                        else -> 2
+                    }
+                }
+                if (dispatch == 0) throw IOException("worker_delivery_unknown")
+                val produced = if (dispatch == 1) WorkerReplyV1.Interrupted(WorkerInterruptedV2.CANCELLED)
+                else callTransaction(binder, operation, frame, descriptor)
                 result = produced
                 if (coordinator.confirmedBinder() !== binder) {
                     discardReply(produced)
@@ -161,8 +223,35 @@ internal class SearchWorkerBinderPort(
                 }
             }
         } ?: return WorkerReplyV1.Quarantined
+        val now = SystemClock.elapsedRealtime()
+        if (now < 0) {
+            discardReplyAsync(reply)
+            return WorkerReplyV1.Quarantined.also { failClosed() }
+        }
+        if (now >= operationDeadline) {
+            val budget = synchronized(lock) { cleanupBudgetMillis }
+            if (budget <= 0 || operationDeadline > Long.MAX_VALUE - budget) {
+                discardReplyAsync(reply)
+                return WorkerReplyV1.Quarantined.also { failClosed() }
+            }
+            synchronized(lock) { tightenCleanupDeadline(operationDeadline + budget) }
+        }
+        val dispositionState = synchronized(lock) { Triple(state, cancelled, cleanupDeadline) }
+        if (dispositionState.first != State.READY || (dispositionState.third != null && now >= dispositionState.third!!)) {
+            discardReplyAsync(reply)
+            return WorkerReplyV1.Quarantined.also { failClosed() }
+        }
+        val cancelledBeforeDisposition = dispositionState.second
+        val disposed = if (reply is WorkerReplyV1.Complete && (now >= operationDeadline || cancelledBeforeDisposition)) {
+            val closed = awaitCall(operationDeadline, {}) { reply.result.close(); true }
+            if (closed != true) return WorkerReplyV1.Quarantined
+            WorkerReplyV1.Interrupted(if (cancelledBeforeDisposition) WorkerInterruptedV2.CANCELLED else WorkerInterruptedV2.DEADLINE)
+        } else reply
+        val finishedAt = SystemClock.elapsedRealtime()
         val accepted = synchronized(lock) {
-            if (state != State.READY || reply == WorkerReplyV1.Quarantined) {
+            if (state != State.READY || disposed == WorkerReplyV1.Quarantined || finishedAt < 0 ||
+                (cleanupDeadline != null && finishedAt >= cleanupDeadline!!)
+            ) {
                 state = State.QUARANTINED
                 ownerLease.quarantine()
                 false
@@ -172,11 +261,11 @@ internal class SearchWorkerBinderPort(
             }
         }
         if (!accepted) {
-            discardReplyAsync(reply)
+            discardReplyAsync(disposed)
             failClosed()
             return WorkerReplyV1.Quarantined
         }
-        return reply
+        return disposed
     }
 
     override fun cancelUntil(identity: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): Unit {
@@ -184,9 +273,15 @@ internal class SearchWorkerBinderPort(
             failClosed()
             throw IOException("worker_identity_unknown")
         }
+        if (remaining(cleanupDeadlineElapsedMillis) <= 0) {
+            failClosed()
+            throw IOException("worker_deadline")
+        }
         var conflict = false
+        var effectiveDeadline = cleanupDeadlineElapsedMillis
         val send = synchronized(lock) {
             cancelled = true
+            effectiveDeadline = tightenCleanupDeadline(cleanupDeadlineElapsedMillis)
             if (cancelPending) {
                 conflict = true
                 false
@@ -208,11 +303,11 @@ internal class SearchWorkerBinderPort(
             throw IOException("worker_delivery_unknown")
         }
         if (!send) return
-        val confirmed = bounded(cleanupDeadlineElapsedMillis, {}) {
-            val binder = coordinator.awaitConfirmed(cleanupDeadlineElapsedMillis) ?: throw IOException("worker_owner_unknown")
-            requireTime(cleanupDeadlineElapsedMillis)
+        val confirmed = bounded(effectiveDeadline, {}) {
+            val binder = coordinator.awaitConfirmed(effectiveDeadline) ?: throw IOException("worker_owner_unknown")
+            requireTime(effectiveDeadline)
             val status = statusTransaction(binder, SearchWorkerIpcV2.CANCEL_ROUND) { it.writeWorkerIdentity(identity, network) }
-            requireTime(cleanupDeadlineElapsedMillis)
+            requireTime(effectiveDeadline)
             status.toLong() == Mobile.SearchWorkerReady
         }
         if (confirmed != true) {
@@ -231,11 +326,13 @@ internal class SearchWorkerBinderPort(
 
     override fun closeUntil(identity: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): WorkerCloseV1 {
         if (identity != this.identity) return WorkerCloseV1.QUARANTINED.also { failClosed() }
+        var effectiveDeadline = cleanupDeadlineElapsedMillis
         val disposition = synchronized(lock) {
             when {
                 state == State.RETIRED -> 1
                 state != State.READY || inFlight || pendingReply != null || cancelPending -> 0
                 else -> {
+                    effectiveDeadline = tightenCleanupDeadline(cleanupDeadlineElapsedMillis)
                     state = State.CLOSING
                     2
                 }
@@ -243,18 +340,18 @@ internal class SearchWorkerBinderPort(
         }
         if (disposition == 1) return WorkerCloseV1.CLEAN_AND_DEAD
         if (disposition != 2) return WorkerCloseV1.QUARANTINED.also { failClosed() }
-        val retired = bounded(cleanupDeadlineElapsedMillis, {}) {
+        val retired = bounded(effectiveDeadline, {}) {
             val binder = coordinator.confirmedBinder() ?: throw IOException("worker_owner_unknown")
-            requireTime(cleanupDeadlineElapsedMillis)
+            requireTime(effectiveDeadline)
             val status = statusTransaction(binder, SearchWorkerIpcV2.CLOSE_ROUND) {
                 it.writeWorkerIdentity(identity, network)
-                it.writeLong(cleanupDeadlineElapsedMillis)
+                it.writeLong(effectiveDeadline)
             }
             if (status.toLong() != Mobile.SearchWorkerReady) throw IOException("worker_cleanup_unknown")
-            requireTime(cleanupDeadlineElapsedMillis)
+            requireTime(effectiveDeadline)
             coordinator.stop()
-            if (!coordinator.awaitRetired(cleanupDeadlineElapsedMillis)) throw IOException("worker_death_unknown")
-            requireTime(cleanupDeadlineElapsedMillis)
+            if (!coordinator.awaitRetired(effectiveDeadline)) throw IOException("worker_death_unknown")
+            requireTime(effectiveDeadline)
             true
         }
         val completed = synchronized(lock) {
@@ -313,7 +410,7 @@ internal class SearchWorkerBinderPort(
             failure = IOException("worker_fd_close_unknown")
         }
         if (failure != null) {
-            try { duplicate?.close() } catch (_: Exception) { }
+            try { duplicate?.close() } catch (_: Exception) { throw IOException("worker_fd_close_unknown") }
             throw failure
         }
         return duplicate ?: throw IOException("worker_fd_unknown")
@@ -384,6 +481,107 @@ internal class SearchWorkerBinderPort(
             return read(response)
         } finally {
             try { request.recycle() } finally { response.recycle() }
+        }
+    }
+
+    // Called only while holding lock. A later cleanup request can shorten, never extend, the budget.
+    private fun tightenCleanupDeadline(proposed: Long): Long {
+        val previous = cleanupDeadline
+        val chosen = if (previous == null) proposed else minOf(previous, proposed)
+        if (previous == null || chosen < previous) {
+            cleanupDeadline = chosen
+            callWake?.countDown()
+        }
+        return chosen
+    }
+
+    private fun <T : Any> awaitCall(operationDeadline: Long, discard: (T) -> Unit, action: () -> T): T? {
+        val resultLock = Any()
+        var completed = false
+        var abandoned = false
+        var result: T? = null
+        var installedWake: CountDownLatch? = null
+
+        fun abandon(): T? {
+            val stale = synchronized(resultLock) {
+                abandoned = true
+                result.also { result = null }
+            }
+            failClosed()
+            if (stale != null) {
+                try {
+                    Thread({ try { discard(stale) } catch (_: Exception) { } }, "search-worker-discard")
+                        .apply { isDaemon = true }.start()
+                } catch (_: Exception) { }
+            }
+            return null
+        }
+
+        try {
+            Thread({
+                val value = try { action() } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    null
+                } catch (_: Exception) { null } catch (_: LinkageError) { null }
+                val stale = synchronized(resultLock) {
+                    if (abandoned) value else {
+                        result = value
+                        completed = true
+                        null
+                    }
+                }
+                synchronized(lock) { callWake?.countDown() }
+                if (stale != null) try { discard(stale) } catch (_: Exception) { }
+            }, "search-worker-call").apply { isDaemon = true }.start()
+        } catch (_: Exception) {
+            return abandon()
+        } catch (_: LinkageError) {
+            return abandon()
+        }
+
+        try {
+            while (true) {
+                val now = SystemClock.elapsedRealtime()
+                if (now < 0) return abandon()
+                if (now >= operationDeadline) {
+                    val budget = synchronized(lock) { cleanupBudgetMillis }
+                    if (budget <= 0 || operationDeadline > Long.MAX_VALUE - budget) return abandon()
+                    synchronized(lock) { tightenCleanupDeadline(operationDeadline + budget) }
+                }
+                val snapshot = synchronized(lock) { state to cleanupDeadline }
+                if (snapshot.first == State.QUARANTINED) return abandon()
+                val limit = if (now < operationDeadline) minOf(operationDeadline, snapshot.second ?: operationDeadline)
+                else snapshot.second ?: return abandon()
+                if (now >= limit) return abandon()
+
+                var done = false
+                var value: T? = null
+                val wake = synchronized(resultLock) {
+                    if (completed) {
+                        done = true
+                        value = result
+                        result = null
+                        null
+                    } else {
+                        synchronized(lock) {
+                            CountDownLatch(1).also {
+                                callWake = it
+                                installedWake = it
+                                if (state == State.QUARANTINED || cleanupDeadline != snapshot.second) it.countDown()
+                            }
+                        }
+                    }
+                }
+                if (done) return value ?: abandon()
+                try {
+                    wake!!.await(limit - now, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return abandon()
+                }
+            }
+        } finally {
+            synchronized(lock) { if (callWake === installedWake) callWake = null }
         }
     }
 
@@ -471,6 +669,7 @@ internal class SearchWorkerBinderPort(
         synchronized(lock) {
             state = State.QUARANTINED
             ownerLease.quarantine()
+            callWake?.countDown()
         }
         coordinator.quarantine()
     }
@@ -481,8 +680,12 @@ private fun remaining(deadline: Long): Long {
     return if (now < 0 || deadline <= now) 0 else deadline - now
 }
 
+private class WorkerFrameDeadline : IOException("worker_deadline")
+
 private fun requireTime(deadline: Long): Unit {
-    if (remaining(deadline) <= 0) throw IOException("worker_deadline")
+    val now = SystemClock.elapsedRealtime()
+    if (now < 0) throw IOException("worker_clock_unknown")
+    if (deadline <= now) throw WorkerFrameDeadline()
 }
 
 internal fun operationNumber(operation: WorkerOperationV1): Int = when (operation) {
