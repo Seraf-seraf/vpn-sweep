@@ -455,6 +455,19 @@ class VpnRunTest {
     }
 
     @Test
+    fun uncertainCleanupKeepsSharedRegistryUnavailable(): Unit = runBlocking {
+        for (failedCleanup in listOf("stop", "close", "foreground")) {
+            val fixture = Fixture(failAt = setOf("start", failedCleanup))
+            val run = fixture.reserve()!!
+            val job = run.launch(CoroutineScope(coroutineContext + Dispatchers.IO), fixture.operations)
+            withTimeout(TIMEOUT_MS) { job.join() }
+            assertFalse("$failedCleanup must keep readiness closed", fixture.registry.available())
+            val nextService = Fixture(fixture.registry)
+            assertNull("$failedCleanup must not release the owner", nextService.reserve())
+        }
+    }
+
+    @Test
     fun promotionFailureStillReleasesRunAndReportsError(): Unit = runBlocking {
         val fixture = Fixture()
         val run = fixture.reserve()!!

@@ -28,30 +28,35 @@ internal object VpnCancellation {
 internal class VpnRunRegistry(private val cancellation: (Job) -> Unit = VpnCancellation::schedule) {
     private val lock = Any()
     private var current: VpnRun? = null
+    private var cleanupUncertain = false
 
     fun reserve(
         deferDelivery: (() -> Unit) -> Unit = { it() },
         stopping: () -> Unit,
     ): VpnRun? = guarded {
-        if (current != null) return@guarded null
+        if (current != null || cleanupUncertain) return@guarded null
         VpnRun(this, stopping, deferDelivery).also { current = it }
     }
 
     fun <T> guarded(action: () -> T): T = synchronized(lock, action)
+
+    fun available(): Boolean = guarded { current == null && !cleanupUncertain }
+
+    fun quarantine(): Unit = guarded { cleanupUncertain = true }
 
     fun scheduleCancellation(job: Job): Unit = cancellation(job)
 
     fun claim(run: VpnRun): Boolean = guarded {
         if (current !== run) return@guarded false
         run.finishLocked()
-        current = null
+        if (!cleanupUncertain) current = null
         true
     }
 
     fun release(run: VpnRun, publishTerminal: () -> Unit): Unit = guarded {
         if (current === run) {
             run.finishLocked()
-            current = null
+            if (!cleanupUncertain) current = null
             publishTerminal()
         }
     }
@@ -163,6 +168,8 @@ internal class VpnRun(
 
     fun claimRelease(): Boolean = registry.claim(this)
 
+    fun quarantineCleanup(): Unit = registry.quarantine()
+
     fun checkActive(): Unit = registry.guarded {
         if (stopped || finished) throw CancellationException("vpn_stopped")
     }
@@ -210,13 +217,17 @@ internal class VpnRun(
                     if (failed && failure == null) failure = VpnRunFailure.Status
                     try {
                         operations.stop()
-                    } catch (_: Exception) {
+                    } catch (cause: Throwable) {
+                        registry.quarantine()
                         failure = VpnRunFailure.Stop
+                        if (cause !is Exception) throw cause
                     } finally {
                         try {
                             tunnel?.let { operations.close(it) }
-                        } catch (_: Exception) {
+                        } catch (cause: Throwable) {
+                            registry.quarantine()
                             failure = VpnRunFailure.Close
+                            if (cause !is Exception) throw cause
                         }
                     }
                 } finally {
@@ -233,6 +244,7 @@ internal class VpnRun(
                     val fallback: (Exception) -> Unit = { _ ->
                         if (!complete) {
                             complete = true
+                            registry.quarantine()
                             if (failure == null || failure is VpnRunFailure.Operation) {
                                 failure = VpnRunFailure.ServiceCleanup
                             }

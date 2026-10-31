@@ -90,6 +90,7 @@ internal class VpnServiceLifecycle {
                 } catch (exception: Exception) {
                     failure = exception
                 }
+                if (failure != null) run.quarantineCleanup()
                 if (!claimRelease(run)) return@withContext false
                 complete(failure)
                 true
