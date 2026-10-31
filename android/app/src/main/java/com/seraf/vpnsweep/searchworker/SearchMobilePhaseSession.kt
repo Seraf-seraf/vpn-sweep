@@ -18,6 +18,12 @@ internal class SearchMobilePhaseProgress(private val deliver: (Long, SearchProgr
         deliver(epoch, progress)
     }
 
+    fun admit(): Unit = synchronized(lock) {
+        if (revoked) throw IOException("search_phase_unavailable")
+    }
+
+    fun isRevoked(): Boolean = synchronized(lock) { revoked }
+
     fun runPhase(epoch: Long, run: (Long) -> String): String {
         synchronized(lock) {
             if (revoked || activeEpoch != null || epoch <= 0) throw IOException("search_phase_unavailable")
@@ -41,26 +47,25 @@ internal class SearchMobilePhaseSession internal constructor(
     close: () -> Unit,
     private val progress: SearchMobilePhaseProgress,
     private val paused: () -> SearchResourceStateV2,
-    private val release: () -> SearchResourceStateV2,
     private val quarantineOwner: () -> Unit,
 ) : SearchPhaseSession {
     constructor(
         session: SearchSession,
         progress: SearchMobilePhaseProgress,
         paused: () -> SearchResourceStateV2,
-        release: () -> SearchResourceStateV2,
         quarantineOwner: () -> Unit,
     ) : this(
         session::preparePhase, session::runPhase, session::cancelPhase,
-        { openMobileResult(session) }, session::close, progress, paused, release, quarantineOwner,
+        { openMobileResult(session) }, session::close, progress, paused, quarantineOwner,
     )
 
-    private val quarantined = AtomicBoolean(false)
+    private val quarantineDispatched = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val closeOnce = LeaseCloseOnce(close)
 
     override fun preparePhase(epoch: Long): Unit {
         ensureAvailable()
+        progress.admit()
         prepare(epoch)
         ensureAvailable()
     }
@@ -76,8 +81,9 @@ internal class SearchMobilePhaseSession internal constructor(
 
     override fun openVerifiedResult(): LocalOpenedResult {
         ensureAvailable()
+        progress.admit()
         val result = openResult()
-        if (quarantined.get() || closed.get()) {
+        if (progress.isRevoked() || closed.get()) {
             try { result.input.close() } catch (_: Exception) { }
             throw IOException("search_result_unavailable")
         }
@@ -85,6 +91,7 @@ internal class SearchMobilePhaseSession internal constructor(
     }
 
     override fun closeSession(): Unit {
+        progress.revoke()
         closed.set(true)
         try {
             closeOnce.close()
@@ -95,24 +102,27 @@ internal class SearchMobilePhaseSession internal constructor(
     }
 
     override fun pauseResources(): SearchResourceStateV2 = resources(SearchResourceStateV2.PAUSED_LEASE_HELD, paused)
-    override fun releaseResources(): SearchResourceStateV2 = resources(SearchResourceStateV2.RELEASED, release)
+    override fun releaseResources(): SearchResourceStateV2 {
+        try { quarantine() } catch (_: Exception) { }
+        return SearchResourceStateV2.QUARANTINED
+    }
 
     override fun quarantine(): Unit {
-        if (quarantined.compareAndSet(false, true)) {
-            progress.revoke()
+        progress.revoke()
+        if (quarantineDispatched.compareAndSet(false, true)) {
             quarantineOwner()
         }
     }
 
     private fun ensureAvailable(): Unit {
-        if (quarantined.get() || closed.get()) throw IOException("search_session_unavailable")
+        if (progress.isRevoked() || closed.get()) throw IOException("search_session_unavailable")
     }
 
     private fun resources(expected: SearchResourceStateV2, action: () -> SearchResourceStateV2): SearchResourceStateV2 {
-        if (quarantined.get()) return SearchResourceStateV2.QUARANTINED
+        try { progress.admit() } catch (_: IOException) { return SearchResourceStateV2.QUARANTINED }
         val result = try { action() } catch (_: Exception) { SearchResourceStateV2.QUARANTINED }
         catch (_: LinkageError) { SearchResourceStateV2.QUARANTINED }
-        if (!quarantined.get() && result == expected) return result
+        if (!progress.isRevoked() && result == expected) return result
         try { quarantine() } catch (_: Exception) { }
         return SearchResourceStateV2.QUARANTINED
     }
