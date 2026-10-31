@@ -234,7 +234,7 @@ func run(ctx context.Context, command string, o options, in io.Reader, out, errO
 			return e
 		}
 		raw, _ := json.Marshal(g.Spec)
-		m = model.Manifest{Version: 1, SearchVersion: model.SearchVersion, SeriesID: model.ID(), Created: time.Now().UTC(), Mode: "core", Environment: "unverified", Core: id, InputID: model.PrivateID(key, profiles), Space: raw, Policy: pol, Budgets: o.budgets, TrustID: "system"}
+		m = model.Manifest{Version: 1, SearchVersion: model.SearchVersion, SeriesID: model.ID(), Created: s.Clock().Now().UTC(), Mode: "core", Environment: "unverified", Core: id, InputID: model.PrivateID(key, profiles), Space: raw, Policy: pol, Budgets: o.budgets, TrustID: "system"}
 		if len(o.trust) > 0 {
 			b := o.trust
 			roots = x509.NewCertPool()

@@ -5,9 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"github.com/Seraf-seraf/vpn-sweep/internal/clock"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
-	"time"
 )
 
 var dnsQuestion = []byte{3, 'w', 'w', 'w', 6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
@@ -15,7 +15,8 @@ var dnsQuestion = []byte{3, 'w', 'w', 'w', 6, 'g', 'o', 'o', 'g', 'l', 'e', 3, '
 const MaxDNSResponseBytes = 512
 
 func UDPDNS(ctx context.Context, proxy socks.Endpoint, id, address string, round int) model.ProbeResult {
-	start := time.Now()
+	c := clock.FromContext(ctx)
+	start := c.Now()
 	result := model.ProbeResult{ID: model.ID(), Probe: id, Round: round, Transport: "udp-socks5", Phase: "udp"}
 	query := make([]byte, 12, 12+len(dnsQuestion))
 	if _, err := rand.Read(query[:2]); err != nil {
@@ -27,7 +28,7 @@ func UDPDNS(ctx context.Context, proxy socks.Endpoint, id, address string, round
 	query = append(query, dnsQuestion...)
 	reply, err := proxy.UDPExchange(ctx, address, query, MaxDNSResponseBytes)
 	result.Bytes = int64(len(reply))
-	result.DurationMS = time.Since(start).Milliseconds()
+	result.DurationMS = c.Now().Sub(start).Milliseconds()
 	if err != nil {
 		result.Outcome = model.Code(err)
 	} else if !validDNSAnswer(query, reply) {

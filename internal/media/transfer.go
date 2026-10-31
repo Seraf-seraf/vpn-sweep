@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Seraf-seraf/vpn-sweep/internal/clock"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
 )
@@ -184,9 +185,10 @@ type Client struct {
 }
 
 func (c Client) sample(ctx context.Context, proxy socks.Endpoint, raw string, n int64, ranged bool, minHeight int, wantHash string, v *model.VideoPolicy) (s model.MediaSample, outcome string) {
-	started := time.Now()
-	defer func() { s.DurationNS = time.Since(started).Nanoseconds() }()
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(v.TimeoutSeconds)*time.Second)
+	curr := clock.FromContext(ctx)
+	started := curr.Now()
+	defer func() { s.DurationNS = curr.Now().Sub(started).Nanoseconds() }()
+	ctx, cancel := curr.WithTimeout(ctx, time.Duration(v.TimeoutSeconds)*time.Second)
 	defer cancel()
 	tr := &http.Transport{Proxy: nil, DialContext: proxy.DialContext, TLSClientConfig: &tls.Config{RootCAs: c.Roots, MinVersion: tls.VersionTLS12}, DisableKeepAlives: true, DisableCompression: true}
 	defer tr.CloseIdleConnections()
@@ -241,14 +243,14 @@ func (c Client) sample(ctx context.Context, proxy socks.Endpoint, raw string, n 
 	h := sha256.New()
 	prefix := make([]byte, 0, prefixLimit)
 	buf := make([]byte, 32<<10)
-	last := time.Now()
+	last := curr.Now()
 	gapLimit := time.Duration(v.MaxReadGapMS) * time.Millisecond
-	timer := time.AfterFunc(gapLimit, cancel)
+	timer := curr.AfterFunc(gapLimit, cancel)
 	defer timer.Stop()
 	for s.Bytes <= n {
 		readStart := last
 		got, err := resp.Body.Read(buf[:min(int64(len(buf)), n-s.Bytes+1)])
-		now := time.Now()
+		now := curr.Now()
 		gap := now.Sub(readStart)
 		if gap.Nanoseconds() > s.MaxReadGapNS {
 			s.MaxReadGapNS = gap.Nanoseconds()
@@ -289,7 +291,7 @@ func (c Client) sample(ctx context.Context, proxy socks.Endpoint, raw string, n 
 	if !s.ContainerVerified {
 		return s, "container_unsupported_or_invalid"
 	}
-	if float64(n)*8/time.Since(started).Seconds()/1e6 < v.MinMbps {
+	if float64(n)*8/curr.Now().Sub(started).Seconds()/1e6 < v.MinMbps {
 		return s, "throughput_below_threshold"
 	}
 	return s, "pass"
@@ -300,7 +302,8 @@ func (c Client) Round(ctx context.Context, proxy socks.Endpoint, p model.Policy,
 	}
 	v := p.Video
 	r := model.ProbeResult{ID: model.ID(), Probe: Transfer, Round: round, Transport: "https-tcp", Phase: "media", Outcome: "pass", Media: &model.MediaEvidence{Version: 1, Capability: Transfer}}
-	started := time.Now()
+	curr := clock.FromContext(ctx)
+	started := curr.Now()
 	if v.Reference.Status != "verified_reference" {
 		r.Outcome = "reference_unverified"
 	}
@@ -315,7 +318,7 @@ func (c Client) Round(ctx context.Context, proxy socks.Endpoint, p model.Policy,
 			}
 		}
 	}
-	r.DurationMS = time.Since(started).Milliseconds()
+	r.DurationMS = curr.Now().Sub(started).Milliseconds()
 	r.TLSVerified = r.Outcome == "pass"
 	r.ContentVerified = r.Outcome == "pass"
 	return []model.ProbeResult{r}

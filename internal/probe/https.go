@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"github.com/Seraf-seraf/vpn-sweep/internal/clock"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
 	"io"
@@ -56,19 +57,20 @@ func Validate(p model.Probe) error {
 	return nil
 }
 func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, round int) model.ProbeResult {
-	started := time.Now()
+	curr := clock.FromContext(ctx)
+	started := curr.Now()
 	r := model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Transport: "https-tcp", Phase: "request"}
 	defer func() {}()
 	finish := func(outcome, phase string) model.ProbeResult {
 		r.Outcome = outcome
 		r.Phase = phase
-		r.DurationMS = time.Since(started).Milliseconds()
+		r.DurationMS = curr.Now().Sub(started).Milliseconds()
 		return r
 	}
 	if Validate(p) != nil {
 		return finish("invalid_probe", "validation")
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
+	ctx, cancel := curr.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
 	defer cancel()
 	u, _ := url.Parse(p.URL)
 	tr := &http.Transport{Proxy: nil, DialContext: proxy.DialContext, DisableKeepAlives: true, ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: c.Roots, MinVersion: tls.VersionTLS12}, MaxResponseHeaderBytes: 64 << 10}

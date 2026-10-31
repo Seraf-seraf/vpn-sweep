@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/Seraf-seraf/vpn-sweep/internal/clock"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/private"
 	"io"
@@ -67,9 +68,17 @@ type Store struct {
 	seen     map[string]bool
 	write    func([]byte) (int, error)
 	syncFile func() error
+	clock    clock.Clock
 }
 
 func Open(dir string, maxBytes int64) (*Store, error) {
+	return OpenWithClock(dir, maxBytes, clock.System{})
+}
+
+func OpenWithClock(dir string, maxBytes int64, c clock.Clock) (*Store, error) {
+	if c == nil {
+		c = clock.System{}
+	}
 	d, e := private.Dir(dir)
 	if e != nil {
 		return nil, e
@@ -87,7 +96,7 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 		l.Close()
 		return nil, e
 	}
-	s := &Store{Dir: d, lock: l, file: f, maxBytes: maxBytes, view: View{Next: "0", Status: "ready"}, seen: map[string]bool{}}
+	s := &Store{Dir: d, lock: l, file: f, maxBytes: maxBytes, view: View{Next: "0", Status: "ready"}, seen: map[string]bool{}, clock: c}
 	s.write = f.Write
 	s.syncFile = f.Sync
 	if e = s.replay(); e != nil {
@@ -100,6 +109,8 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 	}
 	return s, nil
 }
+func (s *Store) Clock() clock.Clock { return s.clock }
+
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,7 +266,7 @@ func (s *Store) append(e Event) error {
 	if s.poisoned {
 		return model.Err("state_requires_reopen", "state")
 	}
-	e.At = time.Now().UTC()
+	e.At = s.clock.Now().UTC()
 	payload, err := json.Marshal(e)
 	if err != nil {
 		return err

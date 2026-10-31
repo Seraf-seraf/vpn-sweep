@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"github.com/Seraf-seraf/vpn-sweep/internal/capability"
+	"github.com/Seraf-seraf/vpn-sweep/internal/clock"
 	"github.com/Seraf-seraf/vpn-sweep/internal/media"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/policy"
@@ -99,10 +100,12 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 	if b.AttemptSeconds < 1 {
 		return "invalid_budget", model.Err("invalid_budget", "search")
 	}
+	c := s.Clock()
+	ctx = clock.WithContext(ctx, c)
 	session := ctx
 	cancel := func() {}
 	if b.SessionSeconds > 0 {
-		session, cancel = context.WithTimeout(ctx, time.Duration(b.SessionSeconds)*time.Second)
+		session, cancel = c.WithTimeout(ctx, time.Duration(b.SessionSeconds)*time.Second)
 	}
 	defer cancel()
 	status := func(v string) (string, error) { return v, s.Status(v) }
@@ -177,7 +180,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 			}
 			next = n.String()
 		}
-		a := model.Attempt{ID: model.ID(), Candidate: c, Started: time.Now().UTC(), Outcome: "running"}
+		a := model.Attempt{ID: model.ID(), Candidate: c, Started: s.Clock().Now().UTC(), Outcome: "running"}
 		if err := s.Begin(a, next); err != nil {
 			if model.Code(err) == "journal_budget" {
 				e.notify(s, Progress{Event: "budget_reached", Outcome: "journal_budget"})
@@ -215,7 +218,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 		}
 		usedAttempts++
 		e.notify(s, Progress{Event: "attempt_started"})
-		attemptCtx, stop := context.WithTimeout(session, time.Duration(b.AttemptSeconds)*time.Second)
+		attemptCtx, stop := s.Clock().WithTimeout(session, time.Duration(b.AttemptSeconds)*time.Second)
 		outcome, err := e.attempt(attemptCtx, m, profiles[c.Profile], c, s, initial.PayloadBytes)
 
 		// Parent cancellation wins over a child deadline: only parent interruption
@@ -286,12 +289,7 @@ func (e Engine) Run(ctx context.Context, m model.Manifest, profiles []model.Prof
 				}
 			}
 		}
-		timer := time.NewTimer(time.Duration(b.IntervalMS) * time.Millisecond)
-		select {
-		case <-session.Done():
-			timer.Stop()
-		case <-timer.C:
-		}
+		s.Clock().Wait(session, time.Duration(b.IntervalMS)*time.Millisecond)
 	}
 }
 func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, c model.Candidate, s *state.Store, initialBytes int64) (string, error) {
@@ -423,7 +421,7 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 				return "interrupted", nil
 			}
 			e.notify(s, Progress{Event: "probe_started", Round: round + 1, Probe: len(m.Policy.Probes) + i + 1})
-			udpCtx, cancel := context.WithTimeout(ctx, time.Duration(pr.TimeoutSeconds)*time.Second)
+			udpCtx, cancel := s.Clock().WithTimeout(ctx, time.Duration(pr.TimeoutSeconds)*time.Second)
 			r := e.UDP(udpCtx, h.Endpoint(), pr, round)
 			cancel()
 			if err = e.recordProbe(s, r, len(m.Policy.Probes)+i+1); err != nil {
