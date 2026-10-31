@@ -6,14 +6,18 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.AfterClass
@@ -25,6 +29,114 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VpnRunTest {
+    @Test
+    fun stopReturnsWhileCancellationHandlerIsBlocked(): Unit = runBlocking {
+        val fixture = Fixture(blockCancellation = true)
+        val run = fixture.reserve()!!
+        val job = run.launch(CoroutineScope(coroutineContext + Dispatchers.IO), fixture.operations)
+        val executor = Executors.newSingleThreadExecutor()
+        val returned = CountDownLatch(1)
+        try {
+            assertTrue(fixture.handlerRegistered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val stop = executor.submit<Boolean> {
+                val result = run.stop()
+                returned.countDown()
+                result
+            }
+            assertTrue(fixture.handlerEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            assertEquals("STOPPING", fixture.state.get())
+            assertTrue("STOP waited for the cancellation handler", returned.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            assertTrue(stop.get(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        } finally {
+            fixture.handlerRelease.countDown()
+            executor.shutdown()
+            withTimeout(TIMEOUT_MS) { job.join() }
+            executor.shutdownNow()
+        }
+        assertEquals("DISCONNECTED", fixture.state.get())
+        assertEquals(1, fixture.events.count { it == "stop" })
+        assertEquals(1, fixture.events.count { it == "close" })
+    }
+
+    @Test
+    fun stopBeforeAttachSchedulesCancellationOnlyOnce(): Unit = runBlocking {
+        val scheduled = Collections.synchronizedList(mutableListOf<Job>())
+        val fixture = Fixture(registry = VpnRunRegistry { scheduled.add(it) })
+        val run = fixture.reserve()!!
+        val dispatcher = QueuedDispatcher { repeat(32) { assertTrue(run.stop()) } }
+        val job = run.launch(CoroutineScope(coroutineContext + dispatcher), fixture.operations)
+
+        repeat(32) { assertTrue(run.stop()) }
+        assertEquals(1, scheduled.size)
+        scheduled.single().cancel()
+        dispatcher.drain()
+        withTimeout(TIMEOUT_MS) { job.join() }
+        assertEquals(1, fixture.events.count { it == "stopping" })
+        assertEquals(1, fixture.events.count { it == "stop" })
+        assertEquals("DISCONNECTED", fixture.state.get())
+    }
+
+    @Test
+    fun repeatedStopWhileHandlerIsBlockedSchedulesOnce(): Unit = runBlocking {
+        val scheduled = AtomicInteger()
+        val fixture = Fixture(
+            registry = VpnRunRegistry { job ->
+                scheduled.incrementAndGet()
+                VpnCancellation.schedule(job)
+            },
+            blockCancellation = true,
+        )
+        val run = fixture.reserve()!!
+        val job = run.launch(CoroutineScope(coroutineContext + Dispatchers.IO), fixture.operations)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            assertTrue(fixture.handlerRegistered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            assertTrue(stopPromptly(run))
+            assertTrue(fixture.handlerEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val repeated = executor.submit { repeat(128) { assertTrue(run.stop()) } }
+            repeated.get(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            assertEquals(1, scheduled.get())
+            assertEquals("STOPPING", fixture.state.get())
+        } finally {
+            fixture.handlerRelease.countDown()
+            executor.shutdownNow()
+        }
+        withTimeout(TIMEOUT_MS) { job.join() }
+        assertEquals(1, fixture.events.count { it == "stop" })
+        assertEquals(1, fixture.events.count { it == "close" })
+        assertEquals("DISCONNECTED", fixture.state.get())
+    }
+
+    @Test
+    fun serviceScopeCancellationDoesNotBlockCallerOnHandler(): Unit = runBlocking {
+        val fixture = Fixture(blockCancellation = true)
+        val run = fixture.reserve()!!
+        val serviceJob = SupervisorJob()
+        val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
+        val job = run.launch(serviceScope, fixture.operations)
+        val executor = Executors.newSingleThreadExecutor()
+        val returned = CountDownLatch(1)
+        try {
+            assertTrue(fixture.handlerRegistered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val destroy = executor.submit {
+                assertTrue(run.stop())
+                VpnCancellation.scheduleScope(serviceScope)
+                returned.countDown()
+            }
+            assertTrue(fixture.handlerEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            assertTrue("Service cancellation waited for the handler", returned.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            destroy.get(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            assertEquals("STOPPING", fixture.state.get())
+        } finally {
+            fixture.handlerRelease.countDown()
+            executor.shutdownNow()
+        }
+        withTimeout(TIMEOUT_MS) { job.join(); serviceJob.join() }
+        assertEquals(1, fixture.events.count { it == "stop" })
+        assertEquals(1, fixture.events.count { it == "close" })
+        assertEquals("DISCONNECTED", fixture.state.get())
+    }
+
     @Test
     fun stopBeforeJobAssignmentStillRunsCleanup(): Unit = runBlocking {
         val fixture = Fixture()
@@ -495,11 +607,15 @@ class VpnRunTest {
         val registry: VpnRunRegistry = VpnRunRegistry(),
         private val failAt: Set<String> = emptySet(),
         private val stopSelfReturns: Boolean = true,
+        private val blockCancellation: Boolean = false,
     ) {
         val lifecycle = VpnServiceLifecycle()
         val events: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val state = AtomicReference("CONNECTING")
         val running = CountDownLatch(1)
+        val handlerRegistered = CountDownLatch(1)
+        val handlerEntered = CountDownLatch(1)
+        val handlerRelease = CountDownLatch(1)
         private val barriers = ConcurrentHashMap<String, Barrier>()
         @Volatile var failure: VpnRunFailure? = null
 
@@ -548,7 +664,17 @@ class VpnRunTest {
                     state.set("RUNNING")
                 }
                 running.countDown()
-                awaitCancellation()
+                if (blockCancellation) {
+                    suspendCancellableCoroutine<Unit> { continuation ->
+                        continuation.invokeOnCancellation {
+                            handlerEntered.countDown()
+                            check(handlerRelease.await(BARRIER_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                        }
+                        handlerRegistered.countDown()
+                    }
+                } else {
+                    awaitCancellation()
+                }
             }
             override fun stop(): Unit = stage("stop")
             override fun close(tunnel: String): Unit = stage("close")

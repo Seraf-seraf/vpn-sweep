@@ -14,7 +14,6 @@ import android.os.ParcelFileDescriptor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.seraf.vpnsweep.core.mobile.Mobile
@@ -70,7 +69,7 @@ class SweepVpnService : VpnService() {
     override fun onDestroy(): Unit {
         val run = lifecycle.destroy()
         run?.stop()
-        scope.cancel()
+        VpnCancellation.scheduleScope(scope)
         super.onDestroy()
     }
 

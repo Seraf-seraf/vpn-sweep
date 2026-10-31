@@ -3,15 +3,29 @@ package com.seraf.vpnsweep
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.coroutineContext
 
-internal class VpnRunRegistry {
+internal object VpnCancellation {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun schedule(job: Job): Unit {
+        scope.launch { job.cancel() }
+    }
+
+    fun scheduleScope(scope: CoroutineScope): Unit {
+        scope.coroutineContext[Job]?.let(::schedule)
+    }
+}
+
+internal class VpnRunRegistry(private val cancellation: (Job) -> Unit = VpnCancellation::schedule) {
     private val lock = Any()
     private var current: VpnRun? = null
 
@@ -21,6 +35,8 @@ internal class VpnRunRegistry {
     }
 
     fun <T> guarded(action: () -> T): T = synchronized(lock, action)
+
+    fun scheduleCancellation(job: Job): Unit = cancellation(job)
 
     fun claim(run: VpnRun): Boolean = guarded {
         if (current !== run) return@guarded false
@@ -67,6 +83,7 @@ internal class VpnRun(
     private var finished = false
     private var statusFailed = false
     private var job: Job? = null
+    private var cancellationScheduled = false
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun <P : Any, T : Any> launch(
@@ -86,13 +103,13 @@ internal class VpnRun(
     }
 
     private fun attach(job: Job): Unit {
-        val cancel = registry.guarded {
-            if (stopped || finished) true else {
+        val pending = registry.guarded {
+            if (finished) null else {
                 this.job = job
-                false
+                cancellationLocked()
             }
         }
-        if (cancel) job.cancel()
+        pending?.let(registry::scheduleCancellation)
     }
 
     fun stop(): Boolean {
@@ -100,12 +117,19 @@ internal class VpnRun(
         val wasActive = registry.guarded {
             if (finished) false else {
                 markStoppingLocked()
-                pending = job
+                pending = cancellationLocked()
                 true
             }
         }
-        pending?.cancel()
+        pending?.let(registry::scheduleCancellation)
         return wasActive
+    }
+
+    private fun cancellationLocked(): Job? {
+        val pending = job
+        if (!stopped || pending == null || cancellationScheduled) return null
+        cancellationScheduled = true
+        return pending
     }
 
     private fun markStoppingLocked(): Unit {
