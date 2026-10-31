@@ -59,6 +59,7 @@ internal enum class SearchFailureV1 {
     WORKER_QUARANTINED,
     INTERRUPTED,
     INTERNAL_ERROR,
+    PROFILE_TOO_LARGE,
 }
 
 internal enum class SearchResourceStateV2 {
