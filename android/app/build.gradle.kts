@@ -15,6 +15,7 @@ android {
         targetSdk = 36
         versionCode = 2
         versionName = "0.1.2-integration"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {
@@ -25,6 +26,14 @@ android {
         compose = true
         buildConfig = true
     }
+    buildTypes {
+        create("qa") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+            applicationIdSuffix = ".qa"
+        }
+    }
+    testBuildType = "qa"
     sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/licenses"))
     packaging { jniLibs.useLegacyPackaging = false }
     lint { abortOnError = true }
@@ -48,4 +57,12 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.4")
+    add("qaImplementation", "androidx.compose.ui:ui-tooling")
+    add("qaImplementation", "androidx.compose.ui:ui-tooling-preview")
+    add("qaImplementation", "androidx.compose.ui:ui-test-manifest")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation(platform("androidx.compose:compose-bom:2025.10.01"))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }
