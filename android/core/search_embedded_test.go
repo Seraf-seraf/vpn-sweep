@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -267,5 +268,258 @@ func TestAndroidSearchEmbeddedStatusPreservesTypedRetryability(t *testing.T) {
 		if status := worker.OpenStatus(profile, params, 1000, 1000); status != want {
 			t.Fatalf("retry=%v status=%d want=%d", retry, status, want)
 		}
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginDefersCandidateCleanup(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeEmbeddedCore{}
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		return instance, nil, &model.Error{Code: "core_start_failed", Phase: "core", Retryable: true}
+	})
+	profile, params := embeddedInput(t)
+	status := worker.BeginOpenStatus(profile, params, 1000)
+	if status != SearchWorkerCandidateStartFailed|SearchWorkerRetryableFlag {
+		t.Fatalf("candidate status=%d", status)
+	}
+	if instance.closes.Load() != 0 {
+		t.Fatal("Begin cleaned the core before the coordinator requested Close")
+	}
+	if !errors.Is(worker.ctx.Err(), context.Canceled) || !searchCurrent(guard) {
+		t.Fatal("failed Begin did not cancel work while retaining its owner")
+	}
+	if _, err := worker.Probes(); err == nil {
+		t.Fatal("failed Begin exposed probes")
+	}
+	if err := worker.Close(1000); err != nil || instance.closes.Load() != 1 {
+		t.Fatal("explicit Close did not clean the core", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginReadyAndDuplicateAdmission(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeEmbeddedCore{}
+	worker := newSearchEmbeddedWorker(guard, func(_ context.Context, _ context.Context, _ *protection, _ model.Profile, _ map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		probes, err := newSearchWorkerProbes("127.0.0.1:1080", "user", "password")
+		return instance, probes, err
+	})
+	profile, params := embeddedInput(t)
+	if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerReady {
+		t.Fatalf("ready status=%d", status)
+	}
+	if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerBusy {
+		t.Fatalf("duplicate status=%d", status)
+	}
+	if _, err := worker.Probes(); err != nil || worker.ctx.Err() != nil || instance.closes.Load() != 0 {
+		t.Fatal("duplicate admission disrupted the active worker")
+	}
+	if err := worker.Close(1000); err != nil || instance.closes.Load() != 1 {
+		t.Fatal("explicit Close did not clean the ready core", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginCancellationWaitsForExplicitCleanup(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeEmbeddedCore{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		close(entered)
+		<-release
+		return instance, nil, nil
+	})
+	profile, params := embeddedInput(t)
+	done := make(chan int, 1)
+	go func() { done <- worker.BeginOpenStatus(profile, params, 10000) }()
+	<-entered
+	worker.Cancel()
+	if status := <-done; status != SearchWorkerCancelled || instance.closes.Load() != 0 {
+		close(release)
+		t.Fatalf("cancel status=%d closes=%d", status, instance.closes.Load())
+	}
+	if err := worker.Close(10); err == nil || err.Error() != "worker_cleanup_incomplete" {
+		close(release)
+		t.Fatal("Close confirmed cleanup while startup was still blocked", err)
+	}
+	close(release)
+	if err := worker.Close(1000); err != nil || instance.closes.Load() != 1 {
+		t.Fatal("late core was not cleaned exactly once", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginTimeoutKeepsLateCore(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeEmbeddedCore{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		close(entered)
+		<-release
+		return instance, nil, nil
+	})
+	profile, params := embeddedInput(t)
+	done := make(chan int, 1)
+	go func() { done <- worker.BeginOpenStatus(profile, params, 100) }()
+	<-entered
+	if status := <-done; status != SearchWorkerCandidateStartTimeout || instance.closes.Load() != 0 {
+		close(release)
+		t.Fatalf("timeout status=%d closes=%d", status, instance.closes.Load())
+	}
+	if err := worker.Close(10); err == nil || err.Error() != "worker_cleanup_incomplete" {
+		close(release)
+		t.Fatal("Close confirmed cleanup while startup was still blocked", err)
+	}
+	close(release)
+	if err := worker.Close(1000); err != nil || instance.closes.Load() != 1 {
+		t.Fatal("timed out core was not cleaned exactly once", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginCapabilityUnavailableIsProvisional(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		return nil, nil, &searchEmbeddedError{SearchWorkerCapabilityUnavailable}
+	})
+	profile, params := embeddedInput(t)
+	if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerCapabilityUnavailable {
+		t.Fatalf("capability status=%d", status)
+	}
+	if !errors.Is(worker.ctx.Err(), context.Canceled) || !searchCurrent(guard) {
+		t.Fatal("capability failure did not cancel work while retaining its owner")
+	}
+	if err := worker.Close(1000); err != nil {
+		t.Fatal("explicit Close failed", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginDeadlineAndOwnerLossAreDistinct(t *testing.T) {
+	t.Run("deadline", func(t *testing.T) {
+		_, guard := installFakeOwner(t)
+		worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+			t.Error("expired attempt launched startup")
+			return nil, nil, nil
+		})
+		worker.cancel()
+		worker.ctx, worker.cancel = context.WithDeadline(guard.searchContext, time.Unix(0, 0))
+		profile, params := embeddedInput(t)
+		if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerDeadline {
+			t.Fatalf("deadline status=%d", status)
+		}
+		if err := worker.Close(1000); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("owner_lost", func(t *testing.T) {
+		owner, guard := installFakeOwner(t)
+		owner.current = false
+		worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+			t.Error("lost owner launched startup")
+			return nil, nil, nil
+		})
+		profile, params := embeddedInput(t)
+		if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerOwnerLost {
+			t.Fatalf("owner status=%d", status)
+		}
+		if err := worker.Close(1000); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestAndroidSearchEmbeddedBeginCoreCloseFailureQuarantines(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeSearchRunningCore{closeErr: errors.New("synthetic_private_close")}
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		return instance, nil, model.Err("core_start_failed", "core")
+	})
+	profile, params := embeddedInput(t)
+	if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerCandidateStartFailed || instance.closes.Load() != 0 {
+		t.Fatalf("candidate status=%d", status)
+	}
+	if err := worker.Close(1000); err == nil || err.Error() != "worker_cleanup_incomplete" {
+		t.Fatal("failed core close was accepted", err)
+	}
+	if err := worker.Close(1000); err == nil || instance.closes.Load() != 1 {
+		t.Fatal("failed core close did not stay quarantined", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginConcurrentCloseOwnsLateStart(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeEmbeddedCore{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		close(entered)
+		<-release
+		return instance, nil, nil
+	})
+	profile, params := embeddedInput(t)
+	beginDone := make(chan int, 1)
+	go func() { beginDone <- worker.BeginOpenStatus(profile, params, 10000) }()
+	<-entered
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- worker.Close(1000) }()
+	<-worker.ctx.Done()
+	if status := <-beginDone; status != SearchWorkerCancelled || instance.closes.Load() != 0 {
+		close(release)
+		<-closeDone
+		t.Fatalf("concurrent close status=%d", status)
+	}
+	close(release)
+	if err := <-closeDone; err != nil || instance.closes.Load() != 1 {
+		t.Fatal("concurrent Close did not own late core", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginUnknownCleanupQuarantines(t *testing.T) {
+	for _, panicStart := range []bool{false, true} {
+		t.Run(fmt.Sprint(panicStart), func(t *testing.T) {
+			_, guard := installFakeOwner(t)
+			worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+				if panicStart {
+					panic("synthetic_private_data")
+				}
+				return nil, nil, errSearchCoreCreation
+			})
+			profile, params := embeddedInput(t)
+			if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerUnavailable {
+				t.Fatalf("unknown creation status=%d", status)
+			}
+			if err := worker.Close(1000); err == nil || err.Error() != "worker_cleanup_incomplete" {
+				t.Fatal("unknown creation cleanup was confirmed", err)
+			}
+			if err := worker.Close(1000); err == nil {
+				t.Fatal("unknown cleanup lost quarantine")
+			}
+		})
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginLateUnknownCreationRemainsQuarantined(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	worker := newSearchEmbeddedWorker(guard, func(context.Context, context.Context, *protection, model.Profile, map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		close(entered)
+		<-release
+		return nil, nil, errSearchCoreCreation
+	})
+	profile, params := embeddedInput(t)
+	done := make(chan int, 1)
+	go func() { done <- worker.BeginOpenStatus(profile, params, 10000) }()
+	<-entered
+	worker.Cancel()
+	if status := <-done; status != SearchWorkerCancelled {
+		close(release)
+		t.Fatalf("cancel status=%d", status)
+	}
+	if err := worker.Close(10); err == nil || err.Error() != "worker_cleanup_incomplete" {
+		close(release)
+		t.Fatal("Close confirmed a blocked creation", err)
+	}
+	close(release)
+	if err := worker.Close(1000); err == nil || err.Error() != "worker_cleanup_incomplete" {
+		t.Fatal("late creation failure lost quarantine", err)
 	}
 }

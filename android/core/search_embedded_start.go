@@ -5,14 +5,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Seraf-seraf/vpn-sweep/android/core/searchdns"
 	"github.com/Seraf-seraf/vpn-sweep/internal/capability"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
+	"github.com/Seraf-seraf/vpn-sweep/internal/socks"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
@@ -29,6 +32,86 @@ type searchRunningCore interface {
 	Start() error
 }
 
+type searchReadinessTrackingKey struct{}
+
+type searchReadinessCloseState struct {
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *searchReadinessCloseState) record(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.failed = true
+	s.mu.Unlock()
+}
+
+func (s *searchReadinessCloseState) hasFailure() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+type searchReadinessConn struct {
+	net.Conn
+	once  sync.Once
+	state *searchReadinessCloseState
+	err   error
+}
+
+func (c *searchReadinessConn) Close() error {
+	c.once.Do(func() {
+		c.err = c.Conn.Close()
+		c.state.record(c.err)
+	})
+	return c.err
+}
+
+type searchReadinessDialer struct {
+	base  socks.SocketDialer
+	state *searchReadinessCloseState
+}
+
+func (d searchReadinessDialer) DialTCP(ctx context.Context, address string) (net.Conn, error) {
+	conn, err := d.base.DialTCP(ctx, address)
+	if conn == nil {
+		return nil, err
+	}
+	tracked := &searchReadinessConn{Conn: conn, state: d.state}
+	if err != nil {
+		_ = tracked.Close()
+		return nil, err
+	}
+	return tracked, nil
+}
+
+func (d searchReadinessDialer) DialUDP(ctx context.Context, address *net.UDPAddr) (socks.UDPConn, error) {
+	return d.base.DialUDP(ctx, address)
+}
+
+func negotiateTrackedSearchReadiness(ctx context.Context, probes *SearchWorkerProbes) (net.Conn, error) {
+	if probes == nil || probes.proxy.SocketDialer == nil {
+		return nil, errors.New("search_socket_unavailable")
+	}
+	state := &searchReadinessCloseState{}
+	proxy := probes.proxy
+	proxy.SocketDialer = searchReadinessDialer{base: proxy.SocketDialer, state: state}
+	conn, err := proxy.Negotiate(ctx)
+	if state.hasFailure() {
+		return conn, errSearchResourceCleanup
+	}
+	return conn, err
+}
+
+func negotiateSearchReadiness(ctx, attempt context.Context, probes *SearchWorkerProbes) (net.Conn, error) {
+	if attempt.Value(searchReadinessTrackingKey{}) == true {
+		return negotiateTrackedSearchReadiness(ctx, probes)
+	}
+	return probes.proxy.Negotiate(ctx)
+}
+
 type searchLaunchPorts struct {
 	reserve   func(context.Context, *protection) (string, error)
 	newCore   func(context.Context, *core.Config) (searchRunningCore, error)
@@ -40,7 +123,7 @@ func startSearchEmbedded(startup, attempt context.Context, owner *protection, pr
 		reserve: reserveSearchAddress,
 		newCore: newSearchXray,
 		negotiate: func(ctx context.Context, probes *SearchWorkerProbes) (net.Conn, error) {
-			return probes.proxy.Negotiate(ctx)
+			return negotiateSearchReadiness(ctx, attempt, probes)
 		},
 	}
 	return launchSearchEmbedded(startup, attempt, owner, profile, params, ports)
@@ -125,12 +208,15 @@ func launchSearchEmbedded(startup, attempt context.Context, owner *protection, p
 			if conn.Close() != nil {
 				return instance, probes, errSearchResourceCleanup
 			}
-			if err == nil {
-				if !searchCurrent(owner) {
-					return instance, probes, &searchEmbeddedError{SearchWorkerOwnerLost}
-				}
-				return instance, probes, nil
+		}
+		if errors.Is(err, errSearchResourceCleanup) {
+			return instance, probes, errSearchResourceCleanup
+		}
+		if conn != nil && err == nil {
+			if !searchCurrent(owner) {
+				return instance, probes, &searchEmbeddedError{SearchWorkerOwnerLost}
 			}
+			return instance, probes, nil
 		}
 		select {
 		case <-startup.Done():

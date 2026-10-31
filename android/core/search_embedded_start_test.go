@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -210,6 +211,149 @@ func TestAndroidSearchEmbeddedReadinessCloseFailureQuarantines(t *testing.T) {
 	}
 	if instance.closes.Load() != 1 {
 		t.Fatal("core cleanup was skipped after readiness close failure")
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginReadinessCloseFailureQuarantines(t *testing.T) {
+	owner, guard := installFakeOwner(t)
+	instance := &fakeSearchRunningCore{}
+	worker := newSearchEmbeddedWorker(guard, func(startup, attempt context.Context, actual *protection, profile model.Profile, params map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		if attempt.Value(searchReadinessTrackingKey{}) != true {
+			return nil, nil, errors.New("missing_readiness_tracking")
+		}
+		ports := searchLaunchPorts{
+			reserve: func(context.Context, *protection) (string, error) { return "127.0.0.1:1080", nil },
+			newCore: func(context.Context, *core.Config) (searchRunningCore, error) { return instance, nil },
+			negotiate: func(ctx context.Context, probes *SearchWorkerProbes) (net.Conn, error) {
+				conn := &failingCloseAuthSocket{&fakeAuthSocket{input: bytes.NewReader([]byte{5, 0})}}
+				probes.proxy.SocketDialer = searchSocketDialer{owner: guard, factory: &fakeSocketFactory{conn: conn}}
+				return negotiateSearchReadiness(ctx, attempt, probes)
+			},
+		}
+		return launchSearchEmbedded(startup, attempt, actual, profile, params, ports)
+	})
+	profile, params := embeddedInput(t)
+	if status := worker.BeginOpenStatus(profile, params, 1000); status != SearchWorkerUnavailable {
+		t.Fatalf("unknown readiness cleanup status=%d", status)
+	}
+	if instance.closes.Load() != 0 || len(owner.roles) != 1 || owner.roles[0] != SearchRoleSOCKSControl {
+		t.Fatal("Begin cleaned the core or bypassed the socket guard")
+	}
+	if err := worker.Close(1000); err == nil || err.Error() != "worker_cleanup_incomplete" || instance.closes.Load() != 1 {
+		t.Fatal("failed readiness close did not retain UNKNOWN", err)
+	}
+}
+
+func TestAndroidSearchLegacyReadinessErrorRemainsUnchanged(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	probes, err := newSearchWorkerProbes("127.0.0.1:1080", "user", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probes.Cancel()
+	conn := &failingCloseAuthSocket{&fakeAuthSocket{input: bytes.NewReader([]byte{5, 0})}}
+	probes.proxy.SocketDialer = searchSocketDialer{owner: guard, factory: &fakeSocketFactory{conn: conn}}
+	result, err := negotiateSearchReadiness(context.Background(), context.Background(), probes)
+	if result != nil || model.Code(err) != "socks_auth_failed" || errors.Is(err, errSearchResourceCleanup) || !conn.closed {
+		t.Fatal("legacy readiness error changed")
+	}
+}
+
+type blockedReadinessSocket struct {
+	readEntered  chan struct{}
+	readReturned chan struct{}
+	closeEntered chan struct{}
+	closeRelease chan struct{}
+	closes       atomic.Int32
+}
+
+func (c *blockedReadinessSocket) Read([]byte) (int, error) {
+	close(c.readEntered)
+	<-c.closeEntered
+	close(c.readReturned)
+	return 0, io.EOF
+}
+func (*blockedReadinessSocket) Write(p []byte) (int, error)      { return len(p), nil }
+func (*blockedReadinessSocket) LocalAddr() net.Addr              { return nil }
+func (*blockedReadinessSocket) RemoteAddr() net.Addr             { return nil }
+func (*blockedReadinessSocket) SetDeadline(time.Time) error      { return nil }
+func (*blockedReadinessSocket) SetReadDeadline(time.Time) error  { return nil }
+func (*blockedReadinessSocket) SetWriteDeadline(time.Time) error { return nil }
+func (c *blockedReadinessSocket) Close() error {
+	c.closes.Add(1)
+	close(c.closeEntered)
+	<-c.closeRelease
+	return nil
+}
+
+func TestAndroidSearchBeginReadinessConcurrentCloseOccursOnce(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	probes, err := newSearchWorkerProbes("127.0.0.1:1080", "user", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probes.Cancel()
+	conn := &blockedReadinessSocket{
+		readEntered: make(chan struct{}), readReturned: make(chan struct{}),
+		closeEntered: make(chan struct{}), closeRelease: make(chan struct{}),
+	}
+	probes.proxy.SocketDialer = searchSocketDialer{owner: guard, factory: &fakeSocketFactory{conn: conn}}
+	ctx, cancel := context.WithCancel(context.Background())
+	attempt := context.WithValue(context.Background(), searchReadinessTrackingKey{}, true)
+	done := make(chan error, 1)
+	go func() { _, err := negotiateSearchReadiness(ctx, attempt, probes); done <- err }()
+	<-conn.readEntered
+	cancel()
+	<-conn.closeEntered
+	<-conn.readReturned
+	select {
+	case <-done:
+		close(conn.closeRelease)
+		t.Fatal("negotiation returned while a temporary close was unresolved")
+	default:
+	}
+	close(conn.closeRelease)
+	if err := <-done; model.Code(err) != "socks_auth_failed" || errors.Is(err, errSearchResourceCleanup) || conn.closes.Load() != 1 {
+		t.Fatal("concurrent close was repeated or misclassified", err)
+	}
+}
+
+func TestAndroidSearchEmbeddedBeginReadinessCloseIsInsideCleanupBudget(t *testing.T) {
+	_, guard := installFakeOwner(t)
+	instance := &fakeSearchRunningCore{}
+	conn := &blockedReadinessSocket{
+		readEntered: make(chan struct{}), readReturned: make(chan struct{}),
+		closeEntered: make(chan struct{}), closeRelease: make(chan struct{}),
+	}
+	worker := newSearchEmbeddedWorker(guard, func(startup, attempt context.Context, actual *protection, profile model.Profile, params map[string]any) (searchCore, *SearchWorkerProbes, error) {
+		ports := searchLaunchPorts{
+			reserve: func(context.Context, *protection) (string, error) { return "127.0.0.1:1080", nil },
+			newCore: func(context.Context, *core.Config) (searchRunningCore, error) { return instance, nil },
+			negotiate: func(ctx context.Context, probes *SearchWorkerProbes) (net.Conn, error) {
+				probes.proxy.SocketDialer = searchSocketDialer{owner: guard, factory: &fakeSocketFactory{conn: conn}}
+				return negotiateSearchReadiness(ctx, attempt, probes)
+			},
+		}
+		return launchSearchEmbedded(startup, attempt, actual, profile, params, ports)
+	})
+	profile, params := embeddedInput(t)
+	done := make(chan int, 1)
+	go func() { done <- worker.BeginOpenStatus(profile, params, 10000) }()
+	<-conn.readEntered
+	worker.Cancel()
+	if status := <-done; status != SearchWorkerCancelled {
+		close(conn.closeRelease)
+		t.Fatalf("cancel status=%d", status)
+	}
+	<-conn.closeEntered
+	<-conn.readReturned
+	if err := worker.Close(10); err == nil || err.Error() != "worker_cleanup_incomplete" || instance.closes.Load() != 0 {
+		close(conn.closeRelease)
+		t.Fatal("Close confirmed unresolved readiness cleanup", err)
+	}
+	close(conn.closeRelease)
+	if err := worker.Close(1000); err != nil || instance.closes.Load() != 1 || conn.closes.Load() != 1 {
+		t.Fatal("readiness and core cleanup did not finish exactly once", err)
 	}
 }
 

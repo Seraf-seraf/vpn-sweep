@@ -142,11 +142,32 @@ func (w *SearchEmbeddedWorker) OpenStatus(profileBytes, parameterBytes []byte, s
 	return searchEmbeddedStatus(w.open(profileBytes, parameterBytes, startupMillis, cleanupMillis))
 }
 
+func (w *SearchEmbeddedWorker) BeginOpenStatus(profileBytes, parameterBytes []byte, startupMillis int64) int {
+	err, _ := w.begin(profileBytes, parameterBytes, startupMillis, true, true)
+	return searchEmbeddedStatus(err)
+}
+
 func (w *SearchEmbeddedWorker) open(profileBytes, parameterBytes []byte, startupMillis, cleanupMillis int64) error {
+	validCleanup := cleanupMillis >= 1 && cleanupMillis <= maxSearchCleanupMillis
+	err, accepted := w.begin(profileBytes, parameterBytes, startupMillis, validCleanup, false)
+	if err == nil || !accepted {
+		return err
+	}
+	if !validCleanup {
+		w.cancel()
+		return err
+	}
+	if closeErr := w.Close(cleanupMillis); closeErr != nil {
+		return &searchEmbeddedError{SearchWorkerCleanupIncomplete}
+	}
+	return err
+}
+
+func (w *SearchEmbeddedWorker) begin(profileBytes, parameterBytes []byte, startupMillis int64, validCleanup, provisional bool) (error, bool) {
 	w.mu.Lock()
 	if w.started || w.closing {
 		w.mu.Unlock()
-		return &searchEmbeddedError{SearchWorkerBusy}
+		return &searchEmbeddedError{SearchWorkerBusy}, false
 	}
 	w.started = true
 	w.mu.Unlock()
@@ -159,7 +180,7 @@ func (w *SearchEmbeddedWorker) open(profileBytes, parameterBytes []byte, startup
 	if len(profileBytes) == 0 || len(profileBytes) > importer.MaxInputBytes ||
 		model.Decode(profileBytes, &profile) != nil || model.Decode(parameterBytes, &params) != nil ||
 		params == nil || importer.Validate(profile) != nil || capability.Check(profile, params) != nil ||
-		startupMillis < 1 || startupMillis > maxSearchStartupMillis || cleanupMillis < 1 || cleanupMillis > maxSearchCleanupMillis {
+		startupMillis < 1 || startupMillis > maxSearchStartupMillis || !validCleanup {
 		err = errInvalidSearchInput
 	} else if searchEmbeddedOwnerLost(w.owner) {
 		err = &searchEmbeddedError{SearchWorkerOwnerLost}
@@ -167,7 +188,7 @@ func (w *SearchEmbeddedWorker) open(profileBytes, parameterBytes []byte, startup
 		ctx, cancel := context.WithDeadline(w.ctx, startedAt.Add(time.Duration(startupMillis)*time.Millisecond))
 		if ctx.Err() == nil {
 			launched = true
-			go w.startCore(ctx, profile, params)
+			go w.startCore(ctx, profile, params, provisional)
 			select {
 			case <-w.openDone:
 			case <-ctx.Done():
@@ -200,16 +221,12 @@ func (w *SearchEmbeddedWorker) open(profileBytes, parameterBytes []byte, startup
 			close(w.openDone)
 			w.mu.Unlock()
 		}
-		if cleanupMillis < 1 || cleanupMillis > maxSearchCleanupMillis {
-			w.cancel()
-			return err
+		if provisional {
+			w.Cancel()
 		}
-		if closeErr := w.Close(cleanupMillis); closeErr != nil {
-			return &searchEmbeddedError{SearchWorkerCleanupIncomplete}
-		}
-		return err
+		return err, true
 	}
-	return nil
+	return nil, true
 }
 
 func searchEmbeddedOwnerLost(owner *protection) bool {
@@ -223,7 +240,7 @@ func searchEmbeddedOwnerLost(owner *protection) bool {
 	return owner.searchRevoked.Load()
 }
 
-func (w *SearchEmbeddedWorker) startCore(ctx context.Context, profile model.Profile, params map[string]any) {
+func (w *SearchEmbeddedWorker) startCore(ctx context.Context, profile model.Profile, params map[string]any, provisional bool) {
 	var instance searchCore
 	var probes *SearchWorkerProbes
 	var err error
@@ -250,7 +267,11 @@ func (w *SearchEmbeddedWorker) startCore(ctx context.Context, profile model.Prof
 	if err = ctx.Err(); err != nil {
 		return
 	}
-	instance, probes, err = w.start(ctx, w.ctx, w.owner, profile, params)
+	attempt := w.ctx
+	if provisional {
+		attempt = context.WithValue(attempt, searchReadinessTrackingKey{}, true)
+	}
+	instance, probes, err = w.start(ctx, attempt, w.owner, profile, params)
 	if err == nil && ctx.Err() == nil && !searchCurrent(w.owner) {
 		err = &searchEmbeddedError{SearchWorkerOwnerLost}
 	}
