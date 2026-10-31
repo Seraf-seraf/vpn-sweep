@@ -1,5 +1,6 @@
 package com.seraf.vpnsweep.searchstate
 
+import com.seraf.vpnsweep.importer.MAX_CONFIG_BYTES
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
 import com.seraf.vpnsweep.searchprotocol.SearchPauseReasonV1
@@ -245,7 +246,12 @@ internal class SearchController(
         try {
             if (publication == Publication.SUCCESS) {
                 stream = try { offer.result.open() } catch (_: IOException) { null }
-                publication = if (stream == null) Publication.FAILED else store.publish(session.token, stream, offer.resultSha256)
+                val bytes = try { stream?.readNBytes(MAX_CONFIG_BYTES + 1) } catch (_: IOException) { null }
+                publication = if (bytes == null || bytes.isEmpty() || bytes.size > MAX_CONFIG_BYTES) {
+                    Publication.FAILED
+                } else {
+                    store.publish(session.token, bytes.inputStream(), offer.resultSha256)
+                }
             }
         } catch (_: Exception) {
             publication = Publication.INDETERMINATE
