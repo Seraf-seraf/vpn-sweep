@@ -147,7 +147,7 @@ private fun rethrowFatal(failure: Throwable): Unit {
     if (failure is VirtualMachineError || failure is ThreadDeath) throw failure
 }
 
-private fun openMobileResult(session: SearchSession): LocalOpenedResult {
+internal fun openMobileResult(session: SearchSession): LocalOpenedResult {
     val result = session.takeVerifiedResult() ?: throw IOException("search_result_unavailable")
     try {
         val digest = result.digest()
