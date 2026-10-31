@@ -300,6 +300,9 @@ type mediaReply struct {
 	Result *[]model.ProbeResult `json:"result"`
 }
 
+// Go and Android each round the remaining deadline down by less than 1 ms.
+const searchWorkerDeadlineRoundingWindow = 2 * time.Millisecond
+
 func (r *androidSearchRound) Check(ctx context.Context, p model.Probe, round int) (model.ProbeResult, error) {
 	var reply probeReply
 	if err := r.call(ctx, SearchWorkerCheck, p, round, &reply); err != nil {
@@ -379,8 +382,14 @@ func (r *androidSearchRound) call(ctx context.Context, operation int, request an
 	if err = ctx.Err(); err != nil {
 		return err
 	}
+	remaining := remainingMillis(ctx)
+	if remaining == 0 {
+		if _, ok := ctx.Deadline(); ok {
+			return waitSearchWorkerDeadline(ctx, time.Millisecond)
+		}
+	}
 	stop := context.AfterFunc(ctx, func() { r.callback.Cancel(r.generation) })
-	response := r.callback.Call(r.generation, operation, data, round, remainingMillis(ctx))
+	response := r.callback.Call(r.generation, operation, data, round, remaining)
 	stop()
 	if model.Decode(response, reply) != nil {
 		return searchbridge.ErrWorkerUnavailable
@@ -400,9 +409,34 @@ func searchWorkerCallError(code int, ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if code == SearchWorkerDeadline {
+			return waitSearchWorkerDeadline(ctx, searchWorkerDeadlineRoundingWindow)
+		}
 		return searchbridge.ErrWorkerUnavailable
 	}
 	return searchWorkerError(code)
+}
+
+func waitSearchWorkerDeadline(ctx context.Context, window time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) > window {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return searchbridge.ErrWorkerUnavailable
+	}
+	done := ctx.Done()
+	if done == nil {
+		return searchbridge.ErrWorkerUnavailable
+	}
+	<-done
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return searchbridge.ErrWorkerUnavailable
 }
 
 func searchWorkerError(code int) error {
