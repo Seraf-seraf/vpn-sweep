@@ -18,6 +18,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -32,6 +33,7 @@ class MainActivity : ComponentActivity() {
             val scope = rememberCoroutineScope()
             var selected by remember { mutableStateOf(File(noBackupFilesDir, SweepVpnService.CONFIG_NAME).exists()) }
             var importing by remember { mutableStateOf(false) }
+            val importOwner = remember { ImportUiOwner() }
             var message by remember { mutableStateOf("") }
             var permissionMessage by remember { mutableStateOf("") }
             var testing by remember { mutableStateOf(false) }
@@ -58,33 +60,32 @@ class MainActivity : ComponentActivity() {
             }
             val document = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 if (uri != null) {
+                    val owner = importOwner.begin()
                     importing = true
-                    scope.launch {
+                    scope.launch(start = CoroutineStart.UNDISPATCHED) {
                         try {
-                            withContext(Dispatchers.IO) {
-                                val bytes = contentResolver.openInputStream(uri)?.use {
-                                    it.readNBytes(MAX_CONFIG_BYTES + 1)
-                                } ?: error("file_unavailable")
-                                check(bytes.size <= MAX_CONFIG_BYTES)
-                                Mobile.validateConfig(bytes)
-                                val file = AtomicFile(File(noBackupFilesDir, SweepVpnService.CONFIG_NAME))
-                                val stream = file.startWrite()
-                                try {
-                                    stream.write(bytes)
-                                    file.finishWrite(stream)
-                                } catch (exception: Exception) {
-                                    file.failWrite(stream)
-                                    throw exception
-                                }
+                            val token = configImportCoordinator.begin()
+                            val saved = withContext(Dispatchers.IO) {
+                                configImportCoordinator.complete(
+                                    token = token,
+                                    read = { readImportedConfig(contentResolver.openInputStream(uri)) },
+                                    validate = { bytes -> Mobile.validateConfig(bytes) },
+                                    write = { bytes, checkBeforeCommit ->
+                                        val file = AtomicFile(File(noBackupFilesDir, SweepVpnService.CONFIG_NAME))
+                                        writeImportedConfig(file, bytes, checkBeforeCommit)
+                                    },
+                                )
                             }
-                            selected = true
-                            message = "Результат выбран. Параметры outbound сохранены"
+                            if (saved && importOwner.isCurrent(owner)) {
+                                selected = true
+                                message = "Результат выбран. Параметры outbound сохранены"
+                            }
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: Exception) {
-                            message = "Не удалось прочитать результат vpn-sweep"
+                            if (importOwner.isCurrent(owner)) message = "Не удалось прочитать результат vpn-sweep"
                         } finally {
-                            importing = false
+                            if (importOwner.finish(owner)) importing = false
                         }
                     }
                 }
@@ -146,9 +147,5 @@ class MainActivity : ComponentActivity() {
 
     private fun startVpn(): Unit {
         startForegroundService(Intent(this, SweepVpnService::class.java).setAction(SweepVpnService.START))
-    }
-
-    companion object {
-        private const val MAX_CONFIG_BYTES = 4 * 1024 * 1024
     }
 }
