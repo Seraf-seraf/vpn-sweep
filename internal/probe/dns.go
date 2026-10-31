@@ -51,11 +51,16 @@ func validDNSAnswer(query, reply []byte) bool {
 	if answers == 0 {
 		return false
 	}
+	question, _, ok := dnsName(reply, 12)
+	if !ok {
+		return false
+	}
 	offset := len(query)
-	foundA := false
+	addresses := map[string]bool{}
+	aliases := map[string]string{}
 	for i := 0; i < answers; i++ {
-		var ok bool
-		offset, ok = dnsNameEnd(reply, offset)
+		owner, end, ok := dnsName(reply, offset)
+		offset = end
 		if !ok || offset+10 > len(reply) {
 			return false
 		}
@@ -66,35 +71,63 @@ func validDNSAnswer(query, reply []byte) bool {
 		if length > len(reply)-offset {
 			return false
 		}
-		if typ == 1 && class == 1 && length == 4 {
-			foundA = true
+		if class == 1 {
+			switch typ {
+			case 1:
+				if length == 4 {
+					addresses[owner] = true
+				}
+			case 5:
+				target, end, valid := dnsName(reply, offset)
+				if !valid || end != offset+length {
+					return false
+				}
+				if previous, exists := aliases[owner]; exists && previous != target {
+					return false
+				}
+				aliases[owner] = target
+			}
 		}
 		offset += length
 	}
-	return foundA
+	visited := map[string]bool{}
+	for {
+		if visited[question] {
+			return false
+		}
+		visited[question] = true
+		if addresses[question] {
+			return true
+		}
+		target, exists := aliases[question]
+		if !exists {
+			return false
+		}
+		question = target
+	}
 }
 
-func dnsNameEnd(message []byte, offset int) (int, bool) {
+func dnsName(message []byte, offset int) (string, int, bool) {
 	end := -1
-	length := 0
+	name := make([]byte, 0, 32)
 	for steps := 0; steps < 128; steps++ {
 		if offset < 12 || offset >= len(message) {
-			return 0, false
+			return "", 0, false
 		}
 		label := int(message[offset])
 		if label == 0 {
 			if end < 0 {
 				end = offset + 1
 			}
-			return end, true
+			return string(append(name, 0)), end, true
 		}
 		if label&0xc0 == 0xc0 {
 			if offset+1 >= len(message) {
-				return 0, false
+				return "", 0, false
 			}
 			target := (label&0x3f)<<8 | int(message[offset+1])
 			if target < 12 || target >= offset {
-				return 0, false
+				return "", 0, false
 			}
 			if end < 0 {
 				end = offset + 2
@@ -103,13 +136,19 @@ func dnsNameEnd(message []byte, offset int) (int, bool) {
 			continue
 		}
 		if label&0xc0 != 0 || offset+1+label > len(message) {
-			return 0, false
+			return "", 0, false
 		}
-		length += label + 1
-		if length > 255 {
-			return 0, false
+		if len(name)+1+label+1 > 255 {
+			return "", 0, false
+		}
+		name = append(name, byte(label))
+		for _, c := range message[offset+1 : offset+1+label] {
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			name = append(name, c)
 		}
 		offset += label + 1
 	}
-	return 0, false
+	return "", 0, false
 }
