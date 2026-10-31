@@ -26,8 +26,8 @@ internal sealed interface LocalPhaseOutcome {
 }
 
 // The session owner transfers exclusive use of the Go session to this phase.
-// execute runs away from Binder-death/revoke threads. The supplied lease release
-// must reflect actual worker cleanup, death and closure of every lease FD.
+// execute runs away from Binder-death/revoke threads. Retirement keeps the
+// anchor held; release follows result disposition and session close.
 internal class SearchLocalPhase internal constructor(
     private val sessionGeneration: Long,
     private val phaseEpoch: Long,
@@ -37,6 +37,7 @@ internal class SearchLocalPhase internal constructor(
     private val runSession: () -> String,
     private val openResult: () -> LocalOpenedResult,
     private val closeSession: () -> Unit,
+    private val retireWorker: () -> SearchResourceStateV2,
     private val releaseLease: () -> SearchResourceStateV2,
 ) {
     private val lock = Any()
@@ -78,7 +79,7 @@ internal class SearchLocalPhase internal constructor(
             else -> return LocalPhaseOutcome.Stopped
         }
         val resources = try {
-            releaseLease()
+            retireWorker()
         } catch (failure: Throwable) {
             fence.quarantine()
             closeAfterUnknown()
@@ -86,7 +87,7 @@ internal class SearchLocalPhase internal constructor(
             return LocalPhaseOutcome.Unknown
         }
         fence.workerState(resources)
-        if (resources != SearchResourceStateV2.RELEASED) {
+        if (resources != SearchResourceStateV2.PAUSED_LEASE_HELD) {
             fence.quarantine()
             closeAfterUnknown()
             return LocalPhaseOutcome.Unknown
@@ -114,6 +115,22 @@ internal class SearchLocalPhase internal constructor(
             rethrowFatal(failure)
             return LocalPhaseOutcome.Unknown
         }
+        if (handoff == HandoffResult.Unknown || handoff == HandoffResult.Rejected) {
+            fence.quarantine()
+            return LocalPhaseOutcome.Handoff(handoff, SearchResultFenceV3.UNKNOWN)
+        }
+        val released = try {
+            releaseLease()
+        } catch (failure: Throwable) {
+            fence.quarantine()
+            rethrowFatal(failure)
+            return LocalPhaseOutcome.Unknown
+        }
+        fence.workerState(released)
+        if (released != SearchResourceStateV2.RELEASED) {
+            fence.quarantine()
+            return LocalPhaseOutcome.Unknown
+        }
         fence.seal()
         val localFence = fence.resultFence() ?: SearchResultFenceV3.UNKNOWN
         return LocalPhaseOutcome.Handoff(handoff, localFence)
@@ -135,10 +152,11 @@ internal class SearchLocalPhase internal constructor(
             sourceRevision: Long,
             selectionRevision: Long,
             observer: SearchSessionObserverV3,
+            retireWorker: () -> SearchResourceStateV2,
             releaseLease: () -> SearchResourceStateV2,
         ): SearchLocalPhase = SearchLocalPhase(
             sessionGeneration, phaseEpoch, sourceRevision, selectionRevision, observer,
-            session::run, { openMobileResult(session) }, session::close, releaseLease,
+            session::run, { openMobileResult(session) }, session::close, retireWorker, releaseLease,
         )
     }
 }

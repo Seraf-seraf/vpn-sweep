@@ -30,9 +30,10 @@ internal interface SearchPhaseSession {
     fun runPhase(epoch: Long): String
     fun cancelPhase(epoch: Long): Boolean
     fun openVerifiedResult(): LocalOpenedResult
-    fun closeSession(): Unit
-    fun pauseResources(): SearchResourceStateV2
-    fun releaseResources(): SearchResourceStateV2
+    fun closeSession(deadlineElapsedMillis: Long): Unit
+    fun pauseResources(deadlineElapsedMillis: Long): SearchResourceStateV2
+    fun retireResources(deadlineElapsedMillis: Long): SearchResourceStateV2
+    fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2
     fun quarantine(): Unit
 }
 
@@ -223,8 +224,9 @@ internal class SearchSessionProducer(
         val phase = SearchLocalPhase(
             current.snapshot.sessionGeneration, epoch, current.snapshot.sourceRevision, current.snapshot.selectionRevision,
             current.observer, { session.runPhase(epoch) }, session::openVerifiedResult,
-            { if (cleanup(current) { session.closeSession(); true } != true) throw IOException("session_cleanup_unknown") },
-            { (cleanup(current) { session.releaseResources() } ?: SearchResourceStateV2.QUARANTINED)
+            { if (cleanup(current) { deadline -> session.closeSession(deadline); true } != true) throw IOException("session_cleanup_unknown") },
+            { cleanup(current) { deadline -> session.retireResources(deadline) } ?: SearchResourceStateV2.QUARANTINED },
+            { (cleanup(current) { deadline -> session.releaseResources(deadline) } ?: SearchResourceStateV2.QUARANTINED)
                 .also { result -> synchronized(lock) { current.resources = result } } },
         )
         val cancelBeforeRun = synchronized(lock) {
@@ -366,7 +368,7 @@ internal class SearchSessionProducer(
 
     private fun emitPause(current: Active, reason: SearchPauseReasonV1): Unit {
         val session = synchronized(lock) { current.session } ?: return unknown(current)
-        val resources = cleanup(current) { session.pauseResources() } ?: SearchResourceStateV2.QUARANTINED
+        val resources = cleanup(current) { deadline -> session.pauseResources(deadline) } ?: SearchResourceStateV2.QUARANTINED
         if (resources != SearchResourceStateV2.PAUSED_LEASE_HELD) return unknown(current)
         var delivery: PauseDelivery? = null
         val epoch = synchronized(lock) { current.epoch }
@@ -423,9 +425,13 @@ internal class SearchSessionProducer(
 
     private fun finishWithoutRun(current: Active, cancelled: Boolean): Unit {
         val session = synchronized(lock) { current.session } ?: return unknown(current)
-        val resources = cleanup(current) {
-            session.closeSession()
-            session.releaseResources()
+        val resources = cleanup(current) { deadline ->
+            if (session.retireResources(deadline) != SearchResourceStateV2.PAUSED_LEASE_HELD) {
+                SearchResourceStateV2.QUARANTINED
+            } else {
+                session.closeSession(deadline)
+                session.releaseResources(deadline)
+            }
         } ?: SearchResourceStateV2.QUARANTINED
         if (resources != SearchResourceStateV2.RELEASED) return unknown(current)
         val terminal = if (cancelled) SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, resources, SearchResultFenceV3.CONFIRMED)
@@ -503,18 +509,24 @@ internal class SearchSessionProducer(
         true
     } catch (_: Exception) { false } catch (_: LinkageError) { false }
 
-    private fun <T : Any> cleanup(current: Active, action: () -> T): T? {
+    private fun <T : Any> cleanup(current: Active, action: (Long) -> T): T? {
         val now = nowMillis()
         if (now < 0 || now > Long.MAX_VALUE - cleanupMillis) return null
+        var startWatch: ControlWatch? = null
         val deadline = synchronized(lock) {
             if (active !== current || current.state == State.UNKNOWN) return null
-            current.deadline ?: (now + cleanupMillis).also { current.deadline = it }
+            val selected = current.deadline ?: (now + cleanupMillis).also { current.deadline = it }
+            if (current.watch == null) {
+                startWatch = ControlWatch(current.epoch, selected).also { current.watch = it }
+            }
+            selected
         }
+        startWatch?.let { dispatchWatch(current, it) }
         if (deadline <= now) return null
         val done = CountDownLatch(1)
         val value = java.util.concurrent.atomic.AtomicReference<T?>()
         if (!launch {
-                try { value.set(action()) } catch (_: Exception) { } catch (_: LinkageError) { }
+                try { value.set(action(deadline)) } catch (_: Exception) { } catch (_: LinkageError) { }
                 finally { done.countDown() }
             }) return null
         val signalled = try { done.await(deadline - now, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {

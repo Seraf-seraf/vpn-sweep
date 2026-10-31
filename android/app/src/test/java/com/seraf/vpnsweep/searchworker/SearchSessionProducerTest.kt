@@ -69,9 +69,10 @@ class SearchSessionProducerTest {
             return cancelResult
         }
         override fun openVerifiedResult(): LocalOpenedResult = LocalOpenedResult("a".repeat(64), resultInput)
-        override fun closeSession(): Unit { closed.incrementAndGet() }
-        override fun pauseResources(): SearchResourceStateV2 = SearchResourceStateV2.PAUSED_LEASE_HELD
-        override fun releaseResources(): SearchResourceStateV2 { released.incrementAndGet(); return SearchResourceStateV2.RELEASED }
+        override fun closeSession(deadlineElapsedMillis: Long): Unit { closed.incrementAndGet() }
+        override fun pauseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 = SearchResourceStateV2.PAUSED_LEASE_HELD
+        override fun retireResources(deadlineElapsedMillis: Long): SearchResourceStateV2 = SearchResourceStateV2.PAUSED_LEASE_HELD
+        override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 { released.incrementAndGet(); return SearchResourceStateV2.RELEASED }
         override fun quarantine(): Unit { quarantined.incrementAndGet(); quarantineReached.countDown() }
     }
 
@@ -237,10 +238,11 @@ class SearchSessionProducerTest {
         assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
         assertTrue(done.await(3, TimeUnit.SECONDS))
         val terminal = terminals.single() as SearchTerminalV3.Stopped
-        assertEquals(SearchResourceStateV2.RELEASED, terminal.resources)
+        assertEquals(SearchResourceStateV2.QUARANTINED, terminal.resources)
         assertEquals(SearchResultFenceV3.UNKNOWN, terminal.resultFence)
         assertEquals(1, calls.get())
         assertEquals(1, owner.quarantined.get())
+        assertEquals(0, owner.released.get())
     }
 
     @Test fun falseCancelAfterPhaseCannotBeReportedAsCancelled(): Unit {
@@ -485,13 +487,47 @@ class SearchSessionProducerTest {
             assertTrue("control deadline must be observed independently of result callback", terminal.await(2, TimeUnit.SECONDS))
             val unknown = terminals.single() as SearchTerminalV3.Stopped
             assertEquals(SearchResultFenceV3.UNKNOWN, unknown.resultFence)
-            assertEquals(SearchResourceStateV2.RELEASED, unknown.resources)
+            assertEquals(SearchResourceStateV2.QUARANTINED, unknown.resources)
+            assertEquals(0, owner.released.get())
             release.countDown()
             owner.runThread.get().join(3_000)
             assertFalse(owner.runThread.get().isAlive)
             assertEquals(1, offers.get())
             assertEquals(1, terminals.size)
             assertEquals(1, owner.resultInput.closed.get())
+        } finally { release.countDown() }
+    }
+
+    @Test fun resultCallbackDeadlineExpiresWithoutExplicitCancel(): Unit {
+        val owner = Owner()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val terminals = Collections.synchronizedList(mutableListOf<SearchTerminalV3>())
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                entered.countDown()
+                check(release.await(3, TimeUnit.SECONDS))
+                offer.result.close()
+                return SearchResultReceiptV3.IGNORED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { terminals.add(value); terminal.countDown() }
+        }
+        val producer = SearchSessionProducer(100, { snap, _ -> snap.profiles.open().use { it.readBytes() }; owner },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) })
+        try {
+            assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            assertTrue(terminal.await(2, TimeUnit.SECONDS))
+            val stopped = terminals.single() as SearchTerminalV3.Stopped
+            assertEquals(SearchResultFenceV3.UNKNOWN, stopped.resultFence)
+            assertEquals(SearchResourceStateV2.QUARANTINED, stopped.resources)
+            assertEquals(0, owner.released.get())
+            release.countDown()
+            owner.runThread.get().join(3_000)
+            assertEquals(1, terminals.size)
+            assertEquals(0, owner.released.get())
         } finally { release.countDown() }
     }
 

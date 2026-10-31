@@ -6,6 +6,12 @@ import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressV1
 import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
 import com.seraf.vpnsweep.searchprotocol.SearchNetworkV1
+import com.seraf.vpnsweep.searchprotocol.SearchResultOfferV3
+import com.seraf.vpnsweep.searchprotocol.SearchResultReceiptV3
+import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
+import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
+import com.seraf.vpnsweep.searchprotocol.SearchStartV3
+import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -31,7 +37,7 @@ class SearchMobilePhaseSessionTest {
     @Test fun delegatesPhaseEpochAndKeepsCleanupResultsTyped(): Unit {
         val calls = mutableListOf<String>()
         val events = mutableListOf<Long>()
-        val progress = SearchMobilePhaseProgress { epoch, _ -> events.add(epoch) }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { epoch, _ -> events.add(epoch) }
         val input = Input()
         val session = SearchMobilePhaseSession(
             { epoch -> calls.add("prepare:$epoch") },
@@ -46,10 +52,10 @@ class SearchMobilePhaseSessionTest {
         assertEquals("paused_budget", session.runPhase(3))
         assertTrue(session.cancelPhase(3))
         assertEquals(listOf(3L), events)
-        assertEquals(SearchResourceStateV2.PAUSED_LEASE_HELD, session.pauseResources())
+        assertEquals(SearchResourceStateV2.PAUSED_LEASE_HELD, session.pauseResources(Long.MAX_VALUE))
         assertSame(input, session.openVerifiedResult().input)
-        session.closeSession()
-        session.closeSession()
+        session.closeSession(Long.MAX_VALUE)
+        session.closeSession(Long.MAX_VALUE)
         assertEquals(listOf("prepare:3", "run:3", "cancel:3", "close"), calls)
     }
 
@@ -57,7 +63,7 @@ class SearchMobilePhaseSessionTest {
         val callbackEntered = CountDownLatch(1)
         val releaseCallback = CountDownLatch(1)
         val epochs = Collections.synchronizedList(mutableListOf<Long>())
-        val progress = SearchMobilePhaseProgress { epoch, _ ->
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { epoch, _ ->
             epochs.add(epoch)
             if (epoch == 1L) { callbackEntered.countDown(); check(releaseCallback.await(3, TimeUnit.SECONDS)) }
         }
@@ -82,7 +88,7 @@ class SearchMobilePhaseSessionTest {
 
     @Test fun actualWorkerProgressCallbackUsesEnclosingGoPhaseEpoch(): Unit {
         val events = mutableListOf<Pair<Long, SearchProgressV1>>()
-        val progress = SearchMobilePhaseProgress { epoch, value -> events.add(epoch to value) }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { epoch, value -> events.add(epoch to value) }
         val worker = SearchEngineWorkerAdapter(7, SearchNetworkV1(11, 12), 5_000, 1_024, { null }, progress::report)
         val session = SearchMobilePhaseSession({}, {
             worker.progress(1, 1, 4, 1, 1, 0, 0, 0)
@@ -102,7 +108,7 @@ class SearchMobilePhaseSessionTest {
         val result = AtomicReference<Throwable>()
         val events = AtomicInteger()
         val quarantines = AtomicInteger()
-        val progress = SearchMobilePhaseProgress { _, _ -> events.incrementAndGet() }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> events.incrementAndGet() }
         val session = SearchMobilePhaseSession({}, {
             entered.countDown(); check(release.await(3, TimeUnit.SECONDS)); progress.report(sample()); "success"
         }, { true }, { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
@@ -119,8 +125,8 @@ class SearchMobilePhaseSessionTest {
             assertTrue(result.get() is IOException)
             assertEquals(0, events.get())
             assertEquals(1, quarantines.get())
-            assertEquals(SearchResourceStateV2.QUARANTINED, session.pauseResources())
-            assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources())
+            assertEquals(SearchResourceStateV2.QUARANTINED, session.pauseResources(Long.MAX_VALUE))
+            assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(Long.MAX_VALUE))
         } finally { release.countDown(); runner.join(3000) }
     }
 
@@ -129,7 +135,7 @@ class SearchMobilePhaseSessionTest {
         val release = CountDownLatch(1)
         val input = Input(failClose = true)
         val failure = AtomicReference<Throwable>()
-        val progress = SearchMobilePhaseProgress { _, _ -> }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> }
         val session = SearchMobilePhaseSession({}, { "success" }, { true }, {
             entered.countDown(); check(release.await(3, TimeUnit.SECONDS)); LocalOpenedResult("a".repeat(64), input)
         }, {}, progress, { SearchResourceStateV2.PAUSED_LEASE_HELD }, {})
@@ -149,26 +155,26 @@ class SearchMobilePhaseSessionTest {
     @Test fun unknownCloseIsStickyAndNeverRetriesOwner(): Unit {
         val closes = AtomicInteger()
         val quarantines = AtomicInteger()
-        val progress = SearchMobilePhaseProgress { _, _ -> }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> }
         val session = SearchMobilePhaseSession({}, { "interrupted" }, { false },
             { LocalOpenedResult("a".repeat(64), Input()) }, { closes.incrementAndGet(); throw IOException("synthetic") },
             progress, { SearchResourceStateV2.PAUSED_LEASE_HELD }, { quarantines.incrementAndGet() })
-        repeat(2) { try { session.closeSession(); fail("unknown close accepted") } catch (_: IOException) { } }
+        repeat(2) { try { session.closeSession(Long.MAX_VALUE); fail("unknown close accepted") } catch (_: IOException) { } }
         assertEquals(1, closes.get())
         assertEquals(1, quarantines.get())
-        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources())
+        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(Long.MAX_VALUE))
         try { session.preparePhase(1); fail("closed session admitted") } catch (_: IOException) { }
         assertFalse(session.cancelPhase(1))
     }
 
     @Test fun unconfirmedOrFailedResourceDispositionIsQuarantined(): Unit {
-        val progress = SearchMobilePhaseProgress { _, _ -> }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> }
         val quarantines = AtomicInteger()
         val session = SearchMobilePhaseSession({}, { "interrupted" }, { false },
             { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
             { throw IOException("synthetic") }, { quarantines.incrementAndGet() })
-        assertEquals(SearchResourceStateV2.QUARANTINED, session.pauseResources())
-        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources())
+        assertEquals(SearchResourceStateV2.QUARANTINED, session.pauseResources(Long.MAX_VALUE))
+        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(Long.MAX_VALUE))
         assertEquals(1, quarantines.get())
     }
 
@@ -177,7 +183,7 @@ class SearchMobilePhaseSessionTest {
         val release = CountDownLatch(1)
         val calls = AtomicInteger()
         val ownerCalls = AtomicInteger()
-        val progress = SearchMobilePhaseProgress { _, _ -> }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> }
         val session = SearchMobilePhaseSession({ calls.incrementAndGet() }, { calls.incrementAndGet(); "success" }, { false },
             { calls.incrementAndGet(); LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
             { calls.incrementAndGet(); SearchResourceStateV2.PAUSED_LEASE_HELD },
@@ -189,8 +195,8 @@ class SearchMobilePhaseSessionTest {
             try { session.preparePhase(1); fail("prepare after revoke") } catch (_: IOException) { }
             try { session.runPhase(1); fail("run after revoke") } catch (_: IOException) { }
             try { session.openVerifiedResult(); fail("open after revoke") } catch (_: IOException) { }
-            assertEquals(SearchResourceStateV2.QUARANTINED, session.pauseResources())
-            assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources())
+            assertEquals(SearchResourceStateV2.QUARANTINED, session.pauseResources(Long.MAX_VALUE))
+            assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(Long.MAX_VALUE))
             assertEquals(0, calls.get())
             assertEquals(1, ownerCalls.get())
         } finally { release.countDown(); revoke.join(3000) }
@@ -198,12 +204,12 @@ class SearchMobilePhaseSessionTest {
 
     @Test fun releaseIsFailClosedUntilRealOwnerGateExists(): Unit {
         val ownerCalls = AtomicInteger()
-        val progress = SearchMobilePhaseProgress { _, _ -> }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> }
         val session = SearchMobilePhaseSession({}, { "interrupted" }, { false },
             { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
             { SearchResourceStateV2.PAUSED_LEASE_HELD }, { ownerCalls.incrementAndGet() })
-        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources())
-        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources())
+        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(Long.MAX_VALUE))
+        assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(Long.MAX_VALUE))
         assertEquals(1, ownerCalls.get())
     }
 
@@ -211,11 +217,11 @@ class SearchMobilePhaseSessionTest {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val result = AtomicReference<SearchResourceStateV2>()
-        val progress = SearchMobilePhaseProgress { _, _ -> }
+        val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { _, _ -> }
         val session = SearchMobilePhaseSession({}, { "interrupted" }, { false },
             { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
             { entered.countDown(); check(release.await(3, TimeUnit.SECONDS)); SearchResourceStateV2.PAUSED_LEASE_HELD }, {})
-        val waiter = Thread { result.set(session.pauseResources()) }
+        val waiter = Thread { result.set(session.pauseResources(Long.MAX_VALUE)) }
         waiter.start()
         try {
             assertTrue(entered.await(2, TimeUnit.SECONDS))
@@ -225,5 +231,153 @@ class SearchMobilePhaseSessionTest {
             assertFalse(waiter.isAlive)
             assertEquals(SearchResourceStateV2.QUARANTINED, result.get())
         } finally { release.countDown(); waiter.join(3_000) }
+    }
+
+    @Test fun blockedGoCallCannotBeReleasedAfterCleanupDeadline(): Unit {
+        val entered = CountDownLatch(1)
+        val continueRun = CountDownLatch(1)
+        val runFinished = CountDownLatch(1)
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val closes = AtomicInteger()
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val lease = SearchOwnerLease(42, admission, token, { closes.incrementAndGet(); true }, clock)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, {
+            entered.countDown()
+            check(continueRun.await(3, TimeUnit.SECONDS))
+            "interrupted"
+        }, { true }, { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, {}, lease)
+        val runner = Thread {
+            try { session.runPhase(1) } catch (_: IOException) { }
+            finally { runFinished.countDown() }
+        }
+        runner.start()
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            try { session.closeSession(clock() + 50); fail("blocked call considered drained") } catch (_: IOException) { }
+            assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(clock() + 1_000))
+            assertEquals(0, closes.get())
+            assertNull(admission.reserve())
+        } finally {
+            continueRun.countDown()
+            assertTrue(runFinished.await(2, TimeUnit.SECONDS))
+        }
+        assertTrue(admission.isQuarantined())
+        assertEquals(0, closes.get())
+    }
+
+    @Test fun blockedRetirementCallbackIsCountedBeforeSessionAndAnchorClose(): Unit {
+        val entered = CountDownLatch(1)
+        val continueRetirement = CountDownLatch(1)
+        val finished = CountDownLatch(1)
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val closes = AtomicInteger()
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val lease = SearchOwnerLease(42, admission, token, { closes.incrementAndGet(); true }, clock)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "interrupted" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, { closes.incrementAndGet() }, progress, {
+                entered.countDown()
+                check(continueRetirement.await(3, TimeUnit.SECONDS))
+                SearchResourceStateV2.PAUSED_LEASE_HELD
+            }, {}, lease)
+        val worker = Thread { try { session.retireResources(clock() + 2_000) } finally { finished.countDown() } }
+        worker.start()
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            try { session.closeSession(clock() + 50); fail("retirement callback not counted") } catch (_: IOException) { }
+            assertEquals(SearchResourceStateV2.QUARANTINED, session.releaseResources(clock() + 1_000))
+            assertEquals(0, closes.get())
+            assertNull(admission.reserve())
+        } finally {
+            continueRetirement.countDown()
+            assertTrue(finished.await(2, TimeUnit.SECONDS))
+        }
+        assertTrue(admission.isQuarantined())
+        assertEquals(0, closes.get())
+    }
+
+    @Test fun realLeaseReleaseRequiresSessionCloseAndWorkerRetirement(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val closes = AtomicInteger()
+        val lease = SearchOwnerLease(42, admission, token, { closes.incrementAndGet(); true }, clock)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "success" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, {}, lease)
+        assertTrue(lease.reserveWorker())
+        lease.workerDeathConfirmed()
+        val deadline = clock() + 2_000
+        assertEquals(SearchResourceStateV2.PAUSED_LEASE_HELD, session.retireResources(deadline))
+        assertEquals(0, closes.get())
+        assertNull(admission.reserve())
+        session.openVerifiedResult().input.close()
+        session.closeSession(deadline)
+        assertEquals(SearchResourceStateV2.RELEASED, session.releaseResources(deadline))
+        assertEquals(1, closes.get())
+        assertNotNull(admission.reserve())
+    }
+
+    @Test fun pauseKeepsAnchorAndOnlyNextPrepareReopensWorkerAdmission(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val lease = SearchOwnerLease(42, admission, token, { true }, clock)
+        val progress = SearchMobilePhaseProgress(clock) { _, _ -> }
+        val session = SearchMobilePhaseSession({}, { "paused_budget" }, { true },
+            { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
+            { SearchResourceStateV2.PAUSED_LEASE_HELD }, {}, lease)
+        assertEquals(SearchResourceStateV2.PAUSED_LEASE_HELD, session.pauseResources(clock() + 2_000))
+        assertFalse(lease.reserveWorker())
+        assertNull(admission.reserve())
+        session.preparePhase(2)
+        assertTrue(lease.reserveWorker())
+        lease.workerDeathConfirmed()
+        val deadline = clock() + 2_000
+        session.closeSession(deadline)
+        assertEquals(SearchResourceStateV2.RELEASED, session.releaseResources(deadline))
+    }
+
+    @Test fun producerKeepsRealOwnerThroughReceiptAndSessionClose(): Unit {
+        val admission = SearchOwnerAdmission()
+        val token = checkNotNull(admission.reserve())
+        val clock = { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+        val trace = Collections.synchronizedList(mutableListOf<String>())
+        val lease = SearchOwnerLease(42, admission, token, { trace.add("anchor-close"); true }, clock)
+        val done = CountDownLatch(1)
+        val terminal = AtomicReference<SearchTerminalV3>()
+        val observer = object : SearchSessionObserverV3 {
+            override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = Unit
+            override fun onResult(offer: SearchResultOfferV3): SearchResultReceiptV3 {
+                trace.add("receipt")
+                check(admission.reserve() == null)
+                check(!trace.contains("anchor-close"))
+                offer.result.open().close()
+                offer.result.close()
+                return SearchResultReceiptV3.COMMITTED_CLOSED
+            }
+            override fun onTerminal(value: SearchTerminalV3): Unit { terminal.set(value); done.countDown() }
+        }
+        val producer = SearchSessionProducer(2_000, { snapshot, deliver ->
+            snapshot.profiles.open().use { it.readBytes() }
+            val progress = SearchMobilePhaseProgress(clock, deliver)
+            SearchMobilePhaseSession({}, {
+                check(lease.reserveWorker())
+                trace.add("worker-retired")
+                lease.workerDeathConfirmed()
+                "success"
+            }, { true }, { trace.add("open"); LocalOpenedResult("a".repeat(64), Input()) },
+                { trace.add("session-close") }, progress, { SearchResourceStateV2.PAUSED_LEASE_HELD }, {}, lease)
+        }, clock)
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(SearchSnapshotV1(7, 1, 1, Input()), 1, observer))
+        assertTrue(done.await(3, TimeUnit.SECONDS))
+        assertTrue(terminal.get() is SearchTerminalV3.Complete)
+        assertEquals(listOf("worker-retired", "open", "receipt", "session-close", "anchor-close"), trace.toList())
+        assertNotNull(admission.reserve())
     }
 }

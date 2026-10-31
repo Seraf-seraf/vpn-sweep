@@ -21,7 +21,7 @@ import org.junit.Test
 
 class ResultHandoffFenceTest {
     @Test
-    fun localOpenAndReceiptRequireLeaseReleaseAndSealedFence(): Unit {
+    fun localOpenRequiresWorkerRetirementAndFenceRequiresLeaseRelease(): Unit {
         val input = FakeInput()
         val calls = AtomicInteger()
         val observer = FakeObserver { value ->
@@ -35,11 +35,12 @@ class ResultHandoffFenceTest {
         assertEquals(HandoffResult.Rejected, open.run { calls.incrementAndGet(); offer(input) })
         assertEquals(0, calls.get())
         assertNull(fence.resultFence())
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.COMMITTED_CLOSED), open.run {
             calls.incrementAndGet()
             offer(input)
         })
+        fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(SearchResultFenceV3.CONFIRMED, fence.resultFence())
         assertEquals(1, calls.get())
         assertEquals(1, input.closes.get())
@@ -57,7 +58,7 @@ class ResultHandoffFenceTest {
             SearchResultReceiptV3.FAILED_CLOSED
         })
         val open = checkNotNull(fence.reserveLocalOpen())
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         val caller = Thread {
             outcome.set(open.run {
                 entered.countDown()
@@ -77,6 +78,7 @@ class ResultHandoffFenceTest {
         }
         assertFalse(caller.isAlive)
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.FAILED_CLOSED), outcome.get())
+        fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(SearchResultFenceV3.CONFIRMED, fence.resultFence())
     }
 
@@ -90,7 +92,7 @@ class ResultHandoffFenceTest {
         }
         val fence = ResultHandoffFence(4, 2, observer)
         val open = checkNotNull(fence.reserveLocalOpen())
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.COMMITTED_CLOSED), open.run {
             sourceCalls.incrementAndGet()
             offer(input)
@@ -104,6 +106,7 @@ class ResultHandoffFenceTest {
         assertEquals(1, sourceCalls.get())
         assertEquals(1, observer.calls.get())
         assertEquals(1, input.closes.get())
+        fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(SearchResultFenceV3.CONFIRMED, fence.resultFence())
     }
 
@@ -114,8 +117,9 @@ class ResultHandoffFenceTest {
         val open = checkNotNull(fence.reserveLocalOpen())
         fence.cancel()
         assertEquals(HandoffResult.Discarded, open.run { calls.incrementAndGet(); offer(FakeInput()) })
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         assertEquals(0, calls.get())
+        fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(SearchResultFenceV3.CONFIRMED, fence.resultFence())
     }
 
@@ -128,7 +132,7 @@ class ResultHandoffFenceTest {
             val observer = FakeObserver { error("cancelled result delivered") }
             val fence = ResultHandoffFence(4, 2, observer)
             val open = checkNotNull(fence.reserveLocalOpen())
-            fence.workerState(SearchResourceStateV2.RELEASED)
+            fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
             val outcome = AtomicReference<HandoffResult>()
             val caller = Thread {
                 outcome.set(open.run {
@@ -148,6 +152,7 @@ class ResultHandoffFenceTest {
             }
             assertFalse(caller.isAlive)
             assertEquals(if (closeFails) HandoffResult.Unknown else HandoffResult.Discarded, outcome.get())
+            if (!closeFails) fence.workerState(SearchResourceStateV2.RELEASED)
             assertEquals(if (closeFails) SearchResultFenceV3.UNKNOWN else SearchResultFenceV3.CONFIRMED, fence.resultFence())
             assertEquals(1, input.closes.get())
             assertEquals(0, observer.calls.get())
@@ -161,9 +166,10 @@ class ResultHandoffFenceTest {
             val observer = FakeObserver { error("stale result delivered") }
             val fence = ResultHandoffFence(4, 2, observer)
             val open = checkNotNull(fence.reserveLocalOpen())
-            fence.workerState(SearchResourceStateV2.RELEASED)
+            fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
             assertEquals(HandoffResult.Discarded, open.run { offer(input, generation, phase) })
             fence.seal()
+            fence.workerState(SearchResourceStateV2.RELEASED)
             assertEquals(SearchResultFenceV3.CONFIRMED, fence.resultFence())
             assertEquals(1, input.closes.get())
             assertEquals(0, observer.calls.get())
@@ -180,7 +186,7 @@ class ResultHandoffFenceTest {
             }
             val fence = ResultHandoffFence(4, 2, observer)
             val open = checkNotNull(fence.reserveLocalOpen())
-            fence.workerState(SearchResourceStateV2.RELEASED)
+            fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
             assertEquals(HandoffResult.Unknown, open.run { offer(input) })
             assertEquals(SearchResultFenceV3.UNKNOWN, fence.resultFence())
             assertEquals(0, input.closes.get())
@@ -201,7 +207,7 @@ class ResultHandoffFenceTest {
         }
         val fence = ResultHandoffFence(4, 2, observer)
         val open = checkNotNull(fence.reserveLocalOpen())
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         val caller = Thread { open.run { offer(FakeInput()) } }
         caller.start()
         try {
@@ -233,7 +239,7 @@ class ResultHandoffFenceTest {
         }
         val fence = ResultHandoffFence(4, 2, observer)
         val open = checkNotNull(fence.reserveLocalOpen())
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         val caller = Thread { outcome.set(open.run { offer(input) }) }
         caller.start()
         try {
@@ -247,6 +253,7 @@ class ResultHandoffFenceTest {
         assertFalse(caller.isAlive)
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.COMMITTED_CLOSED), outcome.get())
         assertEquals(1, input.closes.get())
+        fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(SearchResultFenceV3.CONFIRMED, fence.resultFence())
     }
 
@@ -254,7 +261,7 @@ class ResultHandoffFenceTest {
     fun openFailureOrUnknownWorkerCleanupCannotConfirm(): Unit {
         val fence = ResultHandoffFence(4, 2, FakeObserver { error("unknown result delivered") })
         val open = checkNotNull(fence.reserveLocalOpen())
-        fence.workerState(SearchResourceStateV2.RELEASED)
+        fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         assertEquals(HandoffResult.Unknown, open.run { error("synthetic open failure") })
         assertEquals(SearchResultFenceV3.UNKNOWN, fence.resultFence())
 

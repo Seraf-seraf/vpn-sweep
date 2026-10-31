@@ -14,6 +14,7 @@ import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -63,15 +64,44 @@ internal class SearchLocalPhaseTest {
             SearchResultReceiptV3.COMMITTED_CLOSED
         }, { trace.add("run"); "success" },
             { trace.add("open"); LocalOpenedResult("a".repeat(64), input) },
-            { trace.add("close") }, { trace.add("release"); SearchResourceStateV2.RELEASED })
+            { trace.add("close") }, { trace.add("retire"); SearchResourceStateV2.PAUSED_LEASE_HELD }, { trace.add("release"); SearchResourceStateV2.RELEASED })
         val result = phase.execute() as LocalPhaseOutcome.Handoff
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.COMMITTED_CLOSED), result.result)
         assertEquals(SearchResultFenceV3.CONFIRMED, result.localFence)
-        assertEquals(listOf("run", "release", "open", "offer", "close"), trace)
+        assertEquals(listOf("run", "retire", "open", "offer", "close", "release"), trace)
         assertEquals(1, input.opened)
         assertEquals(1, input.streamsClosed)
         assertEquals(1, input.inputsClosed)
         assertEquals(LocalPhaseOutcome.NotStarted, phase.execute())
+    }
+
+    @Test
+    fun anchorIsHeldWhileConsumerOwnsResult(): Unit {
+        val entered = CountDownLatch(1)
+        val continueReceipt = CountDownLatch(1)
+        val releases = AtomicInteger()
+        val outcome = AtomicReference<LocalPhaseOutcome>()
+        val phase = SearchLocalPhase(9, 3, 12, 14, Observer { offer ->
+            entered.countDown()
+            check(continueReceipt.await(3, TimeUnit.SECONDS))
+            offer.result.open().close()
+            offer.result.close()
+            SearchResultReceiptV3.COMMITTED_CLOSED
+        }, { "success" }, { LocalOpenedResult("a".repeat(64), Input()) }, {}, { SearchResourceStateV2.PAUSED_LEASE_HELD }, {
+            releases.incrementAndGet()
+            SearchResourceStateV2.RELEASED
+        })
+        val worker = Thread { outcome.set(phase.execute()) }
+        worker.start()
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            assertEquals(0, releases.get())
+        } finally {
+            continueReceipt.countDown()
+            worker.join(3_000)
+        }
+        assertEquals(1, releases.get())
+        assertEquals(SearchResultFenceV3.CONFIRMED, (outcome.get() as LocalPhaseOutcome.Handoff).localFence)
     }
 
     @Test
@@ -114,7 +144,7 @@ internal class SearchLocalPhaseTest {
             entered.countDown()
             check(releaseRun.await(2, TimeUnit.SECONDS))
             "success"
-        }, { opens++; LocalOpenedResult("a".repeat(64), input) }, {}, { SearchResourceStateV2.RELEASED })
+        }, { opens++; LocalOpenedResult("a".repeat(64), input) }, {}, { SearchResourceStateV2.PAUSED_LEASE_HELD }, { SearchResourceStateV2.RELEASED })
         val worker = Thread { outcome.set(phase.execute()) }
         worker.start()
         assertTrue(entered.await(1, TimeUnit.SECONDS))
@@ -138,7 +168,7 @@ internal class SearchLocalPhaseTest {
             entered.countDown()
             check(releaseOpen.await(2, TimeUnit.SECONDS))
             LocalOpenedResult("a".repeat(64), input)
-        }, {}, { SearchResourceStateV2.RELEASED })
+        }, {}, { SearchResourceStateV2.PAUSED_LEASE_HELD }, { SearchResourceStateV2.RELEASED })
         val worker = Thread { outcome.set(phase.execute()) }
         worker.start()
         assertTrue(entered.await(1, TimeUnit.SECONDS))
@@ -161,30 +191,32 @@ internal class SearchLocalPhaseTest {
         val failed = SearchLocalPhase(9, 3, 12, 14, observer, { "success" }, {
             opens++
             LocalOpenedResult("a".repeat(64), Input())
-        }, { closes++ }, { SearchResourceStateV2.QUARANTINED })
+        }, { closes++ }, { SearchResourceStateV2.QUARANTINED }, { error("unknown lease released") })
         assertEquals(LocalPhaseOutcome.Unknown, failed.execute())
         assertEquals(0, opens)
         assertEquals(1, closes)
         val paused = SearchLocalPhase(9, 4, 12, 14, observer, { "paused_budget" }, {
             error("paused result")
-        }, { error("paused session closed") }, { error("paused lease released") })
+        }, { error("paused session closed") }, { error("paused worker retired") }, { error("paused lease released") })
         assertEquals(LocalPhaseOutcome.Paused, paused.execute())
     }
 
     @Test
     fun sessionCloseFailureAfterCommitDoesNotProduceConfirmedFence(): Unit {
         val input = Input()
+        val releases = AtomicInteger()
         val phase = SearchLocalPhase(9, 3, 12, 14, Observer { offer ->
             offer.result.open().close()
             offer.result.close()
             SearchResultReceiptV3.COMMITTED_CLOSED
         }, { "success" }, { LocalOpenedResult("a".repeat(64), input) },
-            { throw IOException("synthetic") }, { SearchResourceStateV2.RELEASED })
+            { throw IOException("synthetic") }, { SearchResourceStateV2.PAUSED_LEASE_HELD }, { releases.incrementAndGet(); SearchResourceStateV2.RELEASED })
         assertEquals(LocalPhaseOutcome.Unknown, phase.execute())
         assertEquals(1, input.inputsClosed)
+        assertEquals(0, releases.get())
     }
 
     private fun phase(input: Input, observer: SearchSessionObserverV3): SearchLocalPhase =
         SearchLocalPhase(9, 3, 12, 14, observer, { "success" },
-            { LocalOpenedResult("a".repeat(64), input) }, {}, { SearchResourceStateV2.RELEASED })
+            { LocalOpenedResult("a".repeat(64), input) }, {}, { SearchResourceStateV2.PAUSED_LEASE_HELD }, { SearchResourceStateV2.RELEASED })
 }
