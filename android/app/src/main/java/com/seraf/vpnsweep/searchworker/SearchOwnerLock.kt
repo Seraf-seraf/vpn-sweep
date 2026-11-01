@@ -209,6 +209,11 @@ internal class SearchOwnerLease internal constructor(
         authorized && activeOperations == 0 && workerOutstanding.get() && state.compareAndSet(State.OPEN, State.RECOVERING)
     }
 
+    internal fun completeRecovery(owner: SearchOwnerLeaseAccess): Boolean = synchronized(custodyLock) {
+        owner.owns(this) && custody === owner.token && activeOperations == 0 && !workerOutstanding.get() &&
+            state.compareAndSet(State.RECOVERING, State.SEALED)
+    }
+
     override fun workerDeathConfirmed(): Unit = withAccess(null, { throw IllegalStateException("owner_custody_transferred") }) {
         workerDeathConfirmedImpl()
     }
@@ -404,6 +409,7 @@ internal class SearchOwnerLeaseAccess internal constructor(
     internal fun observeAnchor(): WorkerAnchorObservation = lease.observeAnchor()
     internal fun workerDeathConfirmed(): Unit = lease.workerDeathConfirmed(this)
     internal fun sealForRecovery(): Boolean = lease.sealForRecovery(this)
+    internal fun completeRecovery(): Boolean = lease.completeRecovery(this)
     internal fun quarantine(): Unit = lease.quarantine(this)
     internal fun reserveWorker(): Boolean = lease.reserveWorker(this)
     internal fun releaseUnstartedReservation(): Unit = lease.releaseUnstartedReservation(this)

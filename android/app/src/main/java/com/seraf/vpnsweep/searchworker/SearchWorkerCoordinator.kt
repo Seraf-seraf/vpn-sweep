@@ -15,16 +15,11 @@ import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-internal interface WorkerCoordinatorPort {
+internal interface WorkerCoordinatorPort : PreconnectWorkerStop {
     fun bind(): Boolean
     fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder?
     fun confirmedBinder(): IBinder?
     fun awaitRetired(deadlineElapsedMillis: Long): Boolean
-    fun observeRetirement(completed: (CoordinatorRetirementProof?) -> Unit): Boolean
-    fun ownsRetirement(proof: CoordinatorRetirementProof): Boolean
-    fun beginSupervisorStop(attempt: Any, unbound: (Boolean) -> Unit): Boolean
-    fun replaceSupervisorAttempt(attempt: Any): Boolean
-    fun supervisorDied(proof: SupervisorDeathProof): Boolean
     fun quarantine(): Unit
     fun stop(): Unit
 }
@@ -242,13 +237,17 @@ internal class SearchWorkerCoordinator(
 
     override fun beginSupervisorStop(attempt: Any, unbound: (Boolean) -> Unit): Boolean {
         val duplicate = synchronized(lock) {
-            if (stopped || supervisedStop || !bindCalled || !reservationOwned) return false
+            if (stopped || supervisedStop || bindResult != true || !reservationOwned || connected || handshakeStarted) return false
             val value = prepared ?: return false
             supervisedStop = true
             stopLocked()
             value
         }
         handshakeFinished.countDown()
+        if (!lease.mayLoadMobile()) {
+            failClosed()
+            return false
+        }
         val stop = SupervisedCoordinatorStop(
             admission = admission,
             requestUnbind = { completion -> requestUnbind { success ->

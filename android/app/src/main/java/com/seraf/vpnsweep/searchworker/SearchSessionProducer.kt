@@ -50,6 +50,7 @@ internal class SearchSessionProducer(
     // Must be a local, nonblocking elapsed-realtime clock, including in tests.
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
     private val reportNetworkUnavailable: (Long, NetworkPolicyUnavailableReason) -> Unit = { _, _ -> },
+    private val reportRecoveryPending: (Long) -> Boolean = { true },
 ) : SearchSessionPortV4 {
     constructor(
         cleanupMillis: Long,
@@ -57,7 +58,7 @@ internal class SearchSessionProducer(
         nowMillis: () -> Long = SystemClock::elapsedRealtime,
     ) : this(cleanupMillis, { snapshot, _, progress -> createSession(snapshot, progress) }, nowMillis)
 
-    private enum class State { STARTING, RUNNING, FINISHING, EMITTING_PAUSE, PAUSED, TERMINAL, UNKNOWN }
+    private enum class State { STARTING, RUNNING, RECOVERING, FINISHING, EMITTING_PAUSE, PAUSED, TERMINAL, UNKNOWN }
     private enum class Control { NONE, PAUSE, CANCEL }
     private class Cancellation(val epoch: Long) {
         val done = CountDownLatch(1)
@@ -96,6 +97,10 @@ internal class SearchSessionProducer(
         var pauseDelivery: PauseDelivery? = null
         var terminal: SearchTerminalV3? = null
         var resources = SearchResourceStateV2.QUARANTINED
+        var recoveryToken: Any? = null
+        var recoveryEvidence = false
+        var recoveryPhaseDone = false
+        var recoveryFinishing = false
     }
 
     private val lock = Any()
@@ -191,6 +196,72 @@ internal class SearchSessionProducer(
             current to actions
         }
         dispatchUnknown(pending.first, pending.second)
+    }
+
+    fun beginPreconnectRecovery(generation: Long, recovery: PreconnectRecovery): Boolean {
+        val selected = synchronized(lock) {
+            val current = active ?: return false
+            if (current.snapshot.sessionGeneration != generation || current.state != State.RUNNING ||
+                current.session == null || current.phase == null || current.control == Control.PAUSE ||
+                !recovery.belongsTo(generation, current.sessionLease)
+            ) return false
+            val phase = current.phase!!
+            if (!phase.fenceForRecovery()) return false
+            val token = Any()
+            current.recoveryToken = token
+            current.state = State.RECOVERING
+            current.watch?.done?.countDown()
+            current.watch = null
+            current.deadline = null
+            current to token
+        }
+        val fenced = try { reportRecoveryPending(generation) } catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!fenced) { unknown(selected.first); return false }
+        val started = try {
+            recovery.start { proof -> recoveryEvidence(selected.first, selected.second, recovery, proof) }
+        } catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!started) unknown(selected.first)
+        return started
+    }
+
+    private fun recoveryEvidence(current: Active, token: Any, recovery: PreconnectRecovery, proof: PreconnectRecoveryProof?): Unit {
+        if (!synchronized(lock) { active === current && current.state == State.RECOVERING && current.recoveryToken === token }) return
+        if (proof == null || !recovery.consume(proof)) return unknown(current)
+        val finish = synchronized(lock) {
+            if (active !== current || current.state != State.RECOVERING || current.recoveryToken !== token) return
+            current.recoveryEvidence = true
+            claimRecoveryFinish(current)
+        }
+        if (finish) dispatchRecoveryFinish(current)
+    }
+
+    private fun claimRecoveryFinish(current: Active): Boolean {
+        if (!current.recoveryEvidence || !current.recoveryPhaseDone || current.recoveryFinishing) return false
+        current.recoveryFinishing = true
+        return true
+    }
+
+    private fun dispatchRecoveryFinish(current: Active): Unit {
+        if (!launch {
+                val session = synchronized(lock) {
+                    if (active !== current || current.state != State.RECOVERING || !current.recoveryFinishing) return@launch
+                    current.session
+                } ?: return@launch unknown(current)
+                val resources = cleanup(current) { deadline ->
+                    session.closeSession(deadline)
+                    if (!current.lease.completeRecovery()) SearchResourceStateV2.QUARANTINED
+                    else session.releaseResources(deadline)
+                } ?: SearchResourceStateV2.QUARANTINED
+                if (resources != SearchResourceStateV2.RELEASED) return@launch unknown(current)
+                val cancelled = synchronized(lock) {
+                    if (active !== current || current.state != State.RECOVERING) return@launch
+                    current.resources = resources
+                    current.control == Control.CANCEL
+                }
+                val terminal = if (cancelled) SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, resources, SearchResultFenceV3.CONFIRMED)
+                else SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch, SearchFailureV1.INTERRUPTED, resources, SearchResultFenceV3.CONFIRMED)
+                finish(current, terminal)
+            }) unknown(current)
     }
 
     override fun resume(sessionGeneration: Long, phaseEpoch: Long): SearchStartV3 {
@@ -369,6 +440,7 @@ internal class SearchSessionProducer(
             { cleanup(current) { deadline -> session.retireResources(deadline) } ?: SearchResourceStateV2.QUARANTINED },
             { (cleanup(current) { deadline -> session.releaseResources(deadline) } ?: SearchResourceStateV2.QUARANTINED)
                 .also { result -> synchronized(lock) { current.resources = result } } },
+            { synchronized(lock) { active === current && current.epoch == epoch && current.state == State.RECOVERING } },
         )
         val cancelBeforeRun = synchronized(lock) {
             if (active !== current || current.epoch != epoch || current.state == State.UNKNOWN) return
@@ -378,6 +450,15 @@ internal class SearchSessionProducer(
         }
         if (cancelBeforeRun) phase.revoke()
         val outcome = phase.execute()
+        if (outcome == LocalPhaseOutcome.Recovering) {
+            val finish = synchronized(lock) {
+                if (active !== current || current.epoch != epoch || current.state != State.RECOVERING) return
+                current.recoveryPhaseDone = true
+                claimRecoveryFinish(current)
+            }
+            if (finish) dispatchRecoveryFinish(current)
+            return
+        }
         if (outcome == LocalPhaseOutcome.NotStarted) {
             val pending = synchronized(lock) { current.cancellation }
             if (pending == null || !awaitCancel(current, pending, requireAccepted = true)) {
@@ -412,7 +493,7 @@ internal class SearchSessionProducer(
                 }
             }
             LocalPhaseOutcome.Stopped -> finishWithoutRun(current, cancelled = false)
-            LocalPhaseOutcome.Unknown, LocalPhaseOutcome.NotStarted -> unknown(current)
+            LocalPhaseOutcome.Unknown, LocalPhaseOutcome.NotStarted, LocalPhaseOutcome.Recovering -> unknown(current)
             is LocalPhaseOutcome.Handoff -> finishHandoff(current, outcome)
         }
     }
@@ -429,6 +510,10 @@ internal class SearchSessionProducer(
             if (current.snapshot.sessionGeneration != generation || current.epoch != epoch ||
                 current.state == State.TERMINAL || current.state == State.UNKNOWN
             ) return
+            if (current.state == State.RECOVERING) {
+                if (requested == Control.CANCEL) current.control = Control.CANCEL
+                return
+            }
             if (current.control == Control.CANCEL || current.control == requested) return
             if (now < 0 || now > Long.MAX_VALUE - cleanupMillis) {
                 failed = current

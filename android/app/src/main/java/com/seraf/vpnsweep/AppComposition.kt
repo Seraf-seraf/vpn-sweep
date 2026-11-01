@@ -54,6 +54,7 @@ import com.seraf.vpnsweep.searchworker.WorkerServiceObservation
 import com.seraf.vpnsweep.searchworker.createSearchWorkerRound
 import com.seraf.vpnsweep.searchworker.openAndroidNetworkOwner
 import com.seraf.vpnsweep.searchworker.requireSearchNetwork
+import com.seraf.vpnsweep.searchworker.startPreconnectRecovery
 import com.seraf.vpnsweep.searchstate.SubscriptionController
 import com.seraf.vpnsweep.searchstate.SubscriptionLoadResult
 import com.seraf.vpnsweep.searchstate.SubscriptionPhase
@@ -289,7 +290,7 @@ internal class AppComposition(context: Context) {
     init {
         activation.controller.setPhaseListener { state ->
             if (state.ownerBusyRetry) ownerBusyRecovery.request()
-            if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state.phase)?.let(::addEvent)
+            if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state)?.let(::addEvent)
         }
         if (!recoveryMode.blocked()) restoreSubscription()
         else supervisedCoordinator.start()
@@ -606,6 +607,7 @@ internal class AppComposition(context: Context) {
                     emitWorkerDiagnostic(activeSearch?.sessionGeneration, generation, networkPolicyEvent(reason), ::addEvent)
                 }
             },
+            reportRecoveryPending = { generation -> activation.controller.recoveryPending(generation) },
         )
 
         override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
@@ -806,6 +808,20 @@ internal class AppComposition(context: Context) {
                         localDrain,
                         { action ->
                             try { searchResourceReaper.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
+                        },
+                        { worker, drain ->
+                            startPreconnectRecovery(
+                                snapshot.sessionGeneration,
+                                lease,
+                                drain,
+                                worker,
+                                { delay, action ->
+                                    try { supervisorExecutor.schedule(action, delay, TimeUnit.MILLISECONDS); true }
+                                    catch (_: Exception) { false } catch (_: LinkageError) { false }
+                                },
+                                { confirmed, retry, failed -> SearchSupervisorTermination(app, supervisorExecutor, confirmed, retry, failed) },
+                                producer,
+                            )
                         },
                         limits.frameBytes,
                         limits.replyBytes,
