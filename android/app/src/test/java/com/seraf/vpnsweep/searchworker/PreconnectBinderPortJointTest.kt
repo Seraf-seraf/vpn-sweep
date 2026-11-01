@@ -8,23 +8,33 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.io.IOException
 import org.junit.Assert.*
 import org.junit.Test
 
 class PreconnectBinderPortJointTest {
-    @Test fun innerTimeoutBeforeOuterStillStartsRecovery(): Unit = exercise(innerFirst = true)
-    @Test fun outerTimeoutThenAdapterCancelStillDrainsOpen(): Unit = exercise(innerFirst = false)
+    @Test fun innerTimeoutBeforeOuterStillStartsRecovery(): Unit = exercise(Order.INNER_FIRST)
+    @Test fun outerTimeoutThenAdapterCancelStillDrainsOpen(): Unit = exercise(Order.OUTER_FIRST)
+    @Test fun adapterCancelBeforeTimeoutDrainsBothWaits(): Unit = exercise(Order.CANCEL_FIRST)
+    @Test fun unexpectedLateWaitFailureRemainsUnknown(): Unit = exercise(Order.WAIT_FAIL)
+    @Test fun failedStagedResourceCloseRemainsUnknown(): Unit = exercise(Order.CLOSE_FAIL)
 
-    private fun exercise(innerFirst: Boolean): Unit {
+    private enum class Order { INNER_FIRST, OUTER_FIRST, CANCEL_FIRST, WAIT_FAIL, CLOSE_FAIL }
+
+    private fun exercise(order: Order): Unit {
         val clock = AtomicLong(1_000)
         val waiting = CountDownLatch(1)
         val release = CountDownLatch(1)
+        val cancelWaiting = CountDownLatch(1)
+        val allowTimeout = CountDownLatch(1)
+        val recoveryStarted = CountDownLatch(1)
         val cancelled = CountDownLatch(1)
         val finished = CountDownLatch(1)
         val drainFinished = CountDownLatch(1)
+        val openWait = AtomicReference<CountDownLatch>()
         val outcome = AtomicReference<Boolean?>()
         val recoveryStarts = AtomicInteger()
-        val coordinator = FakeCoordinator(waiting, release)
+        val coordinator = FakeCoordinator(waiting, cancelWaiting, release, order == Order.WAIT_FAIL)
         val owner = FakeOwner()
         val identity = WorkerIdentityV1(1, 2uL, 1, 3)
         val network = SearchNetworkV1(4, 5)
@@ -34,22 +44,25 @@ class PreconnectBinderPortJointTest {
             coordinator, owner, duplicate, identity, network, drain,
             onPreconnectTimeout = {
                 recoveryStarts.incrementAndGet()
-                drain.seal(1) { outcome.set(it != null); drainFinished.countDown() }
+                drain.seal(1) { outcome.set(it != null); drainFinished.countDown() }.also { recoveryStarted.countDown() }
             },
             provenFrameBound = 1024, provenReplyBound = 1024,
             stageFrameOverride = { _, _ -> object : StagedWorkerFrame {
                 override fun descriptor(): ParcelFileDescriptor = error("no Binder transaction expected")
-                override fun close(): Unit = Unit
+                override fun close(): Unit { if (order == Order.CLOSE_FAIL) throw IOException("synthetic_close_failure") }
             } },
             nowMillis = clock::get,
-            awaitBounded = { done, _ ->
-                check(waiting.await(3, TimeUnit.SECONDS))
-                clock.set(2_000)
-                if (innerFirst) {
-                    release.countDown()
-                    check(done.await(3, TimeUnit.SECONDS))
-                    true
-                } else false
+            awaitBounded = { done, millis ->
+                if (done === openWait.get() || openWait.compareAndSet(null, done)) {
+                    check(waiting.await(3, TimeUnit.SECONDS))
+                    if (order == Order.CANCEL_FIRST) check(allowTimeout.await(3, TimeUnit.SECONDS))
+                    clock.set(2_000)
+                    if (order == Order.INNER_FIRST) {
+                        release.countDown()
+                        check(done.await(3, TimeUnit.SECONDS))
+                        true
+                    } else false
+                } else done.await(millis, TimeUnit.MILLISECONDS)
             },
         )
         val forwarding = object : DeadlineWorkerPort {
@@ -73,24 +86,34 @@ class PreconnectBinderPortJointTest {
         }
         worker.start()
         try {
-            assertTrue(cancelled.await(3, TimeUnit.SECONDS))
-            if (!innerFirst) assertNull(outcome.get())
+            if (order == Order.CANCEL_FIRST) {
+                assertTrue(waiting.await(3, TimeUnit.SECONDS))
+                adapter.cancel(3)
+                assertTrue(cancelWaiting.await(3, TimeUnit.SECONDS))
+                allowTimeout.countDown()
+                assertTrue(recoveryStarted.await(3, TimeUnit.SECONDS))
+            } else assertTrue(cancelled.await(3, TimeUnit.SECONDS))
+            if (order != Order.INNER_FIRST) assertNull(outcome.get())
             release.countDown()
+            assertTrue(cancelled.await(3, TimeUnit.SECONDS))
             assertTrue(finished.await(3, TimeUnit.SECONDS))
             assertTrue(drainFinished.await(3, TimeUnit.SECONDS))
             assertEquals(1, recoveryStarts.get())
-            assertEquals(true, outcome.get())
+            assertEquals(order != Order.WAIT_FAIL && order != Order.CLOSE_FAIL, outcome.get())
             assertEquals(0, coordinator.quarantines.get())
             assertEquals(0, owner.quarantines.get())
-        } finally { release.countDown() }
+        } finally { allowTimeout.countDown(); release.countDown() }
     }
 
-    private class FakeCoordinator(private val waiting: CountDownLatch, private val release: CountDownLatch) : WorkerCoordinatorPort {
+    private class FakeCoordinator(private val waiting: CountDownLatch, private val cancelWaiting: CountDownLatch,
+        private val release: CountDownLatch, private val failWait: Boolean) : WorkerCoordinatorPort {
         val quarantines = AtomicInteger()
+        private val waits = AtomicInteger()
         override fun bind(): Boolean = true
         override fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
-            waiting.countDown()
+            if (waits.incrementAndGet() == 1) waiting.countDown() else cancelWaiting.countDown()
             check(release.await(3, TimeUnit.SECONDS))
+            if (failWait) throw IOException("synthetic_wait_failure")
             return null
         }
         override fun confirmedBinder(): IBinder? = null

@@ -70,6 +70,11 @@ private sealed interface OpenDispatchResult {
     data object WaitExpired : OpenDispatchResult
 }
 
+private sealed interface CancelDispatchResult {
+    class Status(val confirmed: Boolean) : CancelDispatchResult
+    data object RecoveryStopped : CancelDispatchResult
+}
+
 internal interface StagedWorkerFrame : AutoCloseable {
     fun descriptor(): ParcelFileDescriptor
 }
@@ -198,7 +203,7 @@ internal class SearchWorkerBinderPort(
                 val binder = coordinator.awaitConfirmed(deadline) ?: run {
                     val expected = synchronized(lock) {
                         !Thread.currentThread().isInterrupted && (state == State.RECOVERY_PENDING ||
-                            (state == State.OPENING && !cancelled && !cancelPending && remaining(deadline) <= 0))
+                            (state == State.OPENING && (!cancelled || cancelPending) && remaining(deadline) <= 0))
                     }
                     if (expected) throw ExpectedPreconnectWaitStop()
                     throw IOException("worker_admission_unknown")
@@ -387,8 +392,11 @@ internal class SearchWorkerBinderPort(
             throw IOException("worker_deadline")
         }
         var conflict = false
+        var unavailable = false
+        var cancelTicket: SearchWorkerLocalDrain.Ticket? = null
         var effectiveDeadline = cleanupDeadlineElapsedMillis
         val send = synchronized(lock) {
+            if (state == State.RECOVERY_PENDING) { cancelled = true; return }
             cancelled = true
             effectiveDeadline = tightenCleanupDeadline(cleanupDeadlineElapsedMillis)
             if (cancelPending) {
@@ -403,34 +411,66 @@ internal class SearchWorkerBinderPort(
                     State.READY -> true
                     State.RECOVERY_PENDING, State.QUARANTINED -> throw IOException("worker_delivery_unknown")
                 }
-                if (needed) cancelPending = true else cancelConfirmed = true
-                needed
+                if (needed) {
+                    cancelTicket = localDrain.begin(identity.sessionGeneration)
+                    if (cancelTicket == null) unavailable = true else cancelPending = true
+                } else cancelConfirmed = true
+                needed && !unavailable
             }
         }
-        if (conflict) {
+        if (conflict || unavailable) {
             failClosed()
             throw IOException("worker_delivery_unknown")
         }
         if (!send) return
-        val confirmed = bounded(effectiveDeadline, {}) {
-            val binder = coordinator.awaitConfirmed(effectiveDeadline) ?: throw IOException("worker_owner_unknown")
-            requireTime(effectiveDeadline)
-            val status = statusTransaction(binder, SearchWorkerIpcV2.CANCEL_ROUND) { it.writeWorkerIdentity(identity, network) }
-            requireTime(effectiveDeadline)
-            status.toLong() == Mobile.SearchWorkerReady
-        }
-        if (confirmed != true) {
-            failClosed()
-            throw IOException("worker_delivery_unknown")
-        }
-        val accepted = synchronized(lock) {
-            if (state == State.QUARANTINED) false else {
-                cancelPending = false
-                cancelConfirmed = true
-                true
+        val custody = checkNotNull(cancelTicket)
+        var completed = false
+        try {
+            val task = custody.retain() ?: throw IOException("worker_drain_unknown")
+            var deferred = false
+            val result = bounded(effectiveDeadline, {}, task, onFailure = { timedOut ->
+                deferred = timedOut && synchronized(lock) { state == State.RECOVERY_PENDING }
+                if (!deferred) failClosed()
+            }, expectedTimeout = { it == CancelDispatchResult.RecoveryStopped }) {
+                try {
+                    CancelDispatchResult.Status(trackedPreconnectCancel(task) {
+                        val binder = coordinator.awaitConfirmed(effectiveDeadline) ?: run {
+                            if (!Thread.currentThread().isInterrupted && synchronized(lock) { state == State.RECOVERY_PENDING }) {
+                                throw ExpectedPreconnectWaitStop()
+                            }
+                            throw IOException("worker_owner_unknown")
+                        }
+                        requireTime(effectiveDeadline)
+                        val status = statusTransaction(binder, SearchWorkerIpcV2.CANCEL_ROUND) { it.writeWorkerIdentity(identity, network) }
+                        requireTime(effectiveDeadline)
+                        if (status.toLong() != Mobile.SearchWorkerReady) throw IOException("worker_cancel_unknown")
+                        true
+                    })
+                } catch (_: ExpectedPreconnectWaitStop) { CancelDispatchResult.RecoveryStopped }
             }
+            if (result == null && deferred) { completed = true; return }
+            if (result == CancelDispatchResult.RecoveryStopped) {
+                val fenced = synchronized(lock) {
+                    if (state == State.RECOVERY_PENDING) { cancelPending = false; true } else false
+                }
+                if (fenced) { completed = true; return }
+            }
+            if (result !is CancelDispatchResult.Status || !result.confirmed) {
+                failClosed()
+                throw IOException("worker_delivery_unknown")
+            }
+            val accepted = synchronized(lock) {
+                if (state == State.QUARANTINED) false else {
+                    cancelPending = false
+                    cancelConfirmed = true
+                    true
+                }
+            }
+            if (!accepted) throw IOException("worker_delivery_unknown")
+            completed = true
+        } finally {
+            try { if (!completed) failClosed() } finally { custody.closed(completed) }
         }
-        if (!accepted) throw IOException("worker_delivery_unknown")
     }
 
     override fun closeUntil(identity: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): WorkerCloseV1 {
@@ -848,7 +888,7 @@ internal class SearchWorkerBinderPort(
         val now = nowMillis()
         handlePreconnectOpenFailure(timedOut, now, deadline, reserve = {
             synchronized(lock) {
-                if (state != State.OPENING || !bindingStarted || cancelled || cancelPending) false else {
+                if (state != State.OPENING || !bindingStarted || (cancelled && !cancelPending)) false else {
                     state = State.RECOVERY_PENDING
                     true
                 }
@@ -877,6 +917,20 @@ internal inline fun <T> trackedPreconnectOpen(
     try {
         val resource = ticket.retain() ?: throw IOException("worker_resource_unknown")
         val result = action(resource)
+        confirmed = true
+        return result
+    } catch (failure: ExpectedPreconnectWaitStop) {
+        confirmed = true
+        throw failure
+    } finally {
+        ticket.closed(confirmed)
+    }
+}
+
+internal inline fun <T> trackedPreconnectCancel(ticket: SearchWorkerLocalDrain.Ticket, action: () -> T): T {
+    var confirmed = false
+    try {
+        val result = action()
         confirmed = true
         return result
     } catch (failure: ExpectedPreconnectWaitStop) {
