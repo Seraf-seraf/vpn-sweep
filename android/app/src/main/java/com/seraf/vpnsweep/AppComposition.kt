@@ -32,6 +32,8 @@ import com.seraf.vpnsweep.searchworker.SearchOwnerLeaseControl
 import com.seraf.vpnsweep.searchworker.SearchOwnerLock
 import com.seraf.vpnsweep.searchworker.SearchSessionProducer
 import com.seraf.vpnsweep.searchworker.SearchNetworkPolicyUnavailable
+import com.seraf.vpnsweep.searchworker.WorkerOperationFailure
+import com.seraf.vpnsweep.searchworker.WorkerServiceObservation
 import com.seraf.vpnsweep.searchworker.createSearchWorkerRound
 import com.seraf.vpnsweep.searchworker.openAndroidNetworkOwner
 import com.seraf.vpnsweep.searchstate.SubscriptionController
@@ -59,12 +61,53 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.workerFatalEvent
 import com.seraf.vpnsweep.searchui.subscriptionEvent
 import com.seraf.vpnsweep.searchui.searchEvent
 import com.seraf.vpnsweep.searchui.workerOpenEvent
 
 internal class SweepApplication : Application() {
     val integration: AppComposition by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppComposition(this) }
+}
+
+internal enum class SearchReadiness { READY, SELECT_REQUIRED, BUSY, UNKNOWN }
+
+internal fun readinessAfterChecks(ownerRecovery: SearchStartV3?, selectionAvailable: Boolean, selected: Boolean, searchEnabled: Boolean): SearchReadiness = when {
+    ownerRecovery == SearchStartV3.BUSY -> SearchReadiness.BUSY
+    ownerRecovery == SearchStartV3.UNKNOWN || ownerRecovery == SearchStartV3.REJECTED -> SearchReadiness.UNKNOWN
+    !selectionAvailable -> SearchReadiness.UNKNOWN
+    !selected -> SearchReadiness.SELECT_REQUIRED
+    searchEnabled -> SearchReadiness.READY
+    else -> SearchReadiness.UNKNOWN
+}
+
+internal fun recheckSearchReadinessFlow(
+    ownerBusyRetry: Boolean,
+    recover: () -> SearchStartV3,
+    selectionAvailable: () -> Boolean,
+    hasCommittedSelection: () -> Boolean,
+    searchEnabled: () -> Boolean,
+): SearchReadiness {
+    val recovery = if (ownerBusyRetry) recover() else null
+    if (recovery == SearchStartV3.BUSY || recovery == SearchStartV3.UNKNOWN || recovery == SearchStartV3.REJECTED) {
+        return readinessAfterChecks(recovery, false, false, false)
+    }
+    val available = selectionAvailable()
+    if (!available) return SearchReadiness.UNKNOWN
+    val selected = hasCommittedSelection()
+    if (!selected) return SearchReadiness.SELECT_REQUIRED
+    return readinessAfterChecks(recovery, true, true, searchEnabled())
+}
+
+internal fun emitWorkerDiagnostic(currentGeneration: Long?, generation: Long, event: ScreenEvent, append: (ScreenEvent) -> Unit): Unit {
+    if (currentGeneration == generation) append(event)
+}
+
+internal fun workerServiceObservationEvent(observation: WorkerServiceObservation): ScreenEvent = when (observation) {
+    WorkerServiceObservation.BUSY -> ScreenEvent.WORKER_SERVICE_BUSY
+    WorkerServiceObservation.UNAVAILABLE -> ScreenEvent.WORKER_SERVICE_UNAVAILABLE
+    WorkerServiceObservation.DEADLINE -> ScreenEvent.WORKER_SERVICE_DEADLINE
+    WorkerServiceObservation.CANCELLED -> ScreenEvent.WORKER_SERVICE_CANCELLED
 }
 
 internal fun recoverOwnerBusyForSelection(
@@ -139,6 +182,16 @@ internal class AppComposition(context: Context) {
         val receipt = synchronized(lock) { acceptedSnapshot }
         val revision = try { activation.currentRevision() } catch (_: Exception) { null }
         return recoverOwnerBusyForSelection(activation.controller, state, receipt, revision, workerTransportLimits.isProven)
+    }
+
+    fun recheckSearchReadiness(): SearchReadiness = synchronized(activation.controller) {
+        recheckSearchReadinessFlow(
+            ownerBusyRetry = searchState.value.ownerBusyRetry,
+            recover = ::retryOwnerBusyForSelection,
+            selectionAvailable = ::selectionAvailable,
+            hasCommittedSelection = { subscriptions.state.value.selectedIds.isNotEmpty() },
+            searchEnabled = ::searchEnabled,
+        )
     }
 
     fun subscriptionState(): StateFlow<SubscriptionUiState> = subscriptions.state
@@ -576,11 +629,16 @@ internal class AppComposition(context: Context) {
             lease: SearchOwnerLeaseControl,
             progress: (Long, SearchProgressV1) -> Unit,
         ): SearchMobilePhaseSession {
+            var stage = ScreenEvent.SEARCH_INIT_PROFILES_FAILED
+            try {
             val profiles = snapshot.profiles.open().use { input -> input.readNBytes(MAX_SEARCH_PROFILES_BYTES + 1) }
             if (profiles.isEmpty() || profiles.size > MAX_SEARCH_PROFILES_BYTES) throw IOException("search_profile_size")
+            stage = ScreenEvent.SEARCH_INIT_CORE_IDENTITY_FAILED
             val digest = coreLibraryDigest(app)
+            stage = ScreenEvent.SEARCH_INIT_MANIFEST_FAILED
             val manifest = Mobile.buildDefaultSearchManifest(profiles, digest)
             val cleanupMillis = Mobile.searchManifestCleanupMillis(manifest)
+            stage = ScreenEvent.SEARCH_INIT_NETWORK_UNKNOWN
             val manager = app.getSystemService(ConnectivityManager::class.java) ?: throw SearchNetworkPolicyUnavailable()
             val network = when (val opened = openAndroidNetworkOwner(
                 manager,
@@ -607,15 +665,61 @@ internal class AppComposition(context: Context) {
                         network.network,
                         limits.frameBytes,
                         limits.replyBytes,
+                        reportRetirementFailure = { reason ->
+                            synchronized(this@AppComposition.lock) {
+                                emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, workerOpenEvent(reason), ::addEvent)
+                            }
+                        },
+                        reportServiceFailure = { reason ->
+                            synchronized(this@AppComposition.lock) {
+                                emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, workerFatalEvent(reason), ::addEvent)
+                            }
+                        },
+                        reportBindFailure = {
+                            synchronized(this@AppComposition.lock) {
+                                emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, ScreenEvent.WORKER_BIND_FAILED, ::addEvent)
+                            }
+                        },
+                        reportServiceObservation = { observation ->
+                            val event = workerServiceObservationEvent(observation)
+                            synchronized(this@AppComposition.lock) {
+                                emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, event, ::addEvent)
+                            }
+                        },
                     )
                 },
                 reportProgress = { progress(snapshot.sessionGeneration, it) },
                 reportKnownFailure = { reason ->
                     synchronized(this@AppComposition.lock) {
-                        if (activeSearch?.sessionGeneration == snapshot.sessionGeneration) addEvent(workerOpenEvent(reason))
+                        emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, workerOpenEvent(reason), ::addEvent)
+                    }
+                },
+                reportFatalFailure = { reason ->
+                    synchronized(this@AppComposition.lock) {
+                        emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, workerFatalEvent(reason), ::addEvent)
+                    }
+                },
+                reportAdmissionFailure = {
+                    synchronized(this@AppComposition.lock) {
+                        emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, ScreenEvent.WORKER_ADMISSION_FAILED, ::addEvent)
+                    }
+                },
+                reportOperationFailure = { operation ->
+                    val event = when (operation) {
+                        WorkerOperationFailure.CALL -> ScreenEvent.WORKER_CALL_FAILED
+                        WorkerOperationFailure.CALL_INVALID -> ScreenEvent.WORKER_CALL_INVALID
+                        WorkerOperationFailure.CALL_STATE -> ScreenEvent.WORKER_CALL_STATE
+                        WorkerOperationFailure.CALL_DEADLINE -> ScreenEvent.WORKER_CALL_DEADLINE
+                        WorkerOperationFailure.CALL_CANCELLED -> ScreenEvent.WORKER_CALL_CANCELLED
+                        WorkerOperationFailure.CANCEL -> ScreenEvent.WORKER_CANCEL_FAILED
+                        WorkerOperationFailure.CLOSE -> ScreenEvent.WORKER_CLOSE_FAILED
+                    }
+                    synchronized(this@AppComposition.lock) {
+                        emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, event, ::addEvent)
                     }
                 },
             )
+            stage = ScreenEvent.SEARCH_INIT_SESSION_FAILED
             val session = Mobile.newSearchSession(
                 snapshot.sessionGeneration,
                 manifest,
@@ -642,6 +746,16 @@ internal class AppComposition(context: Context) {
                 },
                 owner = lease,
             )
+            } catch (failure: Throwable) {
+                if (failure !is SearchNetworkPolicyUnavailable) {
+                    try {
+                        synchronized(this@AppComposition.lock) {
+                            if (activeSearch?.sessionGeneration == snapshot.sessionGeneration) addEvent(stage)
+                        }
+                    } catch (_: Exception) { } catch (_: LinkageError) { }
+                }
+                throw failure
+            }
         }
     }
 

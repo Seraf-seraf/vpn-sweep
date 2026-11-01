@@ -13,6 +13,23 @@ import org.junit.Test
 
 internal class SearchWorkerBinderPortTest {
     @Test
+    fun serviceObservationOnlyRecognizesKnownStatuses(): Unit {
+        assertEquals(WorkerServiceObservation.BUSY, serviceObservation(Mobile.SearchWorkerBusy))
+        assertEquals(WorkerServiceObservation.UNAVAILABLE, serviceObservation(Mobile.SearchWorkerUnavailable))
+        assertEquals(WorkerServiceObservation.DEADLINE, serviceObservation(Mobile.SearchWorkerDeadline))
+        assertEquals(WorkerServiceObservation.CANCELLED, serviceObservation(Mobile.SearchWorkerCancelled))
+        assertNull(serviceObservation(Long.MAX_VALUE))
+    }
+
+    @Test
+    fun knownOpenFailureSurvivesUnknownRetirement(): Unit {
+        val observed = mutableListOf<WorkerCandidateFailureV2>()
+        val result = candidateOpenAfterRetirement(Mobile.SearchWorkerCandidateStartFailed, observed::add) { false }
+        assertEquals(listOf(WorkerCandidateFailureV2.CORE_START_FAILED), observed)
+        assertEquals(WorkerOpenV2.Fatal(WorkerFatalV2.CLEANUP_INCOMPLETE), result)
+    }
+
+    @Test
     fun candidateStatusIsTypedOnlyAfterConfirmedRetirement(): Unit {
         val statuses = listOf(
             Mobile.SearchWorkerCandidateConfigRejected to WorkerCandidateFailureV2.CONFIG_REJECTED,

@@ -61,6 +61,8 @@ internal class WorkerRoundClient(val port: DeadlineWorkerPort, val lease: Search
 // admission. A null reply bound disables Open before any worker is created.
 // The factory must not bind; the concrete port must enforce its deadlines,
 // sticky cancel and FD custody.
+internal enum class WorkerOperationFailure { CALL, CALL_INVALID, CALL_STATE, CALL_DEADLINE, CALL_CANCELLED, CANCEL, CLOSE }
+
 internal class SearchEngineWorkerAdapter(
     private val sessionGeneration: Long,
     private val network: SearchNetworkV1,
@@ -70,6 +72,9 @@ internal class SearchEngineWorkerAdapter(
     private val reportProgress: (SearchProgressV1) -> Unit,
     private val nowNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
     private val reportKnownFailure: (WorkerCandidateFailureV2) -> Unit = {},
+    private val reportFatalFailure: (WorkerFatalV2) -> Unit = {},
+    private val reportAdmissionFailure: () -> Unit = {},
+    private val reportOperationFailure: (WorkerOperationFailure) -> Unit = {},
 ) : SearchEngineWorker {
     private enum class State { OPENING, READY, RETIRING, CLOSING }
     private class Round(val identity: WorkerIdentityV1) {
@@ -140,7 +145,10 @@ internal class SearchEngineWorkerAdapter(
         } catch (_: LinkageError) {
             null
         }
-        if (client == null) return fail(current, Mobile.SearchWorkerOwnerLost)
+        if (client == null) {
+            try { reportAdmissionFailure() } catch (_: Exception) { } catch (_: LinkageError) { }
+            return fail(current, Mobile.SearchWorkerOwnerLost)
+        }
         val remainingAttempt = remainingMillis(started, attemptRemainingMillis)
         val remainingStartup = remainingMillis(started, startupRemainingMillis)
         val input = FrameInput(openHeader(attemptDeadline!!, profile.size, params.size), profile, params)
@@ -168,8 +176,17 @@ internal class SearchEngineWorkerAdapter(
         } catch (_: LinkageError) {
             null
         }
+        when (outcome) {
+            null -> try { reportFatalFailure(WorkerFatalV2.UNKNOWN_DELIVERY) } catch (_: Exception) { } catch (_: LinkageError) { }
+            is WorkerOpenV2.Fatal -> if (!outcome.observedStatusReported) try { reportFatalFailure(outcome.reason) } catch (_: Exception) { } catch (_: LinkageError) { }
+            is WorkerOpenV2.CandidateFailure -> try { reportKnownFailure(outcome.reason) } catch (_: Exception) { } catch (_: LinkageError) { }
+            else -> Unit
+        }
         if (outcome == null) synchronized(lock) { if (fatal == null) fatal = Mobile.SearchWorkerDeliveryUnknown }
-        if (!closeInputsBounded(current, input, client.lease, started, minOf(startupRemainingMillis, attemptRemainingMillis))) return failAndCancel(current, Mobile.SearchWorkerCleanupIncomplete)
+        if (!closeInputsBounded(current, input, client.lease, started, minOf(startupRemainingMillis, attemptRemainingMillis))) {
+            try { reportFatalFailure(WorkerFatalV2.CLEANUP_INCOMPLETE) } catch (_: Exception) { } catch (_: LinkageError) { }
+            return failAndCancel(current, Mobile.SearchWorkerCleanupIncomplete)
+        }
         if (outcome == null) return failAndCancel(current, Mobile.SearchWorkerDeliveryUnknown)
         val cancelled = synchronized(lock) { current.cancelled }
         if (cancelled && outcome is WorkerOpenV2.Ready) {
@@ -193,9 +210,7 @@ internal class SearchEngineWorkerAdapter(
             }
             is WorkerOpenV2.CandidateFailure -> {
                 val code = candidateCode(outcome)
-                val result = finishKnownOpen(current, code)
-                if (result == code) try { reportKnownFailure(outcome.reason) } catch (_: Exception) { } catch (_: LinkageError) { }
-                result
+                finishKnownOpen(current, code)
             }
             is WorkerOpenV2.Interrupted -> {
                 finishKnownOpen(current, if (outcome.reason == WorkerInterruptedV2.CANCELLED) Mobile.SearchWorkerCancelled else Mobile.SearchWorkerDeadline)
@@ -210,17 +225,28 @@ internal class SearchEngineWorkerAdapter(
             Mobile.SearchWorkerCheck -> WorkerOperationV1.CHECK
             Mobile.SearchWorkerUDP -> WorkerOperationV1.UDP
             Mobile.SearchWorkerMedia -> WorkerOperationV1.MEDIA
-            else -> return fault(Mobile.SearchWorkerUnavailable)
+            else -> { reportOperation(WorkerOperationFailure.CALL_INVALID); return fault(Mobile.SearchWorkerUnavailable) }
         }
-        if (request == null || remainingMillis <= 0 || round !in 0 until Int.MAX_VALUE.toLong()) return fault(Mobile.SearchWorkerUnavailable)
-        val callDeadline = elapsedDeadlineMillis(started, remainingMillis) ?: return fault(Mobile.SearchWorkerUnavailable)
+        if (request == null || remainingMillis <= 0 || round !in 0 until Int.MAX_VALUE.toLong()) {
+            reportOperation(WorkerOperationFailure.CALL_INVALID)
+            return fault(Mobile.SearchWorkerUnavailable)
+        }
+        val callDeadline = elapsedDeadlineMillis(started, remainingMillis) ?: run {
+            reportOperation(WorkerOperationFailure.CALL_INVALID)
+            return fault(Mobile.SearchWorkerUnavailable)
+        }
         val current = synchronized(lock) {
             val value = active
             if (fatal != null || value == null || value.identity.workerGeneration != generation || value.identity.round.toLong() != round + 1 ||
                 value.state != State.READY || value.cancelled || value.inFlight
-            ) return fault(fatal ?: Mobile.SearchWorkerUnavailable)
-            value.inFlight = true
-            value
+            ) null else {
+                value.inFlight = true
+                value
+            }
+        }
+        if (current == null) {
+            reportOperation(WorkerOperationFailure.CALL_STATE)
+            return fault(synchronized(lock) { fatal ?: Mobile.SearchWorkerUnavailable })
         }
         val remaining = remainingMillis(started, remainingMillis)
         if (remaining <= 0) {
@@ -228,6 +254,7 @@ internal class SearchEngineWorkerAdapter(
                 current.inFlight = false
                 fatal ?: Mobile.SearchWorkerDeadline
             }
+            reportOperation(WorkerOperationFailure.CALL_DEADLINE)
             return fault(code)
         }
         val input = FrameInput(callHeader(callDeadline, round.toInt(), request.size), request)
@@ -244,6 +271,7 @@ internal class SearchEngineWorkerAdapter(
             input.close()
         }
         if (reply is WorkerReplyV1.Interrupted) {
+            reportOperation(if (reply.reason == WorkerInterruptedV2.CANCELLED) WorkerOperationFailure.CALL_CANCELLED else WorkerOperationFailure.CALL_DEADLINE)
             val code = synchronized(lock) {
                 if (active !== current || current.state != State.READY) {
                     if (fatal == null) fatal = Mobile.SearchWorkerDeliveryUnknown
@@ -283,10 +311,16 @@ internal class SearchEngineWorkerAdapter(
         }
         return when (disposition) {
             is CallDisposition.Success -> resultEnvelope(disposition.bytes)
-            is CallDisposition.Failure -> fault(failAndCancel(current, disposition.code))
+            is CallDisposition.Failure -> {
+                try { reportOperationFailure(WorkerOperationFailure.CALL) } catch (_: Exception) { } catch (_: LinkageError) { }
+                fault(failAndCancel(current, disposition.code))
+            }
             CallDisposition.Cancelled -> {
                 val start = cleanupStart(current)
-                if (!cancelCompleted(current, start)) return fault(failAndCancel(current, Mobile.SearchWorkerDeliveryUnknown))
+                if (!cancelCompleted(current, start)) {
+                    reportOperation(WorkerOperationFailure.CANCEL)
+                    return fault(failAndCancel(current, Mobile.SearchWorkerDeliveryUnknown))
+                }
                 val code = synchronized(lock) {
                     if (active !== current || current.state != State.READY) {
                         if (fatal == null) fatal = Mobile.SearchWorkerDeliveryUnknown
@@ -307,16 +341,25 @@ internal class SearchEngineWorkerAdapter(
         val started = nowNanos()
         val current = synchronized(lock) {
             val value = active
-            if (value == null || value.identity.workerGeneration != generation || value.state != State.READY) return Mobile.SearchWorkerCleanupIncomplete
-            recordCleanupStart(value, started)
-            if (cleanupMillis == this.cleanupMillis && !value.inFlight && fatal == null) value.state = State.CLOSING
-            value
+            if (value == null || value.identity.workerGeneration != generation || value.state != State.READY) null else {
+                recordCleanupStart(value, started)
+                if (cleanupMillis == this.cleanupMillis && !value.inFlight && fatal == null) value.state = State.CLOSING
+                value
+            }
+        }
+        if (current == null) {
+            reportOperation(WorkerOperationFailure.CLOSE)
+            return Mobile.SearchWorkerCleanupIncomplete
         }
         if (synchronized(lock) { current.state != State.CLOSING }) {
+            reportOperation(WorkerOperationFailure.CLOSE)
             return failAndCancel(current, Mobile.SearchWorkerCleanupIncomplete)
         }
         val start = cleanupStart(current)
-        if (!cancelCompleted(current, start) || !cleanClose(current, start)) return fail(current, Mobile.SearchWorkerCleanupIncomplete)
+        if (!cancelCompleted(current, start) || !cleanClose(current, start)) {
+            try { reportOperationFailure(WorkerOperationFailure.CLOSE) } catch (_: Exception) { } catch (_: LinkageError) { }
+            return fail(current, Mobile.SearchWorkerCleanupIncomplete)
+        }
         return finish(current, Mobile.SearchWorkerReady)
     }
 
@@ -389,6 +432,7 @@ internal class SearchEngineWorkerAdapter(
         val start = cleanupStart(round)
         val deadline = elapsedDeadlineMillis(start, cleanupMillis)
         if (deadline == null || remainingCleanupNanos(start) <= 0) {
+            reportCancelFailure()
             failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
             return
@@ -399,22 +443,33 @@ internal class SearchEngineWorkerAdapter(
                     round.client!!.port.cancelUntil(round.identity, deadline)
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
+                    reportCancelFailure()
                     failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } catch (_: Exception) {
+                    reportCancelFailure()
                     failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } catch (_: LinkageError) {
+                    reportCancelFailure()
                     failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } finally {
                     done.countDown()
                 }
             }, "search-round-cancel").apply { isDaemon = true }.start()
         } catch (_: Exception) {
+            reportCancelFailure()
             failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
         } catch (_: LinkageError) {
+            reportCancelFailure()
             failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
         }
+    }
+
+    private fun reportCancelFailure(): Unit = reportOperation(WorkerOperationFailure.CANCEL)
+
+    private fun reportOperation(reason: WorkerOperationFailure): Unit {
+        try { reportOperationFailure(reason) } catch (_: Exception) { } catch (_: LinkageError) { }
     }
 
     private fun recordCleanupStart(round: Round, started: Long): Long =
@@ -614,7 +669,8 @@ internal class SearchEngineWorkerAdapter(
         val deadline = elapsedDeadlineMillis(cleanupStart(round), cleanupMillis) ?: return
         try {
             Thread({
-                try { round.client!!.port.closeUntil(round.identity, deadline) } catch (_: Exception) { } catch (_: LinkageError) { }
+                val closed = try { round.client!!.port.closeUntil(round.identity, deadline) == WorkerCloseV1.CLEAN_AND_DEAD } catch (_: Exception) { false } catch (_: LinkageError) { false }
+                if (!closed) reportOperation(WorkerOperationFailure.CLOSE)
             }, "search-round-quarantine").apply { isDaemon = true }.start()
         } catch (_: Exception) { } catch (_: LinkageError) { }
     }

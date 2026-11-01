@@ -165,7 +165,7 @@ internal sealed interface WorkerOpenV2 {
     // Candidate failure and interruption require confirmed cleanup and death.
     data class CandidateFailure(val reason: WorkerCandidateFailureV2, val retryable: Boolean) : WorkerOpenV2
     data class Interrupted(val reason: WorkerInterruptedV2) : WorkerOpenV2
-    data class Fatal(val reason: WorkerFatalV2) : WorkerOpenV2
+    data class Fatal(val reason: WorkerFatalV2, val observedStatusReported: Boolean = false) : WorkerOpenV2
 }
 
 internal sealed interface WorkerReplyV1 {

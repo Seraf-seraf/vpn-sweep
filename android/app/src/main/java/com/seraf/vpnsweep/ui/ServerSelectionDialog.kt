@@ -211,7 +211,10 @@ internal fun ServerSelectionDialogContent(
                         Column(Modifier.fillMaxWidth()) {
                             ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
                             if (errorMessage.isNotEmpty()) Text(errorMessage, color = ServerDialogColors.text)
-                            if (!canConfirm) OutlinedButton(onClick = onRefreshAvailability) { Text("Проверить доступность снова") }
+                            if (!canConfirm) {
+                                Text("Изменения сохранятся только после подтверждения. Проверьте доступность или вернитесь к подписке.", color = ServerDialogColors.text)
+                            }
+                            OutlinedButton(onClick = onRefreshAvailability) { Text("Проверить возможность подбора") }
                         }
                     },
                     footer = {

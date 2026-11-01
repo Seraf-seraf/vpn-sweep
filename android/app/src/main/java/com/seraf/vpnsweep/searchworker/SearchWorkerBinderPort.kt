@@ -33,14 +33,28 @@ internal fun createSearchWorkerRound(
     network: SearchNetworkV1,
     provenFrameBound: Int?,
     provenReplyBound: Int?,
+    reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {},
+    reportServiceFailure: (WorkerFatalV2) -> Unit = {},
+    reportBindFailure: () -> Unit = {},
+    reportServiceObservation: (WorkerServiceObservation) -> Unit = {},
 ): WorkerRoundClient? {
     if (provenFrameBound == null || provenFrameBound < FRAME_HEADER_BYTES || provenReplyBound == null || provenReplyBound < 1) return null
     val coordinator = SearchWorkerCoordinator(context, ownerLease, identity, network, owner)
     val duplicate = coordinator.prepare() ?: return null
     return WorkerRoundClient(
-        SearchWorkerBinderPort(coordinator, ownerLease, duplicate, identity, network, provenFrameBound, provenReplyBound),
+        SearchWorkerBinderPort(coordinator, ownerLease, duplicate, identity, network, provenFrameBound, provenReplyBound, reportRetirementFailure, reportServiceFailure, reportBindFailure, reportServiceObservation),
         duplicate,
     )
+}
+
+internal enum class WorkerServiceObservation { BUSY, UNAVAILABLE, DEADLINE, CANCELLED }
+
+internal fun serviceObservation(status: Long): WorkerServiceObservation? = when (status) {
+    Mobile.SearchWorkerBusy -> WorkerServiceObservation.BUSY
+    Mobile.SearchWorkerUnavailable -> WorkerServiceObservation.UNAVAILABLE
+    Mobile.SearchWorkerDeadline -> WorkerServiceObservation.DEADLINE
+    Mobile.SearchWorkerCancelled -> WorkerServiceObservation.CANCELLED
+    else -> null
 }
 
 private const val FRAME_HEADER_BYTES = 16
@@ -48,7 +62,7 @@ private const val FRAME_BUFFER_BYTES = 8 * 1024
 private const val MAX_CLEANUP_MILLIS = 60_000L
 private const val CANCELLED_BEFORE_BIND = -1
 
-internal fun candidateOpenAfterRetirement(status: Long, retire: () -> Boolean): WorkerOpenV2? {
+internal fun candidateOpenAfterRetirement(status: Long, reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {}, retire: () -> Boolean): WorkerOpenV2? {
     val flag = Mobile.SearchWorkerRetryableFlag
     val base = status and flag.inv()
     val reason = when (base) {
@@ -60,17 +74,26 @@ internal fun candidateOpenAfterRetirement(status: Long, retire: () -> Boolean): 
     }
     val retired = try { retire() } catch (_: Exception) { false } catch (_: LinkageError) { false }
     return if (retired) WorkerOpenV2.CandidateFailure(reason, status and flag != 0L)
-    else WorkerOpenV2.Fatal(WorkerFatalV2.CLEANUP_INCOMPLETE)
+    else {
+        try { reportRetirementFailure(reason) } catch (_: Exception) { } catch (_: LinkageError) { }
+        WorkerOpenV2.Fatal(WorkerFatalV2.CLEANUP_INCOMPLETE)
+    }
 }
 
 internal class SearchWorkerBinderPort(
-    private val coordinator: SearchWorkerCoordinator,
+    private val coordinator: WorkerCoordinatorPort,
     private val ownerLease: SearchOwnerLeaseControl,
     private val duplicate: PreparedWorkerLeaseDuplicate,
     private val identity: WorkerIdentityV1,
     private val network: SearchNetworkV1,
     private val provenFrameBound: Int,
     private val provenReplyBound: Int,
+    private val reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {},
+    private val reportServiceFailure: (WorkerFatalV2) -> Unit = {},
+    private val reportBindFailure: () -> Unit = {},
+    private val reportServiceObservation: (WorkerServiceObservation) -> Unit = {},
+    private val stageFrameOverride: ((FrameInput, Long) -> ParcelFileDescriptor)? = null,
+    private val statusTransactionOverride: ((IBinder, Int, (Parcel) -> Unit) -> Int)? = null,
 ) : DeadlineWorkerPort {
     private enum class State { NEW, OPENING, READY, CLOSING, RETIRED, QUARANTINED }
     private enum class CallDisposition { ACCEPT, DEADLINE, CANCELLED, UNKNOWN }
@@ -127,7 +150,7 @@ internal class SearchWorkerBinderPort(
             else WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
         }
         val status = bounded(deadline, {}) {
-            val descriptor = stageFrame(frame, deadline)
+            val descriptor = stageFrameOverride?.invoke(frame, deadline) ?: stageFrame(frame, deadline)
             try {
                 val bindDecision = synchronized(lock) {
                     when {
@@ -143,7 +166,11 @@ internal class SearchWorkerBinderPort(
                     duplicate.close()
                     return@bounded CANCELLED_BEFORE_BIND
                 }
-                if (bindDecision != 2 || !coordinator.bind()) throw IOException("worker_admission_unknown")
+                if (bindDecision != 2) throw IOException("worker_admission_unknown")
+                if (!coordinator.bind()) {
+                    try { reportBindFailure() } catch (_: Exception) { } catch (_: LinkageError) { }
+                    throw IOException("worker_admission_unknown")
+                }
                 val binder = coordinator.awaitConfirmed(deadline) ?: throw IOException("worker_admission_unknown")
                 requireTime(deadline)
                 val dispatch = synchronized(lock) { state == State.OPENING && !cancelled }
@@ -173,7 +200,19 @@ internal class SearchWorkerBinderPort(
             else WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
         }
         if (status.toLong() != Mobile.SearchWorkerReady) {
-            val known = candidateOpenAfterRetirement(status.toLong()) {
+            val observedFailure = when (status.toLong()) {
+                Mobile.SearchWorkerOwnerLost -> WorkerFatalV2.OWNER_LOST
+                Mobile.SearchWorkerCleanupIncomplete -> WorkerFatalV2.CLEANUP_INCOMPLETE
+                Mobile.SearchWorkerDied -> WorkerFatalV2.WORKER_DIED
+                Mobile.SearchWorkerCapabilityUnavailable -> WorkerFatalV2.CAPABILITY_UNAVAILABLE
+                else -> null
+            }
+            var observationReported = false
+            if (observedFailure != null) try { reportServiceFailure(observedFailure); observationReported = true } catch (_: Exception) { } catch (_: LinkageError) { }
+            serviceObservation(status.toLong())?.let { observation ->
+                try { reportServiceObservation(observation); observationReported = true } catch (_: Exception) { } catch (_: LinkageError) { }
+            }
+            val known = candidateOpenAfterRetirement(status.toLong(), reportRetirementFailure) {
                 val canRetire = synchronized(lock) {
                     if (state != State.OPENING || cancelled || cancelPending) false else {
                         state = State.READY
@@ -190,7 +229,7 @@ internal class SearchWorkerBinderPort(
                 return known
             }
             failClosed()
-            return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY)
+            return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY, observedStatusReported = observationReported)
         }
         val ready = synchronized(lock) {
             if (state != State.OPENING || cancelled) false else {
@@ -218,7 +257,7 @@ internal class SearchWorkerBinderPort(
         val operationDeadline = frame.deadlineElapsedMillis
         val reply = awaitCall(operationDeadline, ::discardReply) {
             val descriptor = try {
-                stageFrame(frame, operationDeadline)
+                stageFrameOverride?.invoke(frame, operationDeadline) ?: stageFrame(frame, operationDeadline)
             } catch (_: WorkerFrameDeadline) {
                 return@awaitCall WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
             }
@@ -502,7 +541,8 @@ internal class SearchWorkerBinderPort(
     }
 
     private fun statusTransaction(binder: IBinder, code: Int, write: (Parcel) -> Unit): Int =
-        transaction(binder, code, write) { response -> response.readInt().also { response.enforceNoDataAvail() } }
+        statusTransactionOverride?.invoke(binder, code, write)
+            ?: transaction(binder, code, write) { response -> response.readInt().also { response.enforceNoDataAvail() } }
 
     private fun <T> transaction(binder: IBinder, code: Int, write: (Parcel) -> Unit, read: (Parcel) -> T): T {
         val request = Parcel.obtain()

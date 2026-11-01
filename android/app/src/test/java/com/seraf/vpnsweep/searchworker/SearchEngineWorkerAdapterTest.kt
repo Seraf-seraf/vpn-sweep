@@ -240,6 +240,39 @@ internal class SearchEngineWorkerAdapterTest {
     }
 
     @Test
+    fun knownServiceObservationDoesNotEmitFalseUnknownDelivery(): Unit {
+        val port = Port().apply { openResult = WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY, observedStatusReported = true) }
+        val observed = mutableListOf<WorkerFatalV2>()
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, 1024,
+            { WorkerRoundClient(port, Lease()) }, {}, System::nanoTime, {}, observed::add)
+        assertEquals(Mobile.SearchWorkerDeliveryUnknown, open(adapter))
+        assertTrue(observed.isEmpty())
+        assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
+    }
+
+    @Test
+    fun invalidCallAndUnownedCloseEmitSafeOperationReasons(): Unit {
+        val observed = mutableListOf<WorkerOperationFailure>()
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, 1024,
+            { WorkerRoundClient(Port(), Lease()) }, {}, nowNanos = System::nanoTime, reportOperationFailure = observed::add)
+        adapter.call(1, -1, byteArrayOf(1), 0, 100)
+        assertEquals(Mobile.SearchWorkerCleanupIncomplete, adapter.close(1, 100))
+        assertEquals(listOf(WorkerOperationFailure.CALL_INVALID, WorkerOperationFailure.CLOSE), observed)
+    }
+
+    @Test
+    fun fatalOpenReportsReasonBeforeCleanupFailureAndRemainsQuarantined(): Unit {
+        val port = Port().apply { openResult = WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY) }
+        val lease = Lease().apply { fail = true }
+        val observed = mutableListOf<WorkerFatalV2>()
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, 1024,
+            { WorkerRoundClient(port, lease) }, {}, System::nanoTime, {}, observed::add)
+        assertEquals(Mobile.SearchWorkerCleanupIncomplete, open(adapter))
+        assertEquals(listOf(WorkerFatalV2.UNKNOWN_DELIVERY, WorkerFatalV2.CLEANUP_INCOMPLETE), observed)
+        assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
+    }
+
+    @Test
     fun unknownOpenDeliveryStaysQuarantinedDespiteLaterCleanup(): Unit {
         val port = Port().apply { openAction = { throw IOException("synthetic") } }
         val lease = Lease()

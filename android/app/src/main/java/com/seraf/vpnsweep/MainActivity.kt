@@ -23,6 +23,7 @@ import com.seraf.vpnsweep.searchstate.SubscriptionUiState
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionFailureV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.eventText
 import com.seraf.vpnsweep.searchui.ScreenInformation
 import com.seraf.vpnsweep.searchui.searchOutcomeEvent
 import com.seraf.vpnsweep.searchui.subscriptionOutcomeEvent
@@ -146,13 +147,15 @@ class MainActivity : ComponentActivity() {
                         canConfirm = remember(subscriptionState, searchState, selectionProbe) { graph.selectionAvailable() },
                         errorMessage = selectionError,
                         onRefreshAvailability = {
-                            if (graph.searchState.value.ownerBusyRetry) {
-                                when (graph.retryOwnerBusyForSelection()) {
-                                    SearchStartV3.BUSY -> addEvent(ScreenEvent.SEARCH_BUSY)
-                                    SearchStartV3.REJECTED -> addEvent(ScreenEvent.SEARCH_REJECTED)
-                                    SearchStartV3.ACCEPTED, SearchStartV3.UNKNOWN -> Unit
-                                }
+                            val readiness = graph.recheckSearchReadiness()
+                            val event = when (readiness) {
+                                SearchReadiness.READY -> ScreenEvent.READINESS_READY
+                                SearchReadiness.SELECT_REQUIRED -> ScreenEvent.READINESS_SELECT_REQUIRED
+                                SearchReadiness.BUSY -> ScreenEvent.READINESS_BUSY
+                                SearchReadiness.UNKNOWN -> ScreenEvent.READINESS_UNKNOWN
                             }
+                            addEvent(event)
+                            selectionError = eventText(event)
                             selectionProbe++
                         },
                         onDismiss = { serversOpen = false },

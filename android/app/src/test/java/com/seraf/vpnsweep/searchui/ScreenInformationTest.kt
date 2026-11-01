@@ -1,10 +1,14 @@
 package com.seraf.vpnsweep.searchui
 
 import com.seraf.vpnsweep.ui.presentInformation
+import com.seraf.vpnsweep.SearchReadiness
+import com.seraf.vpnsweep.readinessAfterChecks
+import com.seraf.vpnsweep.recheckSearchReadinessFlow
 import com.seraf.vpnsweep.ui.informationPaneHeight
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import com.seraf.vpnsweep.searchstate.SearchPhase
 import com.seraf.vpnsweep.searchstate.SubscriptionPhase
@@ -15,18 +19,58 @@ import com.seraf.vpnsweep.searchprotocol.WorkerCandidateFailureV2
 
 class ScreenInformationTest {
     @Test
+    fun readinessFlowChecksRecoveryBeforeSelectionAndNeverStartsSearch(): Unit {
+        var marker = "ACTIVE"
+        var checks = 0
+        val busy = recheckSearchReadinessFlow(true, { SearchStartV3.BUSY }, { checks++; true }, { true }, { true })
+        assertEquals(SearchReadiness.BUSY, busy)
+        assertEquals("ACTIVE", marker)
+        assertEquals(0, checks)
+        val unknown = recheckSearchReadinessFlow(true, { SearchStartV3.UNKNOWN }, { checks++; true }, { true }, { true })
+        assertEquals(SearchReadiness.UNKNOWN, unknown)
+        assertEquals("ACTIVE", marker)
+        assertEquals(0, checks)
+        val ready = recheckSearchReadinessFlow(true, { marker = "CLEAR"; SearchStartV3.ACCEPTED },
+            { checks++; marker == "CLEAR" }, { true }, { true })
+        assertEquals(SearchReadiness.READY, ready)
+        assertEquals("CLEAR", marker)
+        assertEquals(1, checks)
+        val draftOnly = recheckSearchReadinessFlow(false, { error("unexpected recovery") }, { true }, { false }, { error("unexpected start check") })
+        assertEquals(SearchReadiness.SELECT_REQUIRED, draftOnly)
+    }
+
+    @Test
+    fun readinessNeverConfusesUnknownOrDraftWithCommittedSelection(): Unit {
+        assertEquals(SearchReadiness.UNKNOWN, readinessAfterChecks(SearchStartV3.UNKNOWN, true, true, true))
+        assertEquals(SearchReadiness.UNKNOWN, readinessAfterChecks(SearchStartV3.REJECTED, true, true, true))
+        assertEquals(SearchReadiness.BUSY, readinessAfterChecks(SearchStartV3.BUSY, true, true, true))
+        assertEquals(SearchReadiness.UNKNOWN, readinessAfterChecks(null, false, true, true))
+        assertEquals(SearchReadiness.SELECT_REQUIRED, readinessAfterChecks(SearchStartV3.ACCEPTED, true, false, false))
+        assertEquals(SearchReadiness.UNKNOWN, readinessAfterChecks(SearchStartV3.ACCEPTED, true, true, false))
+        assertEquals(SearchReadiness.READY, readinessAfterChecks(SearchStartV3.ACCEPTED, true, true, true))
+    }
+
+    @Test
+    fun warningAndFailureEventsUseHonestSeverity(): Unit {
+        val entries = presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_STARTING, ScreenEvent.SEARCH_BUSY, ScreenEvent.SEARCH_INTERRUPTED, ScreenEvent.WORKER_START_FAILED))).events
+        assertEquals(listOf("INFO", "WARN", "ERROR", "ERROR"), entries.map { it.level })
+    }
+
+    @Test
     fun paneHeightDependsOnViewportNotTabOrContent(): Unit {
         assertEquals(0.dp, informationPaneHeight(0.dp))
         assertEquals(105.6f, informationPaneHeight(320.dp).value, 0.01f)
         assertEquals(211.2f, informationPaneHeight(640.dp).value, 0.01f)
         assertEquals(220.dp, informationPaneHeight(800.dp))
+        assertEquals(156f, informationPaneHeight(240.dp, 2f).value, 0.01f)
+        assertEquals(220.dp, informationPaneHeight(800.dp, 2f))
     }
 
     @Test
     fun workerReasonIsSafeAllowlistedJournalText(): Unit {
         val event = workerOpenEvent(WorkerCandidateFailureV2.CORE_START_FAILED)
-        assertEquals("worker_open:core_start_failed", presentInformation(ScreenInformation(events = listOf(event))).events.single().message)
-        assertEquals("search_init:network_policy_unavailable", presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE))).events.single().message)
+        assertTrue(presentInformation(ScreenInformation(events = listOf(event))).events.single().message.startsWith("worker_open:core_start_failed"))
+        assertTrue(presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE))).events.single().message.startsWith("search_init:network_policy_unavailable"))
     }
 
     @Test

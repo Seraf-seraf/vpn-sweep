@@ -79,8 +79,8 @@ private val Outline = SweepColors.outline
 private val AccentText = SweepColors.onAccent
 private val ControlShape = RoundedCornerShape(12.dp)
 
-internal fun informationPaneHeight(viewportHeight: Dp): Dp =
-    (viewportHeight * 0.33f).coerceIn(0.dp, 220.dp)
+internal fun informationPaneHeight(viewportHeight: Dp, fontScale: Float = 1f): Dp =
+    (viewportHeight * if (fontScale >= 1.5f) 0.65f else 0.33f).coerceIn(0.dp, 220.dp)
 
 @Composable
 internal fun VpnSweepScreenContent(
@@ -118,7 +118,7 @@ internal fun VpnSweepScreenContent(
     }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(ScreenBackground).windowInsetsPadding(contentWindowInsets), contentAlignment = Alignment.TopCenter) {
-        val paneHeight = informationPaneHeight(maxHeight)
+        val paneHeight = informationPaneHeight(maxHeight, LocalDensity.current.fontScale)
         val powerSize = if (maxHeight < 700.dp) 104.dp else 176.dp
         Column(
             modifier = Modifier
@@ -318,6 +318,7 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
     val journalScroll = rememberScrollState()
     val parametersScroll = rememberScrollState()
     val presentation = presentInformation(information)
+    val largeText = LocalDensity.current.fontScale >= 1.5f
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -326,8 +327,8 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
             .padding(4.dp),
     ) {
         Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).selectableGroup()) {
-            InformationTab("Журнал", selectedTab == 0, { selectedTab = 0 }, Modifier.weight(1f))
-            InformationTab("Параметры", selectedTab == 1, { selectedTab = 1 }, Modifier.weight(1f))
+            InformationTab("Журнал", selectedTab == 0, { selectedTab = 0 }, Modifier.weight(if (largeText) 0.43f else 1f))
+            InformationTab("Параметры", selectedTab == 1, { selectedTab = 1 }, Modifier.weight(if (largeText) 0.57f else 1f))
         }
         Column(
             modifier = Modifier
@@ -335,26 +336,30 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
                 .height(paneHeight)
                 .border(1.dp, Outline, ControlShape)
                 .background(ScreenBackground, ControlShape)
-                .verticalScroll(if (selectedTab == 0) journalScroll else parametersScroll)
-                .padding(16.dp),
+                .padding(if (largeText) 8.dp else 16.dp),
         ) {
-            if (selectedTab == 0) {
-                EventLogPanel(presentation.events)
-            } else {
-                ParametersPanel(applied = presentation.applied, initialAllExpanded = parametersInitiallyExpanded)
+            if (selectedTab == 0) EventLogHeader() else ParametersHeader()
+            Spacer(Modifier.height(8.dp))
+            Column(
+                Modifier.fillMaxWidth().weight(1f)
+                    .verticalScroll(if (selectedTab == 0) journalScroll else parametersScroll),
+            ) {
+                if (selectedTab == 0) {
+                    EventLogPanel(presentation.events, showHeader = false)
+                } else {
+                    ParametersPanel(applied = presentation.applied, initialAllExpanded = parametersInitiallyExpanded, showHeader = false)
+                }
             }
         }
     }
 }
 
 @Composable
-internal fun EventLogPanel(entries: List<EventLogEntry>) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        SweepGlyph(SweepIcon.Terminal, Accent)
-        Spacer(Modifier.width(12.dp))
-        Text("Журнал событий", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+internal fun EventLogPanel(entries: List<EventLogEntry>, showHeader: Boolean = true) {
+    if (showHeader) {
+        EventLogHeader()
+        Spacer(Modifier.height(16.dp))
     }
-    Spacer(Modifier.height(16.dp))
     Column(Modifier.fillMaxWidth()) {
         if (entries.isEmpty()) {
             Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
@@ -367,7 +372,22 @@ internal fun EventLogPanel(entries: List<EventLogEntry>) {
 }
 
 @Composable
+private fun EventLogHeader() {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        SweepGlyph(SweepIcon.Terminal, Accent)
+        Spacer(Modifier.width(12.dp))
+        Text("Журнал событий", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun ParametersHeader() {
+    Text("Параметры подбора", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+}
+
+@Composable
 private fun InformationTab(text: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
+    val horizontalPadding = if (LocalDensity.current.fontScale >= 1.5f) 0.dp else 8.dp
     Column(
         modifier = modifier
             .fillMaxHeight()
@@ -379,7 +399,7 @@ private fun InformationTab(text: String, selected: Boolean, onClick: () -> Unit,
         verticalArrangement = Arrangement.Bottom,
     ) {
         Box(
-            modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 45.dp).padding(horizontal = 8.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 45.dp).padding(horizontal = horizontalPadding, vertical = 8.dp),
             contentAlignment = Alignment.Center,
         ) {
             Text(text, color = if (selected) PrimaryText else SecondaryText, fontSize = 16.sp, textAlign = TextAlign.Center)
@@ -389,9 +409,11 @@ private fun InformationTab(text: String, selected: Boolean, onClick: () -> Unit,
 }
 
 @Composable
-internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: AppliedParameterValues? = null, initialAllExpanded: Boolean = false) {
-    Text("Параметры подбора", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(8.dp))
+internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: AppliedParameterValues? = null, initialAllExpanded: Boolean = false, showHeader: Boolean = true) {
+    if (showHeader) {
+        ParametersHeader()
+        Spacer(Modifier.height(8.dp))
+    }
     if (applied == null) {
         Text("Применённые параметры пока недоступны", color = SecondaryText, fontSize = 14.sp)
         Spacer(Modifier.height(12.dp))

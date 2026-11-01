@@ -31,6 +31,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.tooling.preview.Preview
@@ -199,28 +200,28 @@ private fun PreviewEventLogExample() {
 @Preview(name = "PREVIEW · панель журнал, 2 события", widthDp = 360, heightDp = 320)
 @Preview(name = "PREVIEW · панель журнал, 2 события, малый экран", widthDp = 320, heightDp = 240, fontScale = 2f)
 @Composable private fun PreviewInformationTwoEvents() {
-    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(information = ScreenInformation(events = listOf(ScreenEvent.SUBSCRIPTION_LOADING, ScreenEvent.SUBSCRIPTION_READY)), paneHeight = informationPaneHeight(maxHeight)) } }
+    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(information = ScreenInformation(events = listOf(ScreenEvent.SUBSCRIPTION_LOADING, ScreenEvent.SUBSCRIPTION_READY)), paneHeight = informationPaneHeight(maxHeight, LocalDensity.current.fontScale)) } }
 }
 
 @PreviewTest
 @Preview(name = "PREVIEW · панель журнал, 5 событий", widthDp = 360, heightDp = 320)
 @Preview(name = "PREVIEW · панель журнал, 5 событий, малый экран", widthDp = 320, heightDp = 240, fontScale = 2f)
 @Composable private fun PreviewInformationFiveEvents() {
-    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(information = ScreenInformation(events = listOf(ScreenEvent.SUBSCRIPTION_LOADING, ScreenEvent.SUBSCRIPTION_READY, ScreenEvent.SELECTION_SAVED, ScreenEvent.SEARCH_STARTING, ScreenEvent.SEARCH_INTERRUPTED)), paneHeight = informationPaneHeight(maxHeight)) } }
+    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(information = ScreenInformation(events = listOf(ScreenEvent.SUBSCRIPTION_LOADING, ScreenEvent.SUBSCRIPTION_READY, ScreenEvent.SELECTION_SAVED, ScreenEvent.SEARCH_STARTING, ScreenEvent.SEARCH_INTERRUPTED)), paneHeight = informationPaneHeight(maxHeight, LocalDensity.current.fontScale)) } }
 }
 
 @PreviewTest
 @Preview(name = "PREVIEW · панель параметры, пусто", widthDp = 360, heightDp = 320)
 @Preview(name = "PREVIEW · панель параметры, пусто, малый экран", widthDp = 320, heightDp = 240, fontScale = 2f)
 @Composable private fun PreviewInformationEmptyParameters() {
-    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(initialTab = 1, paneHeight = informationPaneHeight(maxHeight)) } }
+    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(initialTab = 1, paneHeight = informationPaneHeight(maxHeight, LocalDensity.current.fontScale)) } }
 }
 
 @PreviewTest
 @Preview(name = "PREVIEW · панель параметры, заполнено", widthDp = 360, heightDp = 320)
 @Preview(name = "PREVIEW · панель параметры, заполнено, малый экран", widthDp = 320, heightDp = 240, fontScale = 2f)
 @Composable private fun PreviewInformationFullParameters() {
-    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(initialTab = 1, information = ScreenInformation(applied = AppliedParameters(fragmentEnabled = true, muxEnabled = true, udpNoiseEnabled = true)), paneHeight = informationPaneHeight(maxHeight), parametersInitiallyExpanded = true) } }
+    SweepTheme { BoxWithConstraints(Modifier.fillMaxSize()) { InformationPanel(initialTab = 1, information = ScreenInformation(applied = AppliedParameters(fragmentEnabled = true, muxEnabled = true, udpNoiseEnabled = true)), paneHeight = informationPaneHeight(maxHeight, LocalDensity.current.fontScale), parametersInitiallyExpanded = true) } }
 }
 
 @Composable

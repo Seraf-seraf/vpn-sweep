@@ -15,13 +15,22 @@ import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
+internal interface WorkerCoordinatorPort {
+    fun bind(): Boolean
+    fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder?
+    fun confirmedBinder(): IBinder?
+    fun awaitRetired(deadlineElapsedMillis: Long): Boolean
+    fun quarantine(): Unit
+    fun stop(): Unit
+}
+
 internal class SearchWorkerCoordinator(
     context: Context,
     private val lease: SearchOwnerLeaseControl,
     private val identity: WorkerIdentityV1,
     private val network: SearchNetworkV1,
     private val owner: NetworkEpochOwner,
-) {
+) : WorkerCoordinatorPort {
     private val appContext = context.applicationContext
     private val lock = Any()
     private var prepared: PreparedWorkerLeaseDuplicate? = null
@@ -131,7 +140,7 @@ internal class SearchWorkerCoordinator(
         }
     }
 
-    fun bind(): Boolean {
+    override fun bind(): Boolean {
         synchronized(lock) {
             if (bindCalled || stopped || !reservationOwned) return false
             if (prepared?.beginBind() != true) return false
@@ -166,7 +175,7 @@ internal class SearchWorkerCoordinator(
 
     fun state(): CoordinatorState = admission.state()
 
-    fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
+    override fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
         val now = SystemClock.elapsedRealtime()
         if (now < 0 || deadlineElapsedMillis <= now) return null
         val remaining = deadlineElapsedMillis - now
@@ -179,7 +188,7 @@ internal class SearchWorkerCoordinator(
         return if (signalled) confirmedBinder() else null
     }
 
-    fun confirmedBinder(): IBinder? {
+    override fun confirmedBinder(): IBinder? {
         val candidate = synchronized(lock) { if (stopped) null else admittedBinder } ?: return null
         val valid = try {
             admission.state() == CoordinatorState.CONFIRMED && lease.anchorHeldForWorker() && candidate.isBinderAlive &&
@@ -193,15 +202,15 @@ internal class SearchWorkerCoordinator(
         return if (valid) synchronized(lock) { if (!stopped && admittedBinder === candidate) candidate else null } else null
     }
 
-    fun awaitRetired(deadlineElapsedMillis: Long): Boolean {
+    override fun awaitRetired(deadlineElapsedMillis: Long): Boolean {
         val now = SystemClock.elapsedRealtime()
         return now >= 0 && deadlineElapsedMillis > now &&
             admission.awaitRetirement(TimeUnit.MILLISECONDS.toNanos(deadlineElapsedMillis - now))
     }
 
-    fun quarantine(): Unit = failClosed()
+    override fun quarantine(): Unit = failClosed()
 
-    fun stop(): Unit {
+    override fun stop(): Unit {
         val (ownsReservation, unstarted) = synchronized(lock) {
             stopped = true
             if (!bindCalled) bindResult = false

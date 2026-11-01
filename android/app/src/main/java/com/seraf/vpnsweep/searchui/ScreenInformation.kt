@@ -6,8 +6,9 @@ import com.seraf.vpnsweep.searchstate.SearchUiState
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchprotocol.WorkerCandidateFailureV2
+import com.seraf.vpnsweep.searchprotocol.WorkerFatalV2
 
-enum class ScreenEvent { SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CANCEL_REQUESTED, SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE, WORKER_CONFIG_REJECTED, WORKER_START_FAILED, WORKER_START_TIMEOUT, WORKER_EXITED_EARLY, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
+enum class ScreenEvent { READINESS_READY, READINESS_SELECT_REQUIRED, READINESS_BUSY, READINESS_UNKNOWN, SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CANCEL_REQUESTED, SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE, SEARCH_INIT_PROFILES_FAILED, SEARCH_INIT_CORE_IDENTITY_FAILED, SEARCH_INIT_MANIFEST_FAILED, SEARCH_INIT_NETWORK_UNKNOWN, SEARCH_INIT_SESSION_FAILED, WORKER_ADMISSION_FAILED, WORKER_BIND_FAILED, WORKER_CALL_FAILED, WORKER_CALL_INVALID, WORKER_CALL_STATE, WORKER_CALL_DEADLINE, WORKER_CALL_CANCELLED, WORKER_CANCEL_FAILED, WORKER_CLOSE_FAILED, WORKER_SERVICE_BUSY, WORKER_SERVICE_UNAVAILABLE, WORKER_SERVICE_DEADLINE, WORKER_SERVICE_CANCELLED, WORKER_BUSY, WORKER_OWNER_LOST, WORKER_CAPABILITY_UNAVAILABLE, WORKER_DELIVERY_UNKNOWN, WORKER_DIED, WORKER_CLEANUP_INCOMPLETE, WORKER_CONFIG_REJECTED, WORKER_START_FAILED, WORKER_START_TIMEOUT, WORKER_EXITED_EARLY, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
 enum class Fingerprint(val wireValue: String) {
     CHROME("chrome"), FIREFOX("firefox"), SAFARI("safari"), IOS("ios"), ANDROID("android"),
     EDGE("edge"), BROWSER_360("360"), QQ("qq"), RANDOM("random"), RANDOMIZED("randomized"),
@@ -81,7 +82,20 @@ internal fun workerOpenEvent(reason: WorkerCandidateFailureV2): ScreenEvent = wh
     WorkerCandidateFailureV2.CORE_EXITED_BEFORE_READY -> ScreenEvent.WORKER_EXITED_EARLY
 }
 
+internal fun workerFatalEvent(reason: WorkerFatalV2): ScreenEvent = when (reason) {
+    WorkerFatalV2.BUSY -> ScreenEvent.WORKER_BUSY
+    WorkerFatalV2.OWNER_LOST -> ScreenEvent.WORKER_OWNER_LOST
+    WorkerFatalV2.CAPABILITY_UNAVAILABLE -> ScreenEvent.WORKER_CAPABILITY_UNAVAILABLE
+    WorkerFatalV2.UNKNOWN_DELIVERY -> ScreenEvent.WORKER_DELIVERY_UNKNOWN
+    WorkerFatalV2.WORKER_DIED -> ScreenEvent.WORKER_DIED
+    WorkerFatalV2.CLEANUP_INCOMPLETE -> ScreenEvent.WORKER_CLEANUP_INCOMPLETE
+}
+
 internal fun eventText(event: ScreenEvent): String = when (event) {
+    ScreenEvent.READINESS_READY -> "readiness:ready — На момент проверки подбор доступен. Подтвердите выбор и начните подбор."
+    ScreenEvent.READINESS_SELECT_REQUIRED -> "readiness:select_required — Выберите серверы и подтвердите выбор."
+    ScreenEvent.READINESS_BUSY -> "readiness:busy — Другая операция ещё выполняется. Дождитесь её завершения и проверьте снова."
+    ScreenEvent.READINESS_UNKNOWN -> "readiness:unknown — Безопасность повторного запуска не подтверждена. Проверьте состояние приложения и повторите проверку."
     ScreenEvent.SUBSCRIPTION_LOADING -> "Загрузка подписки"
     ScreenEvent.SUBSCRIPTION_READY -> "Подписка обработана"
     ScreenEvent.SUBSCRIPTION_FAILED -> "Не удалось обработать подписку"
@@ -94,11 +108,35 @@ internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.SEARCH_REJECTED -> "Не удалось начать подбор"
     ScreenEvent.SEARCH_UNKNOWN -> "Результат запуска подбора неизвестен"
     ScreenEvent.SEARCH_INTERRUPTED -> "Подбор прерван; повторный запуск заблокирован"
-    ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE -> "search_init:network_policy_unavailable"
-    ScreenEvent.WORKER_CONFIG_REJECTED -> "worker_open:config_rejected"
-    ScreenEvent.WORKER_START_FAILED -> "worker_open:core_start_failed"
-    ScreenEvent.WORKER_START_TIMEOUT -> "worker_open:core_start_timeout"
-    ScreenEvent.WORKER_EXITED_EARLY -> "worker_open:core_exited_before_ready"
+    ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE -> "search_init:network_policy_unavailable — Выбранная сеть недоступна; проверьте подключение."
+    ScreenEvent.SEARCH_INIT_PROFILES_FAILED -> "search_init:profiles_failed — Не удалось прочитать выбор; проверьте подписку и выбор серверов."
+    ScreenEvent.SEARCH_INIT_CORE_IDENTITY_FAILED -> "search_init:core_identity_failed — Не удалось проверить модуль; переустановите совместимую сборку."
+    ScreenEvent.SEARCH_INIT_MANIFEST_FAILED -> "search_init:manifest_failed — Не удалось подготовить параметры; проверьте подписку."
+    ScreenEvent.SEARCH_INIT_NETWORK_UNKNOWN -> "search_init:network_unknown — Не удалось подтвердить состояние сети; повторный запуск заблокирован."
+    ScreenEvent.SEARCH_INIT_SESSION_FAILED -> "search_init:session_failed — Не удалось создать сессию; проверьте состояние приложения."
+    ScreenEvent.WORKER_ADMISSION_FAILED -> "worker_admission:failed — Не удалось подготовить worker; проверьте состояние приложения."
+    ScreenEvent.WORKER_BIND_FAILED -> "worker_bind:failed — Не удалось запустить worker; проверьте состояние приложения."
+    ScreenEvent.WORKER_CALL_FAILED -> "worker_call:failed — Вызов worker завершился ошибкой; проверьте состояние подбора."
+    ScreenEvent.WORKER_CALL_INVALID -> "worker_call:invalid — Вызов отклонён; проверьте состояние подбора."
+    ScreenEvent.WORKER_CALL_STATE -> "worker_call:state — Worker не готов; проверьте состояние подбора."
+    ScreenEvent.WORKER_CALL_DEADLINE -> "worker_call:deadline — Истекло время вызова worker."
+    ScreenEvent.WORKER_CALL_CANCELLED -> "worker_call:cancelled — Worker сообщил об отмене вызова."
+    ScreenEvent.WORKER_CANCEL_FAILED -> "worker_cancel:unknown — Отмена worker не подтверждена; повторный запуск заблокирован."
+    ScreenEvent.WORKER_CLOSE_FAILED -> "worker_close:unknown — Завершение worker не подтверждено; повторный запуск заблокирован."
+    ScreenEvent.WORKER_SERVICE_BUSY -> "worker_service:busy — Worker занят; проверьте состояние подбора."
+    ScreenEvent.WORKER_SERVICE_UNAVAILABLE -> "worker_service:unavailable — Возможность worker недоступна; проверьте совместимость."
+    ScreenEvent.WORKER_SERVICE_DEADLINE -> "worker_service:deadline — Истекло время запуска worker."
+    ScreenEvent.WORKER_SERVICE_CANCELLED -> "worker_service:cancelled — Worker сообщил об отмене запуска."
+    ScreenEvent.WORKER_BUSY -> "worker_open:busy — Worker занят; дождитесь завершения операции."
+    ScreenEvent.WORKER_OWNER_LOST -> "worker_open:owner_lost — Потеряно владение; повторный запуск заблокирован."
+    ScreenEvent.WORKER_CAPABILITY_UNAVAILABLE -> "worker_open:capability_unavailable — Нужная возможность недоступна; проверьте совместимость сборки."
+    ScreenEvent.WORKER_DELIVERY_UNKNOWN -> "worker_open:delivery_unknown — Результат передачи неизвестен; повторный запуск заблокирован."
+    ScreenEvent.WORKER_DIED -> "worker_open:worker_died — Worker завершился; проверьте состояние приложения."
+    ScreenEvent.WORKER_CLEANUP_INCOMPLETE -> "worker_open:cleanup_incomplete — Очистка не подтверждена; повторный запуск заблокирован."
+    ScreenEvent.WORKER_CONFIG_REJECTED -> "worker_open:config_rejected — Конфигурация отклонена; проверьте выбранные серверы."
+    ScreenEvent.WORKER_START_FAILED -> "worker_open:core_start_failed — Не удалось запустить ядро; проверьте состояние приложения."
+    ScreenEvent.WORKER_START_TIMEOUT -> "worker_open:core_start_timeout — Превышено время запуска; проверьте состояние подбора."
+    ScreenEvent.WORKER_EXITED_EARLY -> "worker_open:core_exited_before_ready — Ядро остановилось до готовности; проверьте конфигурацию."
     ScreenEvent.SEARCH_CANCEL_REQUESTED -> "Отмена подбора"
     ScreenEvent.SEARCH_STARTED -> "Подбор начат"
     ScreenEvent.ATTEMPT_STARTED -> "Попытка начата"
