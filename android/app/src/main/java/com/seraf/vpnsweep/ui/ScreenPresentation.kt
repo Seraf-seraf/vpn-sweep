@@ -3,6 +3,8 @@ package com.seraf.vpnsweep.ui
 import com.seraf.vpnsweep.searchui.NumericRange
 import com.seraf.vpnsweep.searchui.ScreenInformation
 import com.seraf.vpnsweep.searchui.eventText
+import com.seraf.vpnsweep.searchstate.SearchStartStage
+import com.seraf.vpnsweep.searchstate.SearchStartReason
 
 internal data class EventLogEntry(val time: String, val level: String, val message: String)
 internal data class ParameterValue(val label: String, val value: String)
@@ -16,7 +18,11 @@ internal data class AppliedParameterValues(
 internal data class ScreenPresentation(val events: List<EventLogEntry>, val applied: AppliedParameterValues?)
 
 internal fun presentInformation(information: ScreenInformation): ScreenPresentation {
-    val events = information.events.map { EventLogEntry("", "INFO", eventText(it)) }
+    val allowedCodes = SearchStartStage.entries.flatMap { stage -> SearchStartReason.entries.map { reason -> "${stage.code}:${reason.code}" } }.toSet()
+    val events = information.events.map { EventLogEntry("", "INFO", eventText(it)) } +
+        listOfNotNull(information.startRejection?.takeIf { it in allowedCodes }?.let {
+            EventLogEntry("", "ERROR", "Подбор не запущен ($it)")
+        })
     val applied = information.applied?.let { values ->
         AppliedParameterValues(
             fragment = ParameterGroupValues(boolValue(values.fragmentEnabled), listOf(

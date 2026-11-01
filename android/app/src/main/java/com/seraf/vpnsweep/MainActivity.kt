@@ -22,6 +22,10 @@ import com.seraf.vpnsweep.searchstate.SubscriptionPhase
 import com.seraf.vpnsweep.searchstate.SubscriptionUiState
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionFailureV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
+import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.ScreenInformation
+import com.seraf.vpnsweep.searchui.searchOutcomeEvent
+import com.seraf.vpnsweep.searchui.subscriptionOutcomeEvent
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?): Unit {
@@ -31,10 +35,15 @@ class MainActivity : ComponentActivity() {
             val vpnState by VpnStatus.state.collectAsStateWithLifecycle()
             val subscriptionState by graph.subscriptionState().collectAsStateWithLifecycle()
             val searchState by graph.searchState.collectAsStateWithLifecycle()
+            val events by graph.events.collectAsStateWithLifecycle()
             var permissionMessage by remember { mutableStateOf("") }
             var operationMessage by remember { mutableStateOf("") }
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
+            var selectionError by remember { mutableStateOf("") }
+            fun addEvent(event: ScreenEvent) {
+                graph.addEvent(event)
+            }
             val busy = vpnState.phase in setOf(VpnPhase.CONNECTING, VpnPhase.RUNNING, VpnPhase.STOPPING)
             val searchRunning = searchState.phase in setOf(
                 SearchPhase.RUNNING,
@@ -83,26 +92,22 @@ class MainActivity : ComponentActivity() {
                     },
                     onServers = {
                         operationMessage = ""
+                        selectionError = ""
                         serversOpen = true
                     },
                     permissionMessage = permissionMessage,
                     sourceEnabled = !busy && !searchRunning && subscriptionState.phase != SubscriptionPhase.LOADING,
                     searchEnabled = graph.searchEnabled() || searchRunning,
                     searchRunning = searchRunning,
-                    searchMessage = operationMessage.ifEmpty {
-                        searchStatus(searchState, subscriptionState, selected)
-                    },
+                    searchMessage = "",
+                    information = ScreenInformation(events = events.toList(), startRejection = searchState.startRejection?.safeCode),
                     onSearch = {
                         operationMessage = ""
                         if (searchRunning) {
                             graph.cancelSearch()
                         } else {
-                            operationMessage = when (graph.startSearch()) {
-                                SearchStartV3.ACCEPTED -> ""
-                                SearchStartV3.BUSY -> "Подбор уже выполняется"
-                                SearchStartV3.REJECTED -> searchStartRejectedMessage(graph.searchState.value)
-                                SearchStartV3.UNKNOWN -> "Результат запуска неизвестен; повторный запуск заблокирован"
-                            }
+                            val outcome = graph.startSearch()
+                            searchOutcomeEvent(outcome, graph.searchState.value)?.let(::addEvent)
                         }
                     },
                 )
@@ -110,7 +115,9 @@ class MainActivity : ComponentActivity() {
                     SubscriptionDialog(
                         onDismiss = { subscriptionOpen = false },
                         onSubmit = { input ->
-                            when (graph.loadSubscription(input).status) {
+                            val outcome = graph.loadSubscription(input).status
+                            subscriptionOutcomeEvent(outcome, graph.subscriptionState().value.phase)?.let(::addEvent)
+                            when (outcome) {
                                 SubscriptionStartV1.ACCEPTED -> {
                                     operationMessage = ""
                                     true
@@ -133,12 +140,17 @@ class MainActivity : ComponentActivity() {
                             ServerChoice(record.id, record.title, record.subtitle, record.supported)
                         },
                         selectedIds = subscriptionState.selectedIds,
+                        canConfirm = graph.subscriptions.canSelect(),
+                        errorMessage = selectionError,
                         onDismiss = { serversOpen = false },
                         onConfirm = { ids ->
                             if (graph.select(ids)) {
+                                addEvent(ScreenEvent.SELECTION_SAVED)
                                 operationMessage = ""
                                 serversOpen = false
                             } else {
+                                addEvent(ScreenEvent.SELECTION_FAILED)
+                                selectionError = "Не удалось сохранить выбор серверов"
                                 operationMessage = "Не удалось сохранить выбор серверов"
                             }
                         },

@@ -54,6 +54,11 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.subscriptionEvent
+import com.seraf.vpnsweep.searchui.searchEvent
 
 internal class SweepApplication : Application() {
     val integration: AppComposition by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppComposition(this) }
@@ -62,6 +67,12 @@ internal class SweepApplication : Application() {
 internal class AppComposition(context: Context) {
     private val app = requireNotNull(context.applicationContext)
     private val lock = Any()
+    private val eventsLock = Any()
+    private val mutableEvents = MutableStateFlow<List<ScreenEvent>>(emptyList())
+    val events = mutableEvents.asStateFlow()
+    fun addEvent(event: ScreenEvent): Unit = synchronized(eventsLock) {
+        mutableEvents.value = (mutableEvents.value + event).takeLast(100)
+    }
     private val requests = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "subscription-fetch") }
     private var currentRequestGeneration: Long? = null
     private var acceptedSnapshot: AcceptedSubscriptionReceiptV1? = null
@@ -84,10 +95,17 @@ internal class AppComposition(context: Context) {
         activation,
         commitSource = ::commitSource,
         commitSelection = ::commitSelection,
+        onPhase = { phase -> subscriptionEvent(phase)?.let(::addEvent) },
+        selectionMutation = { ids -> activation.withOwnedSourceMutation(::acquireOwner) { commitSelection(ids) } },
     )
     val searchState = activation.controller.state
 
-    init { restoreSubscription() }
+    init {
+        activation.controller.setPhaseListener { state ->
+            if (state.startRejection == null) searchEvent(state.phase)?.let(::addEvent)
+        }
+        restoreSubscription()
+    }
 
     fun loadSubscription(input: String): SubscriptionLoadResult = subscriptions.loadWithReceipt(input)
 
@@ -291,21 +309,16 @@ internal class AppComposition(context: Context) {
     }
 
     private fun commitSelection(ids: Set<String>): ResultRevision {
-        val owner = acquireOwner() ?: throw IOException("search_owner_unavailable")
-        try {
-            val revision = storage.commitSelection(ids)
-            synchronized(lock) {
-                acceptedSnapshot = acceptedSnapshot?.let { current ->
-                    current.copy(sourceRevision = revision.source, selectionRevision = revision.selection)
-                }
-                completedSearch = null
-                restoredCompletedSearch = null
-                activeSearch = null
+        val revision = storage.commitSelection(ids)
+        synchronized(lock) {
+            acceptedSnapshot = acceptedSnapshot?.let { current ->
+                current.copy(sourceRevision = revision.source, selectionRevision = revision.selection)
             }
-            return revision
-        } finally {
-            owner.close()
+            completedSearch = null
+            restoredCompletedSearch = null
+            activeSearch = null
         }
+        return revision
     }
 
     private fun acquireOwner(): SearchOwnerLease? = when (val result = SearchOwnerLock.acquire(app)) {
@@ -373,23 +386,24 @@ internal class AppComposition(context: Context) {
             }
             val lease = when (val result = SearchOwnerLock.acquire(app)) {
                 is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> result.lease
-                else -> return SearchStartV3.BUSY
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Busy -> return SearchStartV3.BUSY
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Unavailable -> return SearchStartV3.UNKNOWN
             }
             val leaseIdentity = UUID.randomUUID().toString()
             val receipt = SearchLeaseReceiptV1.fromAcceptedSnapshot(imported, snapshot, leaseIdentity)
                 ?: run {
-                    try { lease.close() } catch (_: Exception) { }
+                    if (!closeUnusedLease(lease)) return SearchStartV3.UNKNOWN
                     return rejectStart(SearchStartReason.LEASE_RECEIPT_INVALID)
                 }
             synchronized(lock) {
                 if (identities.containsKey(snapshot.sessionGeneration)) {
-                    try { lease.close() } catch (_: Exception) { }
+                    if (!closeUnusedLease(lease)) return SearchStartV3.UNKNOWN
                     return SearchStartV3.BUSY
                 }
                 val offered = producer.offerLease(lease)
                 if (offered != com.seraf.vpnsweep.searchworker.SearchLeaseHandoff.CLAIMED) {
                     if (offered == com.seraf.vpnsweep.searchworker.SearchLeaseHandoff.RETURNED) {
-                        try { lease.close() } catch (_: Exception) { }
+                        if (!closeUnusedLease(lease)) return SearchStartV3.UNKNOWN
                     }
                     return if (offered == com.seraf.vpnsweep.searchworker.SearchLeaseHandoff.UNKNOWN) SearchStartV3.UNKNOWN else SearchStartV3.BUSY
                 }
@@ -420,6 +434,15 @@ internal class AppComposition(context: Context) {
                 SearchStartRejection(SearchStartStage.PORT_DISPATCH, reason),
             )
             return SearchStartV3.REJECTED
+        }
+
+        private fun closeUnusedLease(lease: SearchOwnerLease): Boolean = try {
+            lease.close()
+            true
+        } catch (_: Exception) {
+            false
+        } catch (_: LinkageError) {
+            false
         }
 
         override fun pause(sessionGeneration: Long, phaseEpoch: Long): Unit = producer.pause(sessionGeneration, phaseEpoch)

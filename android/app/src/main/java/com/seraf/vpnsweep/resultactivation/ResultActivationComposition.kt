@@ -70,7 +70,7 @@ internal class ResultActivationComposition private constructor(
         receipt.search
     }
 
-    fun withSourceMutation(mutation: () -> ResultRevision): Boolean = activation.withSourceMutation {
+    fun withSourceMutation(beforeClear: () -> Unit = {}, mutation: () -> ResultRevision): Boolean = activation.withSourceMutation {
         check(marker.markActive() && marker.read() == MarkerState.ACTIVE) { "marker_active_unknown" }
         val previous = revisionStorage.read()
         val published = storage.readManifest()?.revision
@@ -81,8 +81,22 @@ internal class ResultActivationComposition private constructor(
         require(revision.source.isNotEmpty() && revision.selection.isNotEmpty())
         check(revision != previous && revision != published) { "revision_reused" }
         check(revisions.update(revision)) { "revision_update_failed" }
+        beforeClear()
         check(marker.markClear() && marker.read() == MarkerState.CLEAR) { "marker_clear_unknown" }
         true
+    }
+
+    fun withOwnedSourceMutation(acquire: () -> AutoCloseable?, mutation: () -> ResultRevision): Boolean {
+        val owner = acquire() ?: return false
+        var closeAttempted = false
+        try {
+            return withSourceMutation(beforeClear = {
+                closeAttempted = true
+                owner.close()
+            }, mutation = mutation)
+        } finally {
+            if (!closeAttempted) owner.close()
+        }
     }
 
     companion object {

@@ -34,6 +34,8 @@ internal class SubscriptionController(
     // The callback borrows the snapshot and returns only after its durable commit.
     private val commitSource: (SubscriptionSnapshotV1) -> ResultRevision,
     private val commitSelection: (Set<String>) -> ResultRevision,
+    private val onPhase: (SubscriptionPhase) -> Unit = {},
+    private val selectionMutation: ((Set<String>) -> Boolean)? = null,
 ) : SubscriptionObserverV1 {
     private class Request(
         val generation: Long,
@@ -73,7 +75,7 @@ internal class SubscriptionController(
                 installedRecords = records
                 this.selectedIds = selection
                 nextGeneration = requestGeneration
-                mutableState.value = visibleState(SubscriptionPhase.READY)
+                publish(visibleState(SubscriptionPhase.READY))
                 true
             }
         } catch (failure: Throwable) {
@@ -95,7 +97,7 @@ internal class SubscriptionController(
             if (nextGeneration == Long.MAX_VALUE) return SubscriptionLoadResult(SubscriptionStartV1.REJECTED)
             Request(++nextGeneration).also {
                 request = it
-                mutableState.value = visibleState(SubscriptionPhase.LOADING)
+                publish(visibleState(SubscriptionPhase.LOADING))
             }
         }
         val result = try {
@@ -108,7 +110,7 @@ internal class SubscriptionController(
                 } else {
                     if (request === current) {
                         request = null
-                        mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                        publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
                     }
                     false
                 }
@@ -124,7 +126,7 @@ internal class SubscriptionController(
             current.dispatching = false
             if (result != SubscriptionStartV1.ACCEPTED && request === current) {
                 request = null
-                mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             }
             result == SubscriptionStartV1.ACCEPTED && current.cancelled
         }
@@ -137,11 +139,11 @@ internal class SubscriptionController(
             val current = request ?: return
             current.cancelled = true
             request = null
-            mutableState.value = if (pendingClose.isNotEmpty()) {
+            publish(if (pendingClose.isNotEmpty()) {
                 visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
             } else {
                 visibleState(SubscriptionPhase.CANCELLED)
-            }
+            })
             if (current.dispatching) null else current.generation
         }
         if (cancelNow != null) port.cancel(cancelNow)
@@ -158,22 +160,22 @@ internal class SubscriptionController(
         request = null
         if (pendingClose.isNotEmpty()) {
             closeResource(snapshot)
-            mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+            publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             return
         }
         val records = snapshot.records.toList()
         val hasSupported = records.any { it.supported }
         if (!validRecords(records) || hasSupported != (status == SubscriptionBatchStatusV1.HAS_SUPPORTED)) {
             if (!closeResource(snapshot)) return
-            mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.MALFORMED)
+            publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.MALFORMED))
             return
         }
         if (!hasSupported) {
             if (!closeResource(snapshot)) return
             if (composition.activation.withSourceMutation { true }) {
-                mutableState.value = visibleState(SubscriptionPhase.NO_SUPPORTED)
+                publish(visibleState(SubscriptionPhase.NO_SUPPORTED))
             } else {
-                mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             }
             return
         }
@@ -188,7 +190,7 @@ internal class SubscriptionController(
         }
         if (!committed) {
             if (!closeResource(snapshot)) return
-            mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+            publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             return
         }
         val previous = installed
@@ -197,10 +199,10 @@ internal class SubscriptionController(
         selectedIds = emptySet()
         if (previous != null) closeResource(previous)
         if (pendingClose.isNotEmpty()) {
-            mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+            publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             return
         }
-        mutableState.value = SubscriptionUiState(phase = SubscriptionPhase.READY, records = records, generation = nextGeneration)
+        publish(SubscriptionUiState(phase = SubscriptionPhase.READY, records = records, generation = nextGeneration))
     }
 
     @Synchronized
@@ -210,25 +212,30 @@ internal class SubscriptionController(
         current.callbackProcessed = true
         request = null
         if (pendingClose.isNotEmpty()) {
-            mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+            publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             return
         }
-        mutableState.value = visibleState(
+        publish(visibleState(
             if (failure == SubscriptionFailureV1.CANCELLED) SubscriptionPhase.CANCELLED else SubscriptionPhase.FAILED,
             failure,
-        )
+        ))
     }
 
     @Synchronized
+    fun canSelect(): Boolean = installed != null && request == null && pendingClose.isEmpty() &&
+        uncertainSearchInput == null &&
+        composition.activation.withSourceMutation { true }
+
+    @Synchronized
     fun select(ids: Set<String>): Boolean {
-        if (installed == null || ids.isEmpty() || pendingClose.isNotEmpty() || uncertainSearchInput != null) return false
+        if (ids.isEmpty() || !canSelect()) return false
         val supported = installedRecords.filter { it.supported }.map { it.id }.toSet()
         if (!supported.containsAll(ids)) return false
         val copy = ids.toSet()
         if (copy == selectedIds) return composition.activation.withSourceMutation { true }
         var failed = false
         val committed = try {
-            composition.withSourceMutation { commitSelection(copy) }
+            selectionMutation?.invoke(copy) ?: composition.withSourceMutation { commitSelection(copy) }
         } catch (failure: Throwable) {
             if (failure !is Exception) throw failure
             failed = true
@@ -236,9 +243,9 @@ internal class SubscriptionController(
         }
         if (committed) {
             selectedIds = copy
-            mutableState.value = visibleState(if (request == null) SubscriptionPhase.READY else SubscriptionPhase.LOADING)
+            publish(visibleState(if (request == null) SubscriptionPhase.READY else SubscriptionPhase.LOADING))
         } else if (failed) {
-            mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+            publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL), notifyPhase = false)
         }
         return committed
     }
@@ -260,7 +267,7 @@ internal class SubscriptionController(
                 val profiles = try {
                     installed?.selectedProfiles(selectedIds)
                 } catch (_: SubscriptionProfilesTooLargeException) {
-                    mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.LIMIT_EXCEEDED)
+                    publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.LIMIT_EXCEEDED), notifyPhase = false)
                     return rejectStart(SearchStartReason.PROFILE_TOO_LARGE)
                 }
                 if (profiles == null) {
@@ -279,7 +286,7 @@ internal class SubscriptionController(
                 SearchStartV3.ACCEPTED -> Unit
                 SearchStartV3.UNKNOWN -> {
                     uncertainSearchInput = input
-                    mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+                    publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL), notifyPhase = false)
                 }
                 SearchStartV3.BUSY, SearchStartV3.REJECTED -> closeResource(input)
             }
@@ -290,6 +297,12 @@ internal class SubscriptionController(
     private fun rejectStart(reason: SearchStartReason): SearchStartV3 {
         composition.controller.recordStartRejection(SearchStartRejection(SearchStartStage.PREFLIGHT, reason))
         return SearchStartV3.REJECTED
+    }
+
+    private fun publish(next: SubscriptionUiState, notifyPhase: Boolean = true): Unit {
+        val previous = mutableState.value
+        mutableState.value = next
+        if (notifyPhase && (previous.phase != next.phase || previous.generation != next.generation)) onPhase(next.phase)
     }
 
     private fun visibleState(phase: SubscriptionPhase, failure: SubscriptionFailureV1? = null): SubscriptionUiState =
@@ -319,7 +332,7 @@ internal class SubscriptionController(
             installed == null -> SubscriptionPhase.IDLE
             else -> SubscriptionPhase.READY
         }
-        mutableState.value = visibleState(phase)
+        publish(visibleState(phase))
         return true
     }
 
@@ -328,7 +341,7 @@ internal class SubscriptionController(
         true
     } catch (_: Exception) {
         pendingClose.add(resource)
-        mutableState.value = visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL)
+        publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
         false
     }
 }

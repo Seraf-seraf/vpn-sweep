@@ -105,11 +105,11 @@ internal fun VpnSweepScreenContent(
         VpnPhase.DISCONNECTED, VpnPhase.ERROR -> "Подключить VPN"
     }
     val powerHint = when {
-        importing -> "Дождитесь окончания чтения файла"
+        importing -> ""
         state.phase == VpnPhase.STOPPING -> "Дождитесь отключения VPN"
         state.phase == VpnPhase.CONNECTING -> "Нажмите, чтобы отменить подключение"
         state.phase == VpnPhase.RUNNING -> "Нажмите, чтобы отключить VPN"
-        !selected -> "Конфигурация VPN пока недоступна"
+        !selected -> ""
         else -> "Нажмите, чтобы подключить VPN"
     }
 
@@ -148,7 +148,7 @@ internal fun VpnSweepScreenContent(
                 textAlign = TextAlign.Center,
             )
             Spacer(Modifier.height(4.dp))
-            Text(
+            if (powerHint.isNotEmpty()) Text(
                 text = powerHint,
                 color = SecondaryText,
                 fontSize = 14.sp,
@@ -180,13 +180,10 @@ internal fun VpnSweepScreenContent(
                 onClick = onSearch,
                 enabled = searchEnabled,
             )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = searchMessage,
-                modifier = Modifier.fillMaxWidth(),
-                color = SecondaryText,
-                fontSize = 14.sp,
-            )
+            if (searchMessage.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text(text = searchMessage, modifier = Modifier.fillMaxWidth(), color = SecondaryText, fontSize = 14.sp)
+            }
             Spacer(Modifier.height(16.dp))
             InformationPanel(information = information)
         }

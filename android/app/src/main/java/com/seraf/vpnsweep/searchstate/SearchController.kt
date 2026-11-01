@@ -114,22 +114,36 @@ internal class SearchController(
     private val pendingResultClose = mutableListOf<AutoCloseable>()
     private var cleanupInProgress = false
 
+    private var phaseListener: (SearchUiState) -> Unit = {}
+
+    @Synchronized
+    fun setPhaseListener(listener: (SearchUiState) -> Unit): Unit {
+        phaseListener = listener
+        listener(mutableState.value)
+    }
+
+    private fun publish(next: SearchUiState): Unit {
+        val previous = mutableState.value
+        mutableState.value = next
+        if (previous.phase != next.phase) phaseListener(next)
+    }
+
     @Synchronized
     fun clearStartRejection(): Unit {
         if (mutableState.value.startRejection != null) {
-            mutableState.value = mutableState.value.copy(startRejection = null)
+            publish(mutableState.value.copy(startRejection = null))
         }
     }
 
     @Synchronized
     fun recordStartRejection(rejection: SearchStartRejection): Unit {
-        mutableState.value = mutableState.value.copy(startRejection = rejection)
+        publish(mutableState.value.copy(startRejection = rejection))
     }
 
     @Synchronized
     fun recordStartRejectionIfAbsent(rejection: SearchStartRejection): Unit {
         if (mutableState.value.startRejection == null) {
-            mutableState.value = mutableState.value.copy(startRejection = rejection)
+            publish(mutableState.value.copy(startRejection = rejection))
         }
     }
 
@@ -155,17 +169,17 @@ internal class SearchController(
         if (!marker.markActive()) {
             store.cancel(token)
             val rejection = SearchStartRejection(SearchStartStage.RESERVE, SearchStartReason.MARKER_ACTIVATION_REJECTED)
-            mutableState.value = SearchUiState(
+            publish(SearchUiState(
                 phase = SearchPhase.INTERRUPTED,
                 failure = SearchFailureV1.INTERRUPTED,
                 startRejection = rejection,
-            )
+            ))
             return SearchStartPreparation.Denied(SearchStartV3.REJECTED)
         }
         val session = Session(++generation, token)
         session.observer = observerFor(session)
         active = session
-        mutableState.value = SearchUiState(phase = SearchPhase.RUNNING)
+        publish(SearchUiState(phase = SearchPhase.RUNNING))
         val snapshot = SearchSnapshotV1(session.generation, sourceRevision, selectionRevision, profiles)
         return SearchStartPreparation.Reserved { dispatchStart(session, snapshot) }
     }
@@ -197,7 +211,7 @@ internal class SearchController(
         val command = synchronized(this) {
             val session = active ?: return
             if (mutableState.value.phase != SearchPhase.RUNNING || session.unknown || session.terminal != null) return
-            mutableState.value = mutableState.value.copy(phase = SearchPhase.PAUSING)
+            publish(mutableState.value.copy(phase = SearchPhase.PAUSING))
             if (session.dispatching) {
                 session.pendingControl = Control.PAUSE
                 null
@@ -216,7 +230,7 @@ internal class SearchController(
             session.dispatching = true
             session.callbackDuringDispatch = false
             session.pendingControl = null
-            mutableState.value = mutableState.value.copy(phase = SearchPhase.RUNNING, pauseReason = null)
+            publish(mutableState.value.copy(phase = SearchPhase.RUNNING, pauseReason = null))
             Triple(session, previous, session.phase)
         }
         val outcome = try {
@@ -231,7 +245,7 @@ internal class SearchController(
         val command = synchronized(this) {
             val session = active ?: return
             if (session.unknown || session.terminal != null || !store.cancel(session.token)) return
-            mutableState.value = mutableState.value.copy(phase = SearchPhase.CANCELLING)
+            publish(mutableState.value.copy(phase = SearchPhase.CANCELLING))
             if (session.dispatching) {
                 session.pendingControl = Control.CANCEL
                 null
@@ -273,7 +287,7 @@ internal class SearchController(
                     Triple(session, previousPhase, Control.CANCEL)
                 } else {
                     session.pendingControl = null
-                    mutableState.value = mutableState.value.copy(phase = SearchPhase.PAUSED)
+                    publish(mutableState.value.copy(phase = SearchPhase.PAUSED))
                     null
                 }
             } else if (session.terminal != null) {
@@ -293,7 +307,7 @@ internal class SearchController(
             synchronized(this@SearchController) {
                 if (active !== session || progress.sessionGeneration != session.generation || phaseEpoch != session.phase || session.phasePaused || session.terminal != null || session.unknown) return
                 if (session.dispatching) session.callbackDuringDispatch = true
-                if (mutableState.value.phase != SearchPhase.CANCELLING) mutableState.value = mutableState.value.copy(progress = progress)
+                if (mutableState.value.phase != SearchPhase.CANCELLING) publish(mutableState.value.copy(progress = progress))
             }
         }
 
@@ -350,7 +364,7 @@ internal class SearchController(
                 interruptCurrentOr(session)
                 SearchResultReceiptV3.UNKNOWN
             } else {
-                mutableState.value = mutableState.value.copy(resultCommitted = session.committed)
+                publish(mutableState.value.copy(resultCommitted = session.committed))
                 when (publication) {
                     Publication.SUCCESS -> SearchResultReceiptV3.COMMITTED_CLOSED
                     Publication.CANCELLED -> SearchResultReceiptV3.CANCELLED_CLOSED
@@ -398,7 +412,7 @@ internal class SearchController(
                     session.phasePaused = true
                     if (session.pendingControl == Control.PAUSE) session.pendingControl = null
                     if (mutableState.value.phase != SearchPhase.CANCELLING) {
-                        mutableState.value = mutableState.value.copy(phase = SearchPhase.PAUSED, pauseReason = terminal.reason)
+                        publish(mutableState.value.copy(phase = SearchPhase.PAUSED, pauseReason = terminal.reason))
                     }
                 }
                 return
@@ -467,7 +481,7 @@ internal class SearchController(
             }
             active = null
             admissionBlocked = false
-            mutableState.value = SearchUiState(
+            publish(SearchUiState(
                 phase = when {
                     session.committed -> SearchPhase.COMPLETE
                     terminal is SearchTerminalV3.Cancelled -> SearchPhase.CANCELLED
@@ -475,7 +489,7 @@ internal class SearchController(
                 },
                 failure = (terminal as? SearchTerminalV3.Stopped)?.reason,
                 resultCommitted = session.committed,
-            )
+            ))
         }
     }
 
@@ -483,18 +497,18 @@ internal class SearchController(
         val current = active
         if (current != null) interrupt(current) else {
             admissionBlocked = true
-            mutableState.value = SearchUiState(phase = SearchPhase.INTERRUPTED, failure = SearchFailureV1.INTERRUPTED, resultCommitted = session.committed)
+            publish(SearchUiState(phase = SearchPhase.INTERRUPTED, failure = SearchFailureV1.INTERRUPTED, resultCommitted = session.committed))
         }
     }
 
     private fun interrupt(session: Session, workerQuarantined: Boolean = false): Unit {
         session.unknown = true
         admissionBlocked = true
-        mutableState.value = SearchUiState(
+        publish(SearchUiState(
             phase = SearchPhase.INTERRUPTED,
             failure = if (workerQuarantined) SearchFailureV1.WORKER_QUARANTINED else SearchFailureV1.INTERRUPTED,
             resultCommitted = session.committed,
             startRejection = mutableState.value.startRejection,
-        )
+        ))
     }
 }

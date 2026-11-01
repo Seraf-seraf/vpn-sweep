@@ -20,6 +20,176 @@ import org.junit.Test
 
 class SubscriptionControllerTest {
     @Test
+    fun selectionOwnerBusyKeepsSelectionAndAllowsRetryAfterRelease(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        var busy = true
+        var writes = 0
+        var closes = 0
+        val controller = SubscriptionController(
+            port, fixture.composition,
+            { ResultRevision("1", "1") },
+            { writes++; ResultRevision("1", "2") },
+            selectionMutation = { ids ->
+                fixture.composition.withOwnedSourceMutation(
+                    acquire = { if (busy) null else AutoCloseable { closes++ } },
+                ) {
+                    assertEquals(setOf("a"), ids)
+                    writes++
+                    ResultRevision("1", "2")
+                }
+            },
+        )
+        controller.load("synthetic")
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true))))
+        assertTrue(controller.canSelect())
+        assertFalse(controller.select(setOf("a")))
+        assertTrue(controller.state.value.selectedIds.isEmpty())
+        assertEquals(0, writes)
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+        assertEquals(ResultRevision("1", "1"), fixture.composition.currentRevision())
+        busy = false
+        assertTrue(controller.canSelect())
+        assertTrue(controller.select(setOf("a")))
+        assertEquals(setOf("a"), controller.state.value.selectedIds)
+        assertEquals(1, writes)
+        assertEquals(1, closes)
+        assertEquals(ResultRevision("1", "2"), fixture.composition.currentRevision())
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+    }
+
+    @Test
+    fun ownerBusyBeforeMutationAllowsRetryAfterOwnerAvailable(): Unit {
+        val fixture = Fixture()
+        fixture.revisions.value = ResultRevision("1", "1")
+        var writes = 0
+        assertFalse(fixture.composition.withOwnedSourceMutation({ null }) { writes++; ResultRevision("1", "2") })
+        assertEquals(0, writes)
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+        assertEquals(ResultRevision("1", "1"), fixture.revisions.value)
+        var closes = 0
+        assertTrue(fixture.composition.withOwnedSourceMutation({ AutoCloseable { closes++ } }) { writes++; ResultRevision("1", "2") })
+        assertEquals(1, writes)
+        assertEquals(1, closes)
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+        assertEquals(ResultRevision("1", "2"), fixture.revisions.value)
+    }
+
+    @Test
+    fun ownerCloseFailureLeavesMutationFailClosed(): Unit {
+        val fixture = Fixture()
+        fixture.revisions.value = ResultRevision("1", "1")
+        var closes = 0
+        try {
+            fixture.composition.withOwnedSourceMutation({ AutoCloseable { closes++; throw IOException("synthetic_close") } }) { ResultRevision("1", "2") }
+            fail("close failure must not succeed")
+        } catch (_: IOException) { }
+        assertEquals(1, closes)
+        assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+        assertFalse(fixture.composition.activation.withSourceMutation { true })
+    }
+
+    @Test
+    fun confirmedCancelCleanupAllowsSelectionAndSearchRetry(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        var revision = 1
+        var observer: SearchSessionObserverV3? = null
+        fixture.runtime.onStart = { current ->
+            observer = current
+            fixture.runtime.snapshot!!.profiles.close()
+        }
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { ResultRevision("1", (++revision).toString()) })
+        controller.load("synthetic")
+        val snapshot = Snapshot(listOf(record("a", true), record("b", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+        assertTrue(controller.select(setOf("a")))
+        assertEquals(SearchStartV3.ACCEPTED, controller.startSelected())
+        fixture.composition.controller.cancel()
+        checkNotNull(observer).onTerminal(SearchTerminalV3.Cancelled(1, 1, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED))
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+        assertEquals(SearchPhase.CANCELLED, fixture.composition.controller.state.value.phase)
+        assertTrue(controller.canSelect())
+        assertTrue(controller.select(setOf("b")))
+        snapshot.selectedInput = FakeInput()
+        assertEquals(SearchStartV3.ACCEPTED, controller.startSelected())
+        assertEquals(2, fixture.runtime.starts)
+    }
+
+    @Test
+    fun invalidUncommittedInputCanRetryAndSuccessRequiresCommit(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        var commits = 0
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { commits++; ResultRevision("1", "2") })
+        controller.load("synthetic")
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true))))
+        assertFalse(controller.select(emptySet()))
+        assertTrue(controller.canSelect())
+        assertTrue(controller.state.value.selectedIds.isEmpty())
+        assertEquals(0, commits)
+        assertTrue(controller.select(setOf("a")))
+        assertEquals(1, commits)
+        assertEquals(setOf("a"), controller.state.value.selectedIds)
+        assertEquals(ResultRevision("1", "2"), fixture.composition.currentRevision())
+    }
+
+    @Test
+    fun subscriptionFailureAndCancelPublishDistinctPhases(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val phases = mutableListOf<SubscriptionPhase>()
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { ResultRevision("1", "2") }, phases::add)
+        controller.load("synthetic")
+        port.observer!!.onFailure(1, SubscriptionFailureV1.TIMEOUT)
+        controller.load("synthetic")
+        controller.cancel()
+        assertEquals(listOf(SubscriptionPhase.LOADING, SubscriptionPhase.FAILED, SubscriptionPhase.LOADING, SubscriptionPhase.CANCELLED), phases)
+    }
+
+    @Test
+    fun phaseListenersRetainTransitionsEvenBeforeUiCollects(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val subscriptionPhases = mutableListOf<SubscriptionPhase>()
+        val searchPhases = mutableListOf<SearchPhase>()
+        fixture.composition.controller.setPhaseListener { searchPhases.add(it.phase) }
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { ResultRevision("1", "2") }, subscriptionPhases::add)
+        controller.load("synthetic")
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true))))
+        assertTrue(controller.select(setOf("a")))
+        assertEquals(SearchStartV3.ACCEPTED, controller.startSelected())
+        fixture.composition.controller.cancel()
+        assertEquals(listOf(SubscriptionPhase.LOADING, SubscriptionPhase.READY), subscriptionPhases)
+        assertEquals(listOf(SearchPhase.IDLE, SearchPhase.RUNNING, SearchPhase.CANCELLING), searchPhases)
+    }
+
+    @Test
+    fun selectionReadinessAndFailedCommitRemainFailClosed(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val phases = mutableListOf<SubscriptionPhase>()
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") },
+            { throw IOException("synthetic_failure") }, phases::add)
+        assertFalse(controller.canSelect())
+        controller.load("synthetic")
+        assertFalse(controller.canSelect())
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true))))
+        assertTrue(controller.canSelect())
+        assertFalse(controller.select(setOf("a")))
+        assertTrue(controller.state.value.selectedIds.isEmpty())
+        assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+        assertFalse(controller.canSelect())
+        assertFalse(controller.select(setOf("a")))
+        assertEquals(listOf(SubscriptionPhase.LOADING, SubscriptionPhase.READY), phases)
+    }
+
+    @Test
     fun cancelClosesLateSnapshotAndDoesNotExposeSensitiveInput(): Unit {
         val port = FakeSubscriptionPort()
         val controller = legacyController(port, search(), { true }, { true }, { ResultRevision("1", "2") })

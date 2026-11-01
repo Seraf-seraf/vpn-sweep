@@ -16,6 +16,8 @@ fun ServerSelectionDialog(
     selectedIds: Set<String>,
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit,
+    canConfirm: Boolean = true,
+    errorMessage: String = "",
 ): Unit {
-    ServerSelectionDialogHost(servers, selectedIds, onDismiss, onConfirm)
+    ServerSelectionDialogHost(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage)
 }

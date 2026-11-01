@@ -93,12 +93,14 @@ internal fun ServerSelectionDialogHost(
     selectedIds: Set<String>,
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit,
+    canConfirm: Boolean = true,
+    errorMessage: String = "",
 ): Unit {
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm)
+        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage)
     }
 }
 
@@ -108,6 +110,8 @@ internal fun ServerSelectionDialogContent(
     selectedIds: Set<String>,
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit,
+    canConfirm: Boolean = true,
+    errorMessage: String = "",
 ): Unit {
     val supportedIds = remember(servers) {
         servers.filter { it.supported }.map { it.id }.toSet()
@@ -204,11 +208,13 @@ internal fun ServerSelectionDialogContent(
                     footerLeading = {
                         Column(Modifier.fillMaxWidth()) {
                             ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
+                            if (errorMessage.isNotEmpty()) Text(errorMessage, color = ServerDialogColors.text)
                         }
                     },
                     footer = {
                         ServerDialogFooter(
                             selectedCount = selected.size,
+                            canConfirm = canConfirm,
                             onDismiss = onDismiss,
                             onConfirm = { onConfirm(selected.toSet()) },
                             layout = actions,
@@ -488,6 +494,7 @@ private fun ServerSelectionSummary(
 @Composable
 private fun ServerDialogFooter(
     selectedCount: Int,
+    canConfirm: Boolean,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
     layout: DialogActionsLayout,
@@ -496,12 +503,12 @@ private fun ServerDialogFooter(
         if (layout.stacked) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 ServerCancelButton(onDismiss, Modifier.fillMaxWidth())
-                ServerConfirmButton(selectedCount > 0, onConfirm, Modifier.fillMaxWidth())
+                ServerConfirmButton(canConfirm && selectedCount > 0, onConfirm, Modifier.fillMaxWidth())
             }
         } else {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ServerCancelButton(onDismiss, Modifier.weight(layout.cancelWeight))
-                ServerConfirmButton(selectedCount > 0, onConfirm, Modifier.weight(layout.confirmWeight))
+                ServerConfirmButton(canConfirm && selectedCount > 0, onConfirm, Modifier.weight(layout.confirmWeight))
             }
         }
     }
