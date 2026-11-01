@@ -82,12 +82,6 @@ private val ControlShape = RoundedCornerShape(12.dp)
 internal fun informationPaneHeight(viewportHeight: Dp, fontScale: Float = 1f): Dp =
     (viewportHeight * if (fontScale >= 1.5f) 0.65f else 0.33f).coerceIn(0.dp, 220.dp)
 
-internal fun journalLevelColor(level: String): Color = when (level) {
-    "ERROR" -> SweepColors.error
-    "WARN" -> SweepColors.journalWarning
-    else -> SweepColors.text
-}
-
 @Composable
 internal fun VpnSweepScreenContent(
     state: VpnState,
@@ -371,7 +365,7 @@ internal fun EventLogPanel(entries: List<EventLogEntry>, showHeader: Boolean = t
             Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
         } else {
             for (entry in entries) {
-                Text("${entry.time}  [${entry.level}] ${entry.message}", color = journalLevelColor(entry.level), fontFamily = SweepMono, fontSize = 14.sp)
+                Text("${entry.time}  [${entry.level}] ${entry.message}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
             }
         }
     }

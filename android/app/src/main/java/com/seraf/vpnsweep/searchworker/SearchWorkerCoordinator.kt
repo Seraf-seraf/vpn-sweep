@@ -15,9 +15,16 @@ import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
+internal sealed interface WorkerConfirmationWait {
+    class Confirmed(val binder: IBinder) : WorkerConfirmationWait
+    data object Deadline : WorkerConfirmationWait
+    data object SupervisedStop : WorkerConfirmationWait
+    data object Unknown : WorkerConfirmationWait
+}
+
 internal interface WorkerCoordinatorPort : PreconnectWorkerStop {
     fun bind(): Boolean
-    fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder?
+    fun awaitConfirmation(deadlineElapsedMillis: Long): WorkerConfirmationWait
     fun confirmedBinder(): IBinder?
     fun awaitRetired(deadlineElapsedMillis: Long): Boolean
     fun quarantine(): Unit
@@ -198,17 +205,20 @@ internal class SearchWorkerCoordinator(
 
     fun state(): CoordinatorState = admission.state()
 
-    override fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
+    override fun awaitConfirmation(deadlineElapsedMillis: Long): WorkerConfirmationWait {
         val now = SystemClock.elapsedRealtime()
-        if (now < 0 || deadlineElapsedMillis <= now) return null
+        if (now < 0) return WorkerConfirmationWait.Unknown
+        if (deadlineElapsedMillis <= now) return WorkerConfirmationWait.Deadline
         val remaining = deadlineElapsedMillis - now
         val signalled = try {
             handshakeFinished.await(remaining, TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
-            false
+            return WorkerConfirmationWait.Unknown
         }
-        return if (signalled) confirmedBinder() else null
+        if (!signalled) return WorkerConfirmationWait.Deadline
+        if (synchronized(lock) { stopped && supervisedStop }) return WorkerConfirmationWait.SupervisedStop
+        return confirmedBinder()?.let(WorkerConfirmationWait::Confirmed) ?: WorkerConfirmationWait.Unknown
     }
 
     override fun confirmedBinder(): IBinder? {

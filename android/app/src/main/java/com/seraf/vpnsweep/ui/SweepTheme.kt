@@ -14,7 +14,6 @@ internal object SweepColors {
     val outline = Color(0xFF344B75)
     val error = Color(0xFFFF8D9C)
     val journalBackground = Color(0xFF03070D)
-    val journalWarning = Color(0xFFFFD98A)
     val onAccent = Color(0xFF11162C)
 }
 

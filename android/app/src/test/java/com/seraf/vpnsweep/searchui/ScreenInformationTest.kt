@@ -7,7 +7,6 @@ import com.seraf.vpnsweep.recheckSearchReadinessFlow
 import com.seraf.vpnsweep.networkPolicyEvent
 import com.seraf.vpnsweep.searchworker.NetworkPolicyUnavailableReason
 import com.seraf.vpnsweep.ui.informationPaneHeight
-import com.seraf.vpnsweep.ui.journalLevelColor
 import com.seraf.vpnsweep.ui.SweepColors
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
@@ -70,13 +69,11 @@ class ScreenInformationTest {
     }
 
     @Test
-    fun journalHasDistinctBackgroundAndReadableLevelColors(): Unit {
+    fun journalHasDistinctBackgroundAndReadableText(): Unit {
         val background = SweepColors.journalBackground
         assertTrue(background != SweepColors.background)
-        for (level in listOf("INFO", "WARN", "ERROR")) {
-            val contrast = (journalLevelColor(level).luminance() + 0.05f) / (background.luminance() + 0.05f)
-            assertTrue("$level contrast $contrast", contrast >= 4.5f)
-        }
+        val contrast = (SweepColors.text.luminance() + 0.05f) / (background.luminance() + 0.05f)
+        assertTrue("journal contrast $contrast", contrast >= 4.5f)
     }
 
     @Test

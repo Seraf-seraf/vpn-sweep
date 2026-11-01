@@ -165,10 +165,10 @@ class PreconnectProducerJointTest {
                     check(prepared.beginBind())
                     val stop = object : WorkerCoordinatorPort {
                         override fun bind(): Boolean = true
-                        override fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
+                        override fun awaitConfirmation(deadlineElapsedMillis: Long): WorkerConfirmationWait {
                             portWaiting.countDown()
                             check(releasePortWait.await(3, TimeUnit.SECONDS))
-                            return null
+                            return WorkerConfirmationWait.SupervisedStop
                         }
                         override fun confirmedBinder(): IBinder? = null
                         override fun awaitRetired(deadlineElapsedMillis: Long): Boolean = false

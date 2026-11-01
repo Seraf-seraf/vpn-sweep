@@ -200,13 +200,14 @@ internal class SearchWorkerBinderPort(
                     try { reportBindFailure() } catch (_: Exception) { } catch (_: LinkageError) { }
                     throw IOException("worker_admission_unknown")
                 }
-                val binder = coordinator.awaitConfirmed(deadline) ?: run {
-                    val expected = synchronized(lock) {
-                        !Thread.currentThread().isInterrupted && (state == State.RECOVERY_PENDING ||
-                            (state == State.OPENING && (!cancelled || cancelPending) && remaining(deadline) <= 0))
+                val binder = when (val observation = coordinator.awaitConfirmation(deadline)) {
+                    is WorkerConfirmationWait.Confirmed -> observation.binder
+                    WorkerConfirmationWait.Deadline -> throw ExpectedPreconnectWaitStop()
+                    WorkerConfirmationWait.SupervisedStop -> {
+                        if (synchronized(lock) { state == State.RECOVERY_PENDING }) throw ExpectedPreconnectWaitStop()
+                        throw IOException("worker_admission_unknown")
                     }
-                    if (expected) throw ExpectedPreconnectWaitStop()
-                    throw IOException("worker_admission_unknown")
+                    WorkerConfirmationWait.Unknown -> throw IOException("worker_admission_unknown")
                 }
                 requireTime(deadline)
                 val dispatch = synchronized(lock) { state == State.OPENING && !cancelled }
@@ -434,11 +435,13 @@ internal class SearchWorkerBinderPort(
             }, expectedTimeout = { it == CancelDispatchResult.RecoveryStopped }) {
                 try {
                     CancelDispatchResult.Status(trackedPreconnectCancel(task) {
-                        val binder = coordinator.awaitConfirmed(effectiveDeadline) ?: run {
-                            if (!Thread.currentThread().isInterrupted && synchronized(lock) { state == State.RECOVERY_PENDING }) {
-                                throw ExpectedPreconnectWaitStop()
+                        val binder = when (val observation = coordinator.awaitConfirmation(effectiveDeadline)) {
+                            is WorkerConfirmationWait.Confirmed -> observation.binder
+                            WorkerConfirmationWait.SupervisedStop -> {
+                                if (synchronized(lock) { state == State.RECOVERY_PENDING }) throw ExpectedPreconnectWaitStop()
+                                throw IOException("worker_owner_unknown")
                             }
-                            throw IOException("worker_owner_unknown")
+                            WorkerConfirmationWait.Deadline, WorkerConfirmationWait.Unknown -> throw IOException("worker_owner_unknown")
                         }
                         requireTime(effectiveDeadline)
                         val status = statusTransaction(binder, SearchWorkerIpcV2.CANCEL_ROUND) { it.writeWorkerIdentity(identity, network) }

@@ -16,10 +16,11 @@ class PreconnectBinderPortJointTest {
     @Test fun innerTimeoutBeforeOuterStillStartsRecovery(): Unit = exercise(Order.INNER_FIRST)
     @Test fun outerTimeoutThenAdapterCancelStillDrainsOpen(): Unit = exercise(Order.OUTER_FIRST)
     @Test fun adapterCancelBeforeTimeoutDrainsBothWaits(): Unit = exercise(Order.CANCEL_FIRST)
+    @Test fun cancelDeadlineBeforeFenceStaysUnknownAfterFence(): Unit = exercise(Order.CANCEL_DEADLINE_FIRST)
     @Test fun unexpectedLateWaitFailureRemainsUnknown(): Unit = exercise(Order.WAIT_FAIL)
     @Test fun failedStagedResourceCloseRemainsUnknown(): Unit = exercise(Order.CLOSE_FAIL)
 
-    private enum class Order { INNER_FIRST, OUTER_FIRST, CANCEL_FIRST, WAIT_FAIL, CLOSE_FAIL }
+    private enum class Order { INNER_FIRST, OUTER_FIRST, CANCEL_FIRST, CANCEL_DEADLINE_FIRST, WAIT_FAIL, CLOSE_FAIL }
 
     private fun exercise(order: Order): Unit {
         val clock = AtomicLong(1_000)
@@ -28,13 +29,16 @@ class PreconnectBinderPortJointTest {
         val cancelWaiting = CountDownLatch(1)
         val allowTimeout = CountDownLatch(1)
         val recoveryStarted = CountDownLatch(1)
+        val cancelDeadlineObserved = CountDownLatch(1)
+        val deliverCancelDeadline = CountDownLatch(1)
         val cancelled = CountDownLatch(1)
         val finished = CountDownLatch(1)
         val drainFinished = CountDownLatch(1)
         val openWait = AtomicReference<CountDownLatch>()
         val outcome = AtomicReference<Boolean?>()
         val recoveryStarts = AtomicInteger()
-        val coordinator = FakeCoordinator(waiting, cancelWaiting, release, order == Order.WAIT_FAIL)
+        val coordinator = FakeCoordinator(waiting, cancelWaiting, release, order == Order.WAIT_FAIL,
+            order == Order.CANCEL_DEADLINE_FIRST, cancelDeadlineObserved, deliverCancelDeadline)
         val owner = FakeOwner()
         val identity = WorkerIdentityV1(1, 2uL, 1, 3)
         val network = SearchNetworkV1(4, 5)
@@ -44,6 +48,7 @@ class PreconnectBinderPortJointTest {
             coordinator, owner, duplicate, identity, network, drain,
             onPreconnectTimeout = {
                 recoveryStarts.incrementAndGet()
+                coordinator.supervised = true
                 drain.seal(1) { outcome.set(it != null); drainFinished.countDown() }.also { recoveryStarted.countDown() }
             },
             provenFrameBound = 1024, provenReplyBound = 1024,
@@ -55,7 +60,7 @@ class PreconnectBinderPortJointTest {
             awaitBounded = { done, millis ->
                 if (done === openWait.get() || openWait.compareAndSet(null, done)) {
                     check(waiting.await(3, TimeUnit.SECONDS))
-                    if (order == Order.CANCEL_FIRST) check(allowTimeout.await(3, TimeUnit.SECONDS))
+                    if (order == Order.CANCEL_FIRST || order == Order.CANCEL_DEADLINE_FIRST) check(allowTimeout.await(3, TimeUnit.SECONDS))
                     clock.set(2_000)
                     if (order == Order.INNER_FIRST) {
                         release.countDown()
@@ -70,8 +75,7 @@ class PreconnectBinderPortJointTest {
                 configuration: PrivateInputV1, startupDeadlineElapsedMillis: Long, cleanupMillis: Long): WorkerOpenV2 =
                 port.openUntil(id, net, lease, configuration, startupDeadlineElapsedMillis, cleanupMillis)
             override fun cancelUntil(id: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): Unit {
-                port.cancelUntil(id, cleanupDeadlineElapsedMillis)
-                cancelled.countDown()
+                try { port.cancelUntil(id, cleanupDeadlineElapsedMillis) } finally { cancelled.countDown() }
             }
             override fun closeUntil(id: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): WorkerCloseV1 =
                 port.closeUntil(id, cleanupDeadlineElapsedMillis)
@@ -86,35 +90,51 @@ class PreconnectBinderPortJointTest {
         }
         worker.start()
         try {
-            if (order == Order.CANCEL_FIRST) {
+            if (order == Order.CANCEL_FIRST || order == Order.CANCEL_DEADLINE_FIRST) {
                 assertTrue(waiting.await(3, TimeUnit.SECONDS))
                 adapter.cancel(3)
                 assertTrue(cancelWaiting.await(3, TimeUnit.SECONDS))
+                if (order == Order.CANCEL_DEADLINE_FIRST) assertTrue(cancelDeadlineObserved.await(3, TimeUnit.SECONDS))
                 allowTimeout.countDown()
                 assertTrue(recoveryStarted.await(3, TimeUnit.SECONDS))
             } else assertTrue(cancelled.await(3, TimeUnit.SECONDS))
             if (order != Order.INNER_FIRST) assertNull(outcome.get())
+            deliverCancelDeadline.countDown()
             release.countDown()
             assertTrue(cancelled.await(3, TimeUnit.SECONDS))
             assertTrue(finished.await(3, TimeUnit.SECONDS))
             assertTrue(drainFinished.await(3, TimeUnit.SECONDS))
             assertEquals(1, recoveryStarts.get())
-            assertEquals(order != Order.WAIT_FAIL && order != Order.CLOSE_FAIL, outcome.get())
-            assertEquals(0, coordinator.quarantines.get())
-            assertEquals(0, owner.quarantines.get())
-        } finally { allowTimeout.countDown(); release.countDown() }
+            assertEquals(order != Order.WAIT_FAIL && order != Order.CLOSE_FAIL && order != Order.CANCEL_DEADLINE_FIRST, outcome.get())
+            if (order == Order.CANCEL_DEADLINE_FIRST) {
+                assertTrue(coordinator.quarantines.get() > 0)
+                assertTrue(owner.quarantines.get() > 0)
+            } else {
+                assertEquals(0, coordinator.quarantines.get())
+                assertEquals(0, owner.quarantines.get())
+            }
+        } finally { allowTimeout.countDown(); deliverCancelDeadline.countDown(); release.countDown() }
     }
 
     private class FakeCoordinator(private val waiting: CountDownLatch, private val cancelWaiting: CountDownLatch,
-        private val release: CountDownLatch, private val failWait: Boolean) : WorkerCoordinatorPort {
+        private val release: CountDownLatch, private val failWait: Boolean, private val earlyCancelDeadline: Boolean,
+        private val cancelDeadlineObserved: CountDownLatch, private val deliverCancelDeadline: CountDownLatch) : WorkerCoordinatorPort {
         val quarantines = AtomicInteger()
         private val waits = AtomicInteger()
+        @Volatile var supervised = false
         override fun bind(): Boolean = true
-        override fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder? {
-            if (waits.incrementAndGet() == 1) waiting.countDown() else cancelWaiting.countDown()
+        override fun awaitConfirmation(deadlineElapsedMillis: Long): WorkerConfirmationWait {
+            val sequence = waits.incrementAndGet()
+            if (sequence == 1) waiting.countDown() else cancelWaiting.countDown()
+            if (sequence == 2 && earlyCancelDeadline) {
+                val observed = WorkerConfirmationWait.Deadline
+                cancelDeadlineObserved.countDown()
+                check(deliverCancelDeadline.await(3, TimeUnit.SECONDS))
+                return observed
+            }
             check(release.await(3, TimeUnit.SECONDS))
             if (failWait) throw IOException("synthetic_wait_failure")
-            return null
+            return if (supervised) WorkerConfirmationWait.SupervisedStop else WorkerConfirmationWait.Deadline
         }
         override fun confirmedBinder(): IBinder? = null
         override fun awaitRetired(deadlineElapsedMillis: Long): Boolean = false
