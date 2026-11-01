@@ -20,6 +20,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 internal enum class SearchLeaseHandoff { CLAIMED, RETURNED, UNKNOWN }
+internal class SearchNetworkPolicyUnavailable : IOException("search_network_policy_unavailable")
 
 // The factory owns one session and the lease/network resources used by it.
 // It must consume profiles synchronously; the producer closes the input.
@@ -45,6 +46,7 @@ internal class SearchSessionProducer(
     private val createSession: (SearchSnapshotV1, SearchOwnerLeaseControl, (Long, SearchProgressV1) -> Unit) -> SearchPhaseSession,
     // Must be a local, nonblocking elapsed-realtime clock, including in tests.
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
+    private val reportNetworkUnavailable: (Long) -> Unit = {},
 ) : SearchSessionPortV4 {
     constructor(
         cleanupMillis: Long,
@@ -254,6 +256,23 @@ internal class SearchSessionProducer(
         val session = try {
             createSession(snapshot, current.sessionLease) { epoch, progress -> progress(current, epoch, progress) }
         } catch (failure: Throwable) {
+            if (failure is SearchNetworkPolicyUnavailable) {
+                try { reportNetworkUnavailable(current.snapshot.sessionGeneration) } catch (_: Exception) { } catch (_: LinkageError) { }
+                val released = cleanup(current) { deadline ->
+                    profiles.close()
+                    if (current.sessionLease.releaseUntil(deadline)) SearchResourceStateV2.RELEASED else SearchResourceStateV2.QUARANTINED
+                }
+                if (released == SearchResourceStateV2.RELEASED) {
+                    val cancelled = synchronized(lock) {
+                        current.resources = released
+                        current.control == Control.CANCEL
+                    }
+                    val terminal = if (cancelled) SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, released, SearchResultFenceV3.CONFIRMED)
+                    else SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch, SearchFailureV1.CAPABILITY_BLOCKED, released, SearchResultFenceV3.CONFIRMED)
+                    finish(current, terminal)
+                } else unknown(current)
+                return
+            }
             try { profiles.close() } catch (_: Exception) { }
             unknown(current)
             rethrowProducerFatal(failure)

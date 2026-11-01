@@ -31,6 +31,7 @@ import com.seraf.vpnsweep.searchworker.SearchOwnerLease
 import com.seraf.vpnsweep.searchworker.SearchOwnerLeaseControl
 import com.seraf.vpnsweep.searchworker.SearchOwnerLock
 import com.seraf.vpnsweep.searchworker.SearchSessionProducer
+import com.seraf.vpnsweep.searchworker.SearchNetworkPolicyUnavailable
 import com.seraf.vpnsweep.searchworker.createSearchWorkerRound
 import com.seraf.vpnsweep.searchworker.openAndroidNetworkOwner
 import com.seraf.vpnsweep.searchstate.SubscriptionController
@@ -60,6 +61,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import com.seraf.vpnsweep.searchui.ScreenEvent
 import com.seraf.vpnsweep.searchui.subscriptionEvent
 import com.seraf.vpnsweep.searchui.searchEvent
+import com.seraf.vpnsweep.searchui.workerOpenEvent
 
 internal class SweepApplication : Application() {
     val integration: AppComposition by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppComposition(this) }
@@ -405,6 +407,11 @@ internal class AppComposition(context: Context) {
         private val producer = SearchSessionProducer(
             cleanupMillis = DEFAULT_CLEANUP_MILLIS,
             createSession = { snapshot, lease, progress -> createSession(snapshot, lease, progress) },
+            reportNetworkUnavailable = { generation ->
+                synchronized(this@AppComposition.lock) {
+                    if (activeSearch?.sessionGeneration == generation) addEvent(ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE)
+                }
+            },
         )
 
         override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
@@ -574,14 +581,15 @@ internal class AppComposition(context: Context) {
             val digest = coreLibraryDigest(app)
             val manifest = Mobile.buildDefaultSearchManifest(profiles, digest)
             val cleanupMillis = Mobile.searchManifestCleanupMillis(manifest)
-            val manager = requireNotNull(app.getSystemService(ConnectivityManager::class.java))
+            val manager = app.getSystemService(ConnectivityManager::class.java) ?: throw SearchNetworkPolicyUnavailable()
             val network = when (val opened = openAndroidNetworkOwner(
                 manager,
                 leaseCurrent = lease::mayLoadMobile,
                 stopRoundAndDns = { producer.ownerLost(snapshot.sessionGeneration) },
             )) {
                 is NetworkOwnerOpen.Ready -> opened
-                else -> throw IOException("search_resolver_unavailable")
+                NetworkOwnerOpen.Unavailable -> throw SearchNetworkPolicyUnavailable()
+                NetworkOwnerOpen.Unknown -> throw IOException("search_resolver_unknown")
             }
             val owner = network.owner
             val limits = workerTransportLimits
@@ -602,6 +610,11 @@ internal class AppComposition(context: Context) {
                     )
                 },
                 reportProgress = { progress(snapshot.sessionGeneration, it) },
+                reportKnownFailure = { reason ->
+                    synchronized(this@AppComposition.lock) {
+                        if (activeSearch?.sessionGeneration == snapshot.sessionGeneration) addEvent(workerOpenEvent(reason))
+                    }
+                },
             )
             val session = Mobile.newSearchSession(
                 snapshot.sessionGeneration,

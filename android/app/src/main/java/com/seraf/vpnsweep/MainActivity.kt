@@ -103,6 +103,7 @@ class MainActivity : ComponentActivity() {
                     searchRunning = searchRunning,
                     searchMessage = "",
                     information = ScreenInformation(events = events.toList(), startRejection = searchState.startRejection?.safeCode),
+                    serverSummary = committedServerSummary(subscriptionState),
                     onSearch = {
                         operationMessage = ""
                         if (searchRunning) {
@@ -191,6 +192,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+internal fun committedServerSummary(state: SubscriptionUiState): String =
+    if (state.records.isEmpty()) "Серверы: нет данных"
+    else "Серверы: ${state.records.size} · выбрано ${state.selectedIds.size}"
 
 private fun searchStatus(
     search: SearchUiState,

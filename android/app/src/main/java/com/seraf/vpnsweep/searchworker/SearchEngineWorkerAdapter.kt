@@ -69,6 +69,7 @@ internal class SearchEngineWorkerAdapter(
     private val createRound: (WorkerIdentityV1) -> WorkerRoundClient?,
     private val reportProgress: (SearchProgressV1) -> Unit,
     private val nowNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
+    private val reportKnownFailure: (WorkerCandidateFailureV2) -> Unit = {},
 ) : SearchEngineWorker {
     private enum class State { OPENING, READY, RETIRING, CLOSING }
     private class Round(val identity: WorkerIdentityV1) {
@@ -191,7 +192,10 @@ internal class SearchEngineWorkerAdapter(
                 }
             }
             is WorkerOpenV2.CandidateFailure -> {
-                finishKnownOpen(current, candidateCode(outcome))
+                val code = candidateCode(outcome)
+                val result = finishKnownOpen(current, code)
+                if (result == code) try { reportKnownFailure(outcome.reason) } catch (_: Exception) { } catch (_: LinkageError) { }
+                result
             }
             is WorkerOpenV2.Interrupted -> {
                 finishKnownOpen(current, if (outcome.reason == WorkerInterruptedV2.CANCELLED) Mobile.SearchWorkerCancelled else Mobile.SearchWorkerDeadline)

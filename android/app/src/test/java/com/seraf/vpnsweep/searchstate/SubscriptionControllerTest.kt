@@ -2,6 +2,7 @@ package com.seraf.vpnsweep.searchstate
 
 import com.seraf.vpnsweep.AcceptedSubscriptionReceiptV1
 import com.seraf.vpnsweep.recoverOwnerBusyForSelection
+import com.seraf.vpnsweep.committedServerSummary
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
 import com.seraf.vpnsweep.resultactivation.MemorySearchCompletionReceiptStorage
 import com.seraf.vpnsweep.resultactivation.SearchCompletionReceiptStorage
@@ -21,6 +22,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SubscriptionControllerTest {
+    @Test
+    fun serverSummaryFollowsCommittedSnapshotAcrossRefreshAndInterruptedSearch(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val controller = SubscriptionController(port, fixture.composition, { ResultRevision("1", "1") }, { ResultRevision("1", "2") })
+        assertEquals("Серверы: нет данных", committedServerSummary(controller.state.value))
+        controller.load("synthetic")
+        val snapshot = Snapshot(listOf(record("a", true), record("b", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+        assertEquals("Серверы: 2 · выбрано 0", committedServerSummary(controller.state.value))
+        assertTrue(controller.select(setOf("a")))
+        assertEquals("Серверы: 2 · выбрано 1", committedServerSummary(controller.state.value))
+        controller.load("synthetic")
+        port.observer!!.onFailure(2, SubscriptionFailureV1.TIMEOUT)
+        assertEquals("Серверы: 2 · выбрано 1", committedServerSummary(controller.state.value))
+        controller.load("synthetic")
+        controller.cancel()
+        val stale = Snapshot(listOf(record("stale", true)))
+        port.observer!!.onParsed(3, SubscriptionBatchStatusV1.HAS_SUPPORTED, stale)
+        assertTrue(stale.closed)
+        assertEquals("Серверы: 2 · выбрано 1", committedServerSummary(controller.state.value))
+        fixture.runtime.result = SearchStartV3.UNKNOWN
+        assertEquals(SearchStartV3.UNKNOWN, controller.startSelected())
+        assertEquals("Серверы: 2 · выбрано 1", committedServerSummary(controller.state.value))
+    }
+
     @Test
     fun productionSelectionRecoveryChecksReceiptAndRevisionBeforeClear(): Unit {
         val fixture = Fixture()

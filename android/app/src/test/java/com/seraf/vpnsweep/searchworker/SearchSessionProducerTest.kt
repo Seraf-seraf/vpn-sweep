@@ -131,6 +131,91 @@ class SearchSessionProducerTest {
         return this
     }
 
+    @Test fun knownNetworkUnavailableReleasesBeforeTerminalAndAllowsRetry(): Unit {
+        val owner = Owner()
+        val events = Collections.synchronizedList(mutableListOf<Long>())
+        val producer = SearchSessionProducer(2_000,
+            { _, _, _ -> throw SearchNetworkPolicyUnavailable() },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, events::add).withOfferedLease(owner.initialLease)
+        val input = Input()
+        val observer = Observer()
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(input), 1, observer))
+        assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
+        val terminal = observer.terminals.single() as SearchTerminalV3.Stopped
+        assertEquals(SearchFailureV1.CAPABILITY_BLOCKED, terminal.reason)
+        assertEquals(SearchResourceStateV2.RELEASED, terminal.resources)
+        assertEquals(SearchResultFenceV3.CONFIRMED, terminal.resultFence)
+        assertEquals(1, input.closed.get())
+        assertEquals(listOf(7L), events.toList())
+        assertFalse(owner.admissionAvailable())
+        assertTrue(accept(producer, terminal))
+        assertTrue(owner.admissionAvailable())
+        val next = Owner()
+        val nextObserver = Observer()
+        assertEquals(SearchLeaseHandoff.CLAIMED, producer.offerLease(next.initialLease))
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, nextObserver))
+        assertTrue(nextObserver.terminal.await(3, TimeUnit.SECONDS))
+        assertTrue(accept(producer, nextObserver.terminals.single()))
+    }
+
+    @Test fun knownNetworkUnavailableWithUnknownInputCloseCannotRetry(): Unit {
+        val owner = Owner()
+        val events = Collections.synchronizedList(mutableListOf<Long>())
+        val producer = SearchSessionProducer(2_000,
+            { _, _, _ -> throw SearchNetworkPolicyUnavailable() },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, events::add).withOfferedLease(owner.initialLease)
+        val observer = Observer()
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input(failClose = true)), 1, observer))
+        assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
+        val terminal = observer.terminals.single() as SearchTerminalV3.Stopped
+        assertEquals(SearchResultFenceV3.UNKNOWN, terminal.resultFence)
+        assertEquals(listOf(7L), events.toList())
+        assertFalse(accept(producer, terminal))
+        assertFalse(owner.admissionAvailable())
+        assertEquals(SearchStartV3.BUSY, producer.start(snapshot(Input()), 1, Observer()))
+    }
+
+    @Test fun cancelledNetworkBootstrapReportsObservedReasonWithoutEnablingRetry(): Unit {
+        val owner = Owner()
+        val entered = CountDownLatch(1)
+        val finish = CountDownLatch(1)
+        val events = Collections.synchronizedList(mutableListOf<Long>())
+        val producer = SearchSessionProducer(2_000,
+            { _, _, _ -> entered.countDown(); check(finish.await(2, TimeUnit.SECONDS)); throw SearchNetworkPolicyUnavailable() },
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, events::add).withOfferedLease(owner.initialLease)
+        val observer = Observer()
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            producer.cancel(7, 1)
+        } finally { finish.countDown() }
+        assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
+        assertTrue(observer.terminals.single() is SearchTerminalV3.Cancelled)
+        assertEquals(listOf(7L), events.toList())
+        assertFalse(owner.admissionAvailable())
+        assertTrue(accept(producer, observer.terminals.single()))
+    }
+
+    @Test fun stoppedTerminalNeedsConfirmedReleaseBeforeNextSession(): Unit {
+        val owner = Owner().apply { status = "failed" }
+        val observer = Observer()
+        val producer = producer(owner)
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
+        assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
+        val terminal = observer.terminals.single() as SearchTerminalV3.Stopped
+        assertEquals(SearchResourceStateV2.RELEASED, terminal.resources)
+        assertEquals(SearchResultFenceV3.CONFIRMED, terminal.resultFence)
+        assertFalse(owner.admissionAvailable())
+        assertTrue(accept(producer, terminal))
+        assertTrue(owner.admissionAvailable())
+        val next = Owner()
+        val nextObserver = Observer()
+        assertEquals(SearchLeaseHandoff.CLAIMED, producer.offerLease(next.initialLease))
+        assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, nextObserver))
+        assertTrue(nextObserver.terminal.await(3, TimeUnit.SECONDS))
+        assertTrue(accept(producer, nextObserver.terminals.single()))
+    }
+
     @Test fun startWithoutLeaseDoesNotConsumeProfilesOrCallFactory(): Unit {
         val owner = Owner()
         val input = Input()

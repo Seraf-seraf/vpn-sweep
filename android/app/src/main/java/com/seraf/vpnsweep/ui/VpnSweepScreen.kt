@@ -79,6 +79,9 @@ private val Outline = SweepColors.outline
 private val AccentText = SweepColors.onAccent
 private val ControlShape = RoundedCornerShape(12.dp)
 
+internal fun informationPaneHeight(viewportHeight: Dp): Dp =
+    (viewportHeight * 0.33f).coerceIn(0.dp, 220.dp)
+
 @Composable
 internal fun VpnSweepScreenContent(
     state: VpnState,
@@ -95,6 +98,7 @@ internal fun VpnSweepScreenContent(
     searchMessage: String = "Подбор настроек пока недоступен",
     onSearch: () -> Unit = {},
     information: ScreenInformation = ScreenInformation(),
+    serverSummary: String = "Серверы: нет данных",
 ) {
     val powerEnabled = !importing && state.phase != VpnPhase.STOPPING &&
         (selected || state.phase == VpnPhase.CONNECTING || state.phase == VpnPhase.RUNNING)
@@ -113,10 +117,11 @@ internal fun VpnSweepScreenContent(
         else -> "Нажмите, чтобы подключить VPN"
     }
 
-    Box(Modifier.fillMaxSize().background(ScreenBackground), contentAlignment = Alignment.TopCenter) {
+    BoxWithConstraints(Modifier.fillMaxSize().background(ScreenBackground).windowInsetsPadding(contentWindowInsets), contentAlignment = Alignment.TopCenter) {
+        val paneHeight = informationPaneHeight(maxHeight)
+        val powerSize = if (maxHeight < 700.dp) 104.dp else 176.dp
         Column(
             modifier = Modifier
-                .windowInsetsPadding(contentWindowInsets)
                 .widthIn(max = 600.dp)
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
@@ -133,7 +138,7 @@ internal fun VpnSweepScreenContent(
             Spacer(Modifier.height(16.dp))
             BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                 PowerControl(
-                    size = minOf(maxWidth, 176.dp),
+                    size = minOf(maxWidth, powerSize),
                     enabled = powerEnabled,
                     action = powerAction,
                     status = state.message,
@@ -173,7 +178,7 @@ internal fun VpnSweepScreenContent(
                 enabled = sourceEnabled,
             )
             Spacer(Modifier.height(8.dp))
-            ServerButton(onClick = onServers, enabled = sourceEnabled)
+            ServerButton(onClick = onServers, enabled = sourceEnabled, summary = serverSummary)
             Spacer(Modifier.height(8.dp))
             SweepButton(
                 text = if (searchRunning) "Отменить подбор" else "Подобрать настройки",
@@ -185,7 +190,7 @@ internal fun VpnSweepScreenContent(
                 Text(text = searchMessage, modifier = Modifier.fillMaxWidth(), color = SecondaryText, fontSize = 14.sp)
             }
             Spacer(Modifier.height(16.dp))
-            InformationPanel(information = information)
+            InformationPanel(information = information, paneHeight = paneHeight)
         }
     }
 }
@@ -286,7 +291,7 @@ private fun SweepButton(
 }
 
 @Composable
-private fun ServerButton(onClick: () -> Unit, enabled: Boolean = true) {
+private fun ServerButton(onClick: () -> Unit, enabled: Boolean = true, summary: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -301,15 +306,17 @@ private fun ServerButton(onClick: () -> Unit, enabled: Boolean = true) {
     ) {
         SweepGlyph(SweepIcon.Server, Accent)
         Spacer(Modifier.width(16.dp))
-        Text("Серверы: нет данных", Modifier.weight(1f), color = PrimaryText, fontSize = 16.sp)
+        Text(summary, Modifier.weight(1f), color = PrimaryText, fontSize = 16.sp)
         Spacer(Modifier.width(8.dp))
         SweepGlyph(SweepIcon.ChevronRight, Accent)
     }
 }
 
 @Composable
-internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformation = ScreenInformation()) {
+internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformation = ScreenInformation(), paneHeight: Dp = 220.dp, parametersInitiallyExpanded: Boolean = false) {
     var selectedTab by rememberSaveable { mutableStateOf(initialTab) }
+    val journalScroll = rememberScrollState()
+    val parametersScroll = rememberScrollState()
     val presentation = presentInformation(information)
     Column(
         modifier = Modifier
@@ -325,14 +332,16 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .height(paneHeight)
                 .border(1.dp, Outline, ControlShape)
                 .background(ScreenBackground, ControlShape)
+                .verticalScroll(if (selectedTab == 0) journalScroll else parametersScroll)
                 .padding(16.dp),
         ) {
             if (selectedTab == 0) {
                 EventLogPanel(presentation.events)
             } else {
-                ParametersPanel(applied = presentation.applied)
+                ParametersPanel(applied = presentation.applied, initialAllExpanded = parametersInitiallyExpanded)
             }
         }
     }
@@ -346,9 +355,7 @@ internal fun EventLogPanel(entries: List<EventLogEntry>) {
         Text("Журнал событий", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
     }
     Spacer(Modifier.height(16.dp))
-    Column(
-        Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 200.dp).verticalScroll(rememberScrollState()),
-    ) {
+    Column(Modifier.fillMaxWidth()) {
         if (entries.isEmpty()) {
             Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
         } else {
@@ -382,20 +389,20 @@ private fun InformationTab(text: String, selected: Boolean, onClick: () -> Unit,
 }
 
 @Composable
-internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: AppliedParameterValues? = null) {
+internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: AppliedParameterValues? = null, initialAllExpanded: Boolean = false) {
     Text("Параметры подбора", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(8.dp))
     if (applied == null) {
         Text("Применённые параметры пока недоступны", color = SecondaryText, fontSize = 14.sp)
         Spacer(Modifier.height(12.dp))
     }
-    ParameterGroup("Fragment", SweepIcon.Fragment, listOf("Фрагментация", "Пакеты", "Длина", "Интервал", "Макс. частей"), initialFragmentExpanded, applied?.fragment)
+    ParameterGroup("Fragment", SweepIcon.Fragment, listOf("Фрагментация", "Пакеты", "Длина", "Интервал", "Макс. частей"), initialFragmentExpanded || initialAllExpanded, applied?.fragment)
     Spacer(Modifier.height(8.dp))
-    ParameterGroup("Mux", SweepIcon.Mux, listOf("Mux", "TCP concurrency", "XUDP concurrency", "UDP 443"), values = applied?.mux)
+    ParameterGroup("Mux", SweepIcon.Mux, listOf("Mux", "TCP concurrency", "XUDP concurrency", "UDP 443"), initialExpanded = initialAllExpanded, values = applied?.mux)
     Spacer(Modifier.height(8.dp))
-    ParameterGroup("TLS fingerprint", SweepIcon.Fingerprint, listOf("Fingerprint"), values = applied?.fingerprint)
+    ParameterGroup("TLS fingerprint", SweepIcon.Fingerprint, listOf("Fingerprint"), initialExpanded = initialAllExpanded, values = applied?.fingerprint)
     Spacer(Modifier.height(8.dp))
-    ParameterGroup("Шум UDP", SweepIcon.Noise, listOf("Шум", "Записи"), values = applied?.udpNoise)
+    ParameterGroup("Шум UDP", SweepIcon.Noise, listOf("Шум", "Записи"), initialExpanded = initialAllExpanded, values = applied?.udpNoise)
 }
 
 @Composable

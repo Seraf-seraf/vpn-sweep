@@ -91,12 +91,8 @@ internal enum class SubscriptionDialogStatus {
 @Composable
 internal fun SubscriptionDialogHost(onDismiss: () -> Unit, onSubmit: (String) -> Boolean): Unit {
     var link by remember { mutableStateOf("") }
-    val valid = remember(link) { isValidSubscriptionUrl(link) }
-    val status = when {
-        link.isBlank() -> SubscriptionDialogStatus.Empty
-        !valid -> SubscriptionDialogStatus.InvalidUrl
-        else -> SubscriptionDialogStatus.Input
-    }
+    var submitFailed by remember { mutableStateOf(false) }
+    val status = subscriptionInputStatus(link, submitFailed)
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -113,25 +109,40 @@ internal fun SubscriptionDialogHost(onDismiss: () -> Unit, onSubmit: (String) ->
             SubscriptionDialogContent(
                 link = link,
                 status = status,
-                onLinkChange = { link = it },
+                onLinkChange = { link = it; submitFailed = false },
                 onDismiss = onDismiss,
                 onSubmit = {
                     if (onSubmit(link.trim())) {
                         link = ""
                         onDismiss()
-                    }
+                    } else submitFailed = true
                 },
             )
         }
     }
 }
 
+internal fun subscriptionInputStatus(link: String, submitFailed: Boolean): SubscriptionDialogStatus = when {
+    link.isBlank() -> SubscriptionDialogStatus.Empty
+    !isValidSubscriptionUrl(link) -> SubscriptionDialogStatus.InvalidUrl
+    submitFailed -> SubscriptionDialogStatus.Unavailable
+    else -> SubscriptionDialogStatus.Input
+}
+
+internal fun subscriptionCanSubmit(link: String, status: SubscriptionDialogStatus): Boolean = when (status) {
+    SubscriptionDialogStatus.Input, SubscriptionDialogStatus.NetworkError,
+    SubscriptionDialogStatus.MalformedData, SubscriptionDialogStatus.Unavailable -> isValidSubscriptionUrl(link)
+    else -> false
+}
+
 internal fun isValidSubscriptionUrl(value: String): Boolean {
     return try {
-        val uri = URI(value.trim())
-        (uri.scheme.equals("http", ignoreCase = true) ||
-            uri.scheme.equals("https", ignoreCase = true)) &&
-            !uri.host.isNullOrEmpty() && (uri.port == -1 || uri.port in 0..65535)
+        val raw = value.trim()
+        if ('#' in raw) return false
+        val uri = URI(raw)
+        uri.scheme.equals("https", ignoreCase = true) && uri.rawUserInfo == null &&
+            !uri.isOpaque && !uri.host.isNullOrEmpty() && uri.rawAuthority?.endsWith(':') != true &&
+            (uri.port == -1 || uri.port in 1..65535)
     } catch (_: URISyntaxException) {
         false
     }
@@ -146,12 +157,7 @@ internal fun SubscriptionDialogContent(
     onSubmit: () -> Unit,
 ): Unit {
     val loading = status == SubscriptionDialogStatus.Loading
-    val canSubmit = when (status) {
-        SubscriptionDialogStatus.Input,
-        SubscriptionDialogStatus.NetworkError,
-        SubscriptionDialogStatus.MalformedData -> isValidSubscriptionUrl(link)
-        else -> false
-    }
+    val canSubmit = subscriptionCanSubmit(link, status)
     val focusManager = LocalFocusManager.current
     val submit: () -> Unit = {
         if (canSubmit) {

@@ -95,6 +95,32 @@ internal class SearchEngineWorkerAdapterTest {
         adapter.open(42, 1, 1, generation, "profile".toByteArray(), "params".toByteArray(), 10_000, 5_000)
 
     @Test
+    fun knownOpenReasonIsEmittedOnlyAfterRetirementAndAllowsNextRound(): Unit {
+        val port = Port()
+        val events = mutableListOf<WorkerCandidateFailureV2>()
+        var retired = false
+        port.openResult = checkNotNull(candidateOpenAfterRetirement(Mobile.SearchWorkerCandidateStartFailed) { retired = true; true })
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, 1024,
+            { WorkerRoundClient(port, Lease()) }, {}, System::nanoTime, events::add)
+        assertEquals(Mobile.SearchWorkerCandidateStartFailed, open(adapter))
+        assertTrue(retired)
+        assertEquals(listOf(WorkerCandidateFailureV2.CORE_START_FAILED), events)
+        port.openResult = WorkerOpenV2.Ready
+        assertEquals(Mobile.SearchWorkerReady, open(adapter, 2))
+    }
+
+    @Test
+    fun unknownRetirementBlocksNextRoundAndEmitsNoKnownReason(): Unit {
+        val port = Port().apply { openResult = checkNotNull(candidateOpenAfterRetirement(Mobile.SearchWorkerCandidateStartFailed) { false }) }
+        val events = mutableListOf<WorkerCandidateFailureV2>()
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, 1024,
+            { WorkerRoundClient(port, Lease()) }, {}, System::nanoTime, events::add)
+        assertEquals(Mobile.SearchWorkerCleanupIncomplete, open(adapter))
+        assertTrue(events.isEmpty())
+        assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
+    }
+
+    @Test
     fun absentProvenBoundDeniesBeforeCreatingAnyWorker(): Unit {
         val creations = AtomicInteger()
         val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, null,

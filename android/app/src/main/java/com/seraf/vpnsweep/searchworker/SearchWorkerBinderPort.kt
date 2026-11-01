@@ -16,6 +16,7 @@ import com.seraf.vpnsweep.searchprotocol.WorkerFatalV2
 import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
 import com.seraf.vpnsweep.searchprotocol.WorkerInterruptedV2
 import com.seraf.vpnsweep.searchprotocol.WorkerOpenV2
+import com.seraf.vpnsweep.searchprotocol.WorkerCandidateFailureV2
 import com.seraf.vpnsweep.searchprotocol.WorkerOperationV1
 import com.seraf.vpnsweep.searchprotocol.WorkerReplyV1
 import java.io.FilterInputStream
@@ -46,6 +47,21 @@ private const val FRAME_HEADER_BYTES = 16
 private const val FRAME_BUFFER_BYTES = 8 * 1024
 private const val MAX_CLEANUP_MILLIS = 60_000L
 private const val CANCELLED_BEFORE_BIND = -1
+
+internal fun candidateOpenAfterRetirement(status: Long, retire: () -> Boolean): WorkerOpenV2? {
+    val flag = Mobile.SearchWorkerRetryableFlag
+    val base = status and flag.inv()
+    val reason = when (base) {
+        Mobile.SearchWorkerCandidateConfigRejected -> WorkerCandidateFailureV2.CONFIG_REJECTED
+        Mobile.SearchWorkerCandidateStartFailed -> WorkerCandidateFailureV2.CORE_START_FAILED
+        Mobile.SearchWorkerCandidateStartTimeout -> WorkerCandidateFailureV2.CORE_START_TIMEOUT
+        Mobile.SearchWorkerCandidateExitedBeforeReady -> WorkerCandidateFailureV2.CORE_EXITED_BEFORE_READY
+        else -> return null
+    }
+    val retired = try { retire() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+    return if (retired) WorkerOpenV2.CandidateFailure(reason, status and flag != 0L)
+    else WorkerOpenV2.Fatal(WorkerFatalV2.CLEANUP_INCOMPLETE)
+}
 
 internal class SearchWorkerBinderPort(
     private val coordinator: SearchWorkerCoordinator,
@@ -157,6 +173,22 @@ internal class SearchWorkerBinderPort(
             else WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
         }
         if (status.toLong() != Mobile.SearchWorkerReady) {
+            val known = candidateOpenAfterRetirement(status.toLong()) {
+                val canRetire = synchronized(lock) {
+                    if (state != State.OPENING || cancelled || cancelPending) false else {
+                        state = State.READY
+                        true
+                    }
+                }
+                if (!canRetire) return@candidateOpenAfterRetirement false
+                val now = SystemClock.elapsedRealtime()
+                val cleanupDeadline = try { minOf(deadline, Math.addExact(now, cleanupMillis)) } catch (_: ArithmeticException) { return@candidateOpenAfterRetirement false }
+                now >= 0 && cleanupDeadline > now && closeUntil(identity, cleanupDeadline) == WorkerCloseV1.CLEAN_AND_DEAD
+            }
+            if (known != null) {
+                if (known is WorkerOpenV2.Fatal) failClosed()
+                return known
+            }
             failClosed()
             return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY)
         }

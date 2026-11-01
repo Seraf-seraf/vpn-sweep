@@ -5,8 +5,9 @@ import com.seraf.vpnsweep.searchstate.SubscriptionPhase
 import com.seraf.vpnsweep.searchstate.SearchUiState
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
+import com.seraf.vpnsweep.searchprotocol.WorkerCandidateFailureV2
 
-enum class ScreenEvent { SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CANCEL_REQUESTED, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
+enum class ScreenEvent { SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CANCEL_REQUESTED, SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE, WORKER_CONFIG_REJECTED, WORKER_START_FAILED, WORKER_START_TIMEOUT, WORKER_EXITED_EARLY, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
 enum class Fingerprint(val wireValue: String) {
     CHROME("chrome"), FIREFOX("firefox"), SAFARI("safari"), IOS("ios"), ANDROID("android"),
     EDGE("edge"), BROWSER_360("360"), QQ("qq"), RANDOM("random"), RANDOMIZED("randomized"),
@@ -73,6 +74,13 @@ internal fun subscriptionOutcomeEvent(outcome: SubscriptionStartV1, phase: Subsc
     SubscriptionStartV1.REJECTED -> if (phase != SubscriptionPhase.FAILED) ScreenEvent.SUBSCRIPTION_FAILED else null
 }
 
+internal fun workerOpenEvent(reason: WorkerCandidateFailureV2): ScreenEvent = when (reason) {
+    WorkerCandidateFailureV2.CONFIG_REJECTED -> ScreenEvent.WORKER_CONFIG_REJECTED
+    WorkerCandidateFailureV2.CORE_START_FAILED -> ScreenEvent.WORKER_START_FAILED
+    WorkerCandidateFailureV2.CORE_START_TIMEOUT -> ScreenEvent.WORKER_START_TIMEOUT
+    WorkerCandidateFailureV2.CORE_EXITED_BEFORE_READY -> ScreenEvent.WORKER_EXITED_EARLY
+}
+
 internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.SUBSCRIPTION_LOADING -> "Загрузка подписки"
     ScreenEvent.SUBSCRIPTION_READY -> "Подписка обработана"
@@ -86,6 +94,11 @@ internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.SEARCH_REJECTED -> "Не удалось начать подбор"
     ScreenEvent.SEARCH_UNKNOWN -> "Результат запуска подбора неизвестен"
     ScreenEvent.SEARCH_INTERRUPTED -> "Подбор прерван; повторный запуск заблокирован"
+    ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE -> "search_init:network_policy_unavailable"
+    ScreenEvent.WORKER_CONFIG_REJECTED -> "worker_open:config_rejected"
+    ScreenEvent.WORKER_START_FAILED -> "worker_open:core_start_failed"
+    ScreenEvent.WORKER_START_TIMEOUT -> "worker_open:core_start_timeout"
+    ScreenEvent.WORKER_EXITED_EARLY -> "worker_open:core_exited_before_ready"
     ScreenEvent.SEARCH_CANCEL_REQUESTED -> "Отмена подбора"
     ScreenEvent.SEARCH_STARTED -> "Подбор начат"
     ScreenEvent.ATTEMPT_STARTED -> "Попытка начата"

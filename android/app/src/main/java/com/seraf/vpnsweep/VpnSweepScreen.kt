@@ -27,6 +27,7 @@ fun VpnSweepScreen(
     searchMessage: String = "Подбор настроек пока недоступен",
     onSearch: () -> Unit = {},
     information: ScreenInformation = ScreenInformation(),
+    serverSummary: String = "Серверы: нет данных",
 ): Unit {
     VpnSweepScreenContent(
         state = state,
@@ -43,5 +44,6 @@ fun VpnSweepScreen(
         searchMessage = searchMessage,
         onSearch = onSearch,
         information = information,
+        serverSummary = serverSummary,
     )
 }

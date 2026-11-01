@@ -436,8 +436,8 @@ internal class SearchWorkerService : Service() {
             else Mobile.SearchWorkerCleanupIncomplete.toInt()
         }
         val status = try {
-            embedded.open(frame.profile, frame.parameters, startupMillis, cleanupMillis)
-            Mobile.SearchWorkerReady.toInt()
+            val value = embedded.openStatus(frame.profile, frame.parameters, startupMillis, cleanupMillis)
+            if (value in 0..Int.MAX_VALUE.toLong()) value.toInt() else Mobile.SearchWorkerDeliveryUnknown.toInt()
         } catch (_: Exception) {
             Mobile.SearchWorkerDeliveryUnknown.toInt()
         } catch (_: LinkageError) {
