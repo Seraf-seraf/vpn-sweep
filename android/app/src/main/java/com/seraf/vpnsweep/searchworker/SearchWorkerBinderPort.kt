@@ -153,6 +153,8 @@ internal class SearchWorkerBinderPort(
     },
     private val onCloseRecovery: () -> Boolean = { false },
     private val closeTransactionOverride: ((IBinder, SearchWorkerLocalDrain.Ticket) -> Int)? = null,
+    private val beforeConnectedRecoveryAdmission: () -> Unit = {},
+    private val beforeCloseAdmission: () -> Unit = {},
 ) : DeadlineWorkerPort {
     private enum class State { NEW, OPENING, READY, CLOSING, RECOVERY_PENDING, RETIRED, QUARANTINED }
     private enum class CallDisposition { ACCEPT, DEADLINE, CANCELLED, RECOVERY, UNKNOWN }
@@ -181,11 +183,14 @@ internal class SearchWorkerBinderPort(
 
     private fun beginConnectedRecovery(identity: WorkerIdentityV1, pendingCancel: Boolean): Boolean {
         if (identity != this.identity) return false
-        if (synchronized(lock) { state == State.CLOSING || (state == State.RECOVERY_PENDING && closeRecovery) }) {
-            return beginCloseRecovery(identity)
-        }
+        beforeConnectedRecoveryAdmission()
         var first = false
+        var useCloseRecovery = false
         val start = synchronized(lock) {
+            if (state == State.CLOSING || (state == State.RECOVERY_PENDING && closeRecovery)) {
+                useCloseRecovery = true
+                return@synchronized null
+            }
             if (state == State.RECOVERY_PENDING && !connectedRecovery) return recoveryIntent?.requested() == true
             if (state == State.RECOVERY_PENDING && connectedRecovery) return@synchronized recoveryStart
             val permitted = (!cancelled && !cancelPending) || (pendingCancel && cancelled)
@@ -203,7 +208,9 @@ internal class SearchWorkerBinderPort(
                 callWake?.countDown()
                 value
             }
-        } ?: return false
+        }
+        if (useCloseRecovery) return beginCloseRecovery(identity)
+        if (start == null) return false
         if (!first) return true
         val scheduled = try {
             scheduleRecoveryStart {
@@ -708,10 +715,11 @@ internal class SearchWorkerBinderPort(
 
     override fun closeUntil(identity: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): WorkerCloseV1 {
         if (identity != this.identity) return WorkerCloseV1.QUARANTINED.also { failClosed() }
-        if (synchronized(lock) { state == State.RECOVERY_PENDING }) return WorkerCloseV1.QUARANTINED
+        beforeCloseAdmission()
         var effectiveDeadline = cleanupDeadlineElapsedMillis
         val disposition = synchronized(lock) {
             when {
+                state == State.RECOVERY_PENDING -> return WorkerCloseV1.QUARANTINED
                 state == State.RETIRED -> 1
                 state != State.READY || inFlight || pendingReply != null || cancelPending -> 0
                 else -> {

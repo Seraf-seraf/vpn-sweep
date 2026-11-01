@@ -291,6 +291,95 @@ class PreconnectProducerJointTest {
 
     @Test fun originalDeathCannotReleaseUntilCloseParcelRecycleFinishes(): Unit = exerciseCloseRecovery("inner", waitInRecycle = true)
 
+    @Test fun deathRacingCloseAdmissionRecoversAfterDrain(): Unit {
+        val test = Harness(temporary.newFolder(), connectedMode = true, closeRace = "deathAtCloseAdmission", virtualClock = true,
+            productionTerminalGate = true)
+        val deathReturned = CountDownLatch(1)
+        val deathFailure = AtomicReference<Throwable?>()
+        test.installSelection()
+        assertEquals(SearchStartV3.ACCEPTED, test.subscriptions.startSelected())
+        try {
+            assertTrue(test.connectedReady.await(3, TimeUnit.SECONDS))
+            assertTrue(test.subscriptions.select(setOf(ID_B)))
+            Thread({
+                try { test.originalDeath.get()!!.invoke() }
+                catch (failure: Throwable) { deathFailure.set(failure) }
+                finally { deathReturned.countDown() }
+            }, "synthetic-worker-death").apply { isDaemon = true }.start()
+            assertTrue(test.connectedRecoveryAdmission.await(3, TimeUnit.SECONDS))
+            test.triggerClose.countDown()
+            assertTrue(test.closeStateEntered.await(3, TimeUnit.SECONDS))
+            test.resumeConnectedRecovery.countDown()
+            assertTrue(deathReturned.await(3, TimeUnit.SECONDS))
+            assertNull(deathFailure.get())
+            assertTrue("death racing CLOSE must start recovery", test.pending.await(3, TimeUnit.SECONDS))
+            test.originalUnbind.get()!!.invoke(true)
+            test.operation.closed(true)
+            test.pump()
+            assertEquals(MarkerState.ACTIVE, test.marker.read())
+            assertEquals(0, test.anchorCloses.get())
+            assertEquals(SearchStartV3.BUSY, test.subscriptions.startSelected())
+            test.resumeCloseAfterTransition.countDown()
+            assertTrue(test.closeReturned.await(3, TimeUnit.SECONDS))
+            test.returnRun.countDown()
+            test.pumpUntilFirstTerminal()
+            assertEquals(MarkerState.CLEAR, test.marker.read())
+            assertEquals(1, test.anchorCloses.get())
+            test.blockSecond = true
+            assertEquals(SearchStartV3.ACCEPTED, test.subscriptions.startSelected())
+            assertEquals(setOf(ID_B), test.profilesSelected.get())
+            assertTrue(test.secondEntered.await(3, TimeUnit.SECONDS))
+            test.releaseSecond.countDown()
+            assertTrue(test.secondTerminal.await(3, TimeUnit.SECONDS))
+        } finally {
+            test.triggerClose.countDown()
+            test.resumeConnectedRecovery.countDown()
+            test.resumeCloseAfterTransition.countDown()
+            test.operation.closed(true)
+            test.returnRun.countDown()
+            test.releaseSecond.countDown()
+        }
+    }
+
+    @Test fun timeoutRacingCloseAdmissionRecoversAfterDrain(): Unit {
+        val test = Harness(temporary.newFolder(), connectedMode = true, closeRace = "timeoutAtCloseAdmission", virtualClock = true,
+            productionTerminalGate = true)
+        test.installSelection()
+        assertEquals(SearchStartV3.ACCEPTED, test.subscriptions.startSelected())
+        try {
+            assertTrue(test.connectedReady.await(3, TimeUnit.SECONDS))
+            assertTrue(test.subscriptions.select(setOf(ID_B)))
+            test.triggerClose.countDown()
+            assertTrue(test.closeAdmission.await(3, TimeUnit.SECONDS))
+            assertTrue(test.pending.await(3, TimeUnit.SECONDS))
+            test.originalUnbind.get()!!.invoke(true)
+            test.originalDeath.get()!!.invoke()
+            test.operation.closed(true)
+            test.pump()
+            assertEquals(MarkerState.ACTIVE, test.marker.read())
+            assertEquals(0, test.anchorCloses.get())
+            assertEquals(SearchStartV3.BUSY, test.subscriptions.startSelected())
+            test.resumeCloseRecovery.countDown()
+            assertTrue(test.closeReturned.await(3, TimeUnit.SECONDS))
+            test.returnRun.countDown()
+            test.pumpUntilFirstTerminal()
+            assertEquals("confirmed late cleanup must release the marker", MarkerState.CLEAR, test.marker.read())
+            assertEquals(1, test.anchorCloses.get())
+            test.blockSecond = true
+            assertEquals(SearchStartV3.ACCEPTED, test.subscriptions.startSelected())
+            assertEquals(setOf(ID_B), test.profilesSelected.get())
+            assertTrue(test.secondEntered.await(3, TimeUnit.SECONDS))
+            test.releaseSecond.countDown()
+            assertTrue(test.secondTerminal.await(3, TimeUnit.SECONDS))
+        } finally {
+            test.triggerClose.countDown()
+            test.resumeCloseRecovery.countDown()
+            test.operation.closed(true)
+            test.returnRun.countDown()
+            test.releaseSecond.countDown()
+        }
+    }
+
     private fun exerciseCloseRecovery(order: String, waitInRecycle: Boolean = false): Unit {
         val test = Harness(temporary.newFolder(), connectedMode = true, closeRace = order, virtualClock = true,
             productionTerminalGate = true, closeWaitInRecycle = waitInRecycle)
@@ -1643,6 +1732,13 @@ class PreconnectProducerJointTest {
         val connectedReady = CountDownLatch(1)
         val triggerClose = CountDownLatch(1)
         val closeEntered = CountDownLatch(1)
+        val connectedRecoveryAdmission = CountDownLatch(1)
+        val resumeConnectedRecovery = CountDownLatch(1)
+        val closeAdmission = CountDownLatch(1)
+        val resumeCloseRecovery = CountDownLatch(1)
+        val closeStateEntered = CountDownLatch(1)
+        val resumeCloseAfterTransition = CountDownLatch(1)
+        private val firstCloseClock = java.util.concurrent.atomic.AtomicBoolean(true)
         val closeReturned = CountDownLatch(1)
         val closeTaskReturned = CountDownLatch(1)
         val closeEvents = AtomicInteger()
@@ -2114,8 +2210,18 @@ class PreconnectProducerJointTest {
                             finally { cancelTransactionReturned.countDown() }
                         }
                         com.seraf.vpnsweep.core.mobile.Mobile.SearchWorkerReady.toInt()
-                    }, reportServiceFailure = { serviceFailures.add(it) }, nowMillis = portTime::get, awaitBounded = { done, millis ->
-                        if (closeRace != null && connectedReady.count == 0L) {
+                    }, reportServiceFailure = { serviceFailures.add(it) }, nowMillis = {
+                        if (closeRace == "deathAtCloseAdmission" && Thread.currentThread().name == "search-round-close" &&
+                            firstCloseClock.compareAndSet(true, false)
+                        ) {
+                            closeStateEntered.countDown()
+                            check(resumeCloseAfterTransition.await(10, TimeUnit.SECONDS))
+                        }
+                        portTime.get()
+                    }, awaitBounded = { done, millis ->
+                        if (closeRace != null && closeRace != "deathAtCloseAdmission" && closeRace != "timeoutAtCloseAdmission" &&
+                            connectedReady.count == 0L
+                        ) {
                             check(closeEntered.await(3, TimeUnit.SECONDS))
                             when (closeRace) {
                                 "outer", "deathBeforeStop" -> check(resumeInnerCloseWait.await(3, TimeUnit.SECONDS))
@@ -2191,13 +2297,27 @@ class PreconnectProducerJointTest {
                             if (closeParcelFails) throw IOException("synthetic_parcel_recycle_failure")
                             true
                         })
+                    }, beforeConnectedRecoveryAdmission = {
+                        if (closeRace == "deathAtCloseAdmission") {
+                            connectedRecoveryAdmission.countDown()
+                            check(resumeConnectedRecovery.await(10, TimeUnit.SECONDS))
+                        }
+                    }, beforeCloseAdmission = {
+                        if (closeRace == "timeoutAtCloseAdmission") {
+                            closeAdmission.countDown()
+                            check(resumeCloseRecovery.await(10, TimeUnit.SECONDS))
+                        }
                     })
                 disconnect.set { recoverConnectedDisconnect({ handler.get()?.invoke() == true }, admission::disconnected) }
                 adapter = SearchEngineWorkerAdapter(1, network, 5_000, 1024, { WorkerRoundClient(actual, prepared) }, {},
                     nowNanos = { if (openingRace == "admittingTimeout" || closeRace != null) portTime.get() * 1_000_000 else System.nanoTime() }, localDrain = drain,
                     reportOperationFailure = { if (it == WorkerOperationFailure.CLOSE) closeEvents.incrementAndGet() },
                     awaitClose = { done, nanos ->
-                        if (closeRace == "outer" || closeRace == "deathBeforeStop") {
+                        if (closeRace == "timeoutAtCloseAdmission") {
+                            check(closeAdmission.await(3, TimeUnit.SECONDS))
+                            portTime.addAndGet(TimeUnit.NANOSECONDS.toMillis(nanos) + 1)
+                            false
+                        } else if (closeRace == "outer" || closeRace == "deathBeforeStop") {
                             check(closeEntered.await(3, TimeUnit.SECONDS))
                             if (closeRace == "deathBeforeStop") check(pending.await(3, TimeUnit.SECONDS))
                             portTime.addAndGet(TimeUnit.NANOSECONDS.toMillis(nanos) + 1)
