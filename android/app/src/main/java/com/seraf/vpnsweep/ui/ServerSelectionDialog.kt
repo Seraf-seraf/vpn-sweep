@@ -96,12 +96,13 @@ internal fun ServerSelectionDialogHost(
     canConfirm: Boolean = true,
     errorMessage: String = "",
     onRefreshAvailability: () -> Unit = {},
+    checking: Boolean = false,
 ): Unit {
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage, onRefreshAvailability)
+        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage, onRefreshAvailability, checking)
     }
 }
 
@@ -114,6 +115,7 @@ internal fun ServerSelectionDialogContent(
     canConfirm: Boolean = true,
     errorMessage: String = "",
     onRefreshAvailability: () -> Unit = {},
+    checking: Boolean = false,
 ): Unit {
     val supportedIds = remember(servers) {
         servers.filter { it.supported }.map { it.id }.toSet()
@@ -214,7 +216,9 @@ internal fun ServerSelectionDialogContent(
                             if (!canConfirm) {
                                 Text("Изменения сохранятся только после подтверждения. Проверьте доступность или вернитесь к подписке.", color = ServerDialogColors.text)
                             }
-                            OutlinedButton(onClick = onRefreshAvailability) { Text("Проверить возможность подбора") }
+                            OutlinedButton(onClick = onRefreshAvailability, enabled = !checking) {
+                                Text(if (checking) "Проверка..." else "Проверить возможность подбора")
+                            }
                         }
                     },
                     footer = {

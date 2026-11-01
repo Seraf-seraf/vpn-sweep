@@ -54,6 +54,9 @@ internal class SubscriptionController(
     private var uncertainSearchInput: PrivateInputV1? = null
 
     @Synchronized
+    fun <T> withRecovery(action: () -> T): T = action()
+
+    @Synchronized
     fun restore(
         snapshot: SubscriptionSnapshotV1,
         selectedIds: Set<String>,

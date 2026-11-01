@@ -4,6 +4,7 @@ import android.content.Context
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
+import com.seraf.vpnsweep.importer.MAX_CONFIG_BYTES
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -13,10 +14,16 @@ import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 
-internal class PrivateResultStorage(context: Context) : ResultStorage {
-    private val root = File(context.noBackupFilesDir, "search-results")
+internal class PrivateResultStorage(
+    private val root: File,
+    private val directorySync: (File) -> Unit,
+) : ResultStorage {
+    constructor(context: Context) : this(File(context.noBackupFilesDir, "search-results"), ::syncResultDirectory)
     private val manifestFile = File(root, "current")
 
     override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String {
@@ -76,6 +83,42 @@ internal class PrivateResultStorage(context: Context) : ResultStorage {
         return readRecord(manifestFile)
     }
 
+    override fun safeForUpgrade(candidate: ResultRevision?): Boolean = try {
+        val rootAttributes = attributes(root)
+        if (rootAttributes == null) true
+        else if (!rootAttributes.isDirectory) false
+        else {
+            val current = attributes(manifestFile)
+            if (current == null) true
+            else if (!current.isRegularFile) false
+            else readManifest()?.let { candidate != it.revision && verifiedGenerationForUpgrade(it) } ?: false
+        }
+    } catch (_: Exception) { false }
+
+    override fun hasVerifiedManifestForUpgrade(): Boolean = try {
+        if (attributes(root)?.isDirectory != true || attributes(manifestFile)?.isRegularFile != true) false
+        else readManifest()?.let(::verifiedGenerationForUpgrade) ?: false
+    } catch (_: Exception) { false }
+
+    override fun verifiedGenerationForUpgrade(manifest: ResultManifest): Boolean = try {
+        val directory = File(root, manifest.generation)
+        if (!validGeneration(manifest.generation) || attributes(root)?.isDirectory != true ||
+            attributes(directory)?.isDirectory != true || attributes(File(directory, "metadata"))?.isRegularFile != true ||
+            attributes(File(directory, "result"))?.isRegularFile != true
+        ) false else {
+            val result = readGeneration(manifest.generation)
+            if (result == null) false else result.input.use { input ->
+                val bytes = input.readNBytes(MAX_CONFIG_BYTES + 1)
+                bytes.isNotEmpty() && bytes.size <= MAX_CONFIG_BYTES && result.revision == manifest.revision &&
+                    result.sha256 == manifest.sha256 && digest(bytes.inputStream()) == manifest.sha256
+            }
+        }
+    } catch (_: Exception) { false }
+
+    private fun attributes(file: File): BasicFileAttributes? = try {
+        Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+    } catch (_: NoSuchFileException) { null }
+
     override fun publish(manifest: ResultManifest): Unit {
         ensureRoot()
         val temporary = File(root, "manifest-${UUID.randomUUID()}")
@@ -130,18 +173,20 @@ internal class PrivateResultStorage(context: Context) : ResultStorage {
         false
     }
 
-    private fun syncDirectory(directory: File): Unit {
+    private fun syncDirectory(directory: File): Unit = directorySync(directory)
+}
+
+private fun syncResultDirectory(directory: File): Unit {
+    try {
+        val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY or OsConstants.O_CLOEXEC, 0)
         try {
-            val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY or OsConstants.O_CLOEXEC, 0)
-            try {
-                if (!OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) throw IOException("directory_invalid")
-                Os.fsync(fd)
-            } finally {
-                Os.close(fd)
-            }
-        } catch (failure: ErrnoException) {
-            throw IOException("directory_sync", failure)
+            if (!OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) throw IOException("directory_invalid")
+            Os.fsync(fd)
+        } finally {
+            Os.close(fd)
         }
+    } catch (failure: ErrnoException) {
+        throw IOException("directory_sync", failure)
     }
 }
 

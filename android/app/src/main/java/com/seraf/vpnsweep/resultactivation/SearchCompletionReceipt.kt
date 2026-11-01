@@ -23,6 +23,9 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -90,6 +93,7 @@ internal interface SearchCompletionReceiptStorage {
     fun hasPending(): Boolean
     fun prepare(receipt: SearchCompletionReceiptV1): Boolean
     fun commit(): Boolean
+    fun safeForUpgrade(candidate: ResultRevision?, verify: (SearchCompletionReceiptV1) -> Boolean): Boolean = false
 
     fun write(receipt: SearchCompletionReceiptV1): Boolean = prepare(receipt) && commit()
 }
@@ -106,6 +110,32 @@ internal class PrivateSearchCompletionReceiptStorage(
     private val previousFile = File(directory, "completion.previous")
     private val pendingFile = File(directory, "completion.pending")
     private var commitUncertain = false
+
+    override fun safeForUpgrade(candidate: ResultRevision?, verify: (SearchCompletionReceiptV1) -> Boolean): Boolean {
+        return try {
+        if (commitUncertain) return false
+        val root = attributes(directory)
+        if (root == null) return true
+        if (!root.isDirectory || attributes(pendingFile) != null) return false
+        val current = attributes(receiptFile)
+        val previous = attributes(previousFile)
+        if (current == null && previous != null) return false
+        for ((file, attributes) in listOf(receiptFile to current, previousFile to previous)) {
+            if (attributes != null) {
+                if (!attributes.isRegularFile) return false
+                val receipt = readRecord(file) ?: return false
+                if (!receipt.matchesCurrentRevision(receipt.result.revision)) return false
+                if (candidate != null && receipt.result.revision == candidate) return false
+                if (!verify(receipt)) return false
+            }
+        }
+        true
+        } catch (_: Exception) { false }
+    }
+
+    private fun attributes(file: File): BasicFileAttributes? = try {
+        Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+    } catch (_: NoSuchFileException) { null }
 
     override fun read(): SearchCompletionReceiptV1? {
         return try {

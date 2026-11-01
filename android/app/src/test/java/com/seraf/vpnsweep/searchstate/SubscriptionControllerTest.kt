@@ -3,6 +3,8 @@ package com.seraf.vpnsweep.searchstate
 import com.seraf.vpnsweep.AcceptedSubscriptionReceiptV1
 import com.seraf.vpnsweep.recoverOwnerBusyForSelection
 import com.seraf.vpnsweep.committedServerSummary
+import com.seraf.vpnsweep.SearchReadiness
+import com.seraf.vpnsweep.recheckSearchReadinessFlow
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
 import com.seraf.vpnsweep.resultactivation.MemorySearchCompletionReceiptStorage
 import com.seraf.vpnsweep.resultactivation.SearchCompletionReceiptStorage
@@ -22,6 +24,114 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SubscriptionControllerTest {
+    @Test
+    fun ownerBusyRecheckUsesRealControllerAndKeepsUnknownBlocked(): Unit {
+        for (outcome in listOf(OwnerBusyRecovery.READY, OwnerBusyRecovery.UNKNOWN)) {
+            val raw = FakeMarker()
+            val backend = object : UpgradeRecoveryBackend {
+                override var recoveryBlocked = false
+                override var quarantined = false
+                override fun readIntent(): RecoveryIntentState = RecoveryIntentState.Absent
+                override fun writeIntent(stamp: RecoveryStamp): Boolean = false
+                override fun finishIntent(): Boolean = false
+                override fun readStamp(): RecoveryStamp? = null
+                override fun readRawMarker(): MarkerState = raw.read()
+                override fun clearRawMarker(): Boolean = raw.markClear()
+                override fun acquireOwner(): RecoveryOwner? = null
+                override fun reconcile(): Boolean = false
+            }
+            val upgrade = UpgradeRecovery(backend, eligibleAtStartup = false)
+            val fixture = Fixture(overrideMarker = RecoveryFencedMarker(raw, backend))
+            val port = FakeSubscriptionPort()
+            val controller = SubscriptionController(port, fixture.composition,
+                { ResultRevision("1", "1") }, { ResultRevision("1", "2") })
+            assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+            port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true))))
+            assertTrue(controller.select(setOf("a")))
+            fixture.runtime.result = SearchStartV3.BUSY
+            fixture.runtime.noOwnerBusy = true
+            assertEquals(SearchStartV3.BUSY, controller.startSelected())
+            assertEquals(MarkerState.ACTIVE, raw.read())
+            assertTrue(fixture.composition.controller.state.value.ownerBusyRetry)
+            assertFalse(upgrade.blocked())
+            val clearBefore = raw.clearCalls
+            fixture.runtime.recovery = outcome
+            val result = recheckSearchReadinessFlow(
+                ownerBusyRetry = fixture.composition.controller.state.value.ownerBusyRetry,
+                recover = { fixture.composition.controller.retryOwnerBusy() },
+                selectionAvailable = { controller.canSelect() },
+                hasCommittedSelection = { controller.state.value.selectedIds.isNotEmpty() },
+                searchEnabled = { true },
+            )
+            if (outcome == OwnerBusyRecovery.READY) {
+                assertEquals(SearchReadiness.READY, result)
+                assertEquals(clearBefore + 1, raw.clearCalls)
+                assertEquals(MarkerState.CLEAR, raw.read())
+            } else {
+                assertEquals(SearchReadiness.UNKNOWN, result)
+                assertEquals(clearBefore, raw.clearCalls)
+                assertEquals(MarkerState.ACTIVE, raw.read())
+                assertFalse(controller.canSelect())
+            }
+            assertEquals(1, fixture.runtime.recoveryCalls)
+        }
+    }
+    @Test
+    fun armedFenceRejectsALateSubscriptionCallbackWithoutCommitting(): Unit {
+        val backend = object : UpgradeRecoveryBackend {
+            override var recoveryBlocked = false
+            override var quarantined = false
+            var intent: RecoveryStamp? = null
+            var done = false
+            var stamp = RecoveryStamp("11111111-1111-4111-8111-111111111111")
+            var rawState = MarkerState.ACTIVE
+            var reconcileAction: () -> Boolean = { false }
+            override fun readIntent(): RecoveryIntentState = intent?.let { RecoveryIntentState.Armed(it) } ?: if (done) RecoveryIntentState.Done else RecoveryIntentState.Absent
+            override fun writeIntent(stamp: RecoveryStamp): Boolean { intent = stamp; done = false; return true }
+            override fun finishIntent(): Boolean { intent = null; done = true; return true }
+            override fun readStamp(): RecoveryStamp = stamp
+            override fun readRawMarker(): MarkerState = rawState
+            override fun clearRawMarker(): Boolean { rawState = MarkerState.CLEAR; return true }
+            override fun acquireOwner(): RecoveryOwner = object : RecoveryOwner { override fun close(): Unit = Unit }
+            override fun reconcile(): Boolean = reconcileAction()
+        }
+        val raw = object : SessionMarker {
+            override fun read(): MarkerState = backend.rawState
+            override fun markActive(): Boolean = true
+            override fun markClear(): Boolean = true
+        }
+        val recovery = UpgradeRecovery(backend, eligibleAtStartup = true)
+        val fixture = Fixture(overrideMarker = RecoveryFencedMarker(raw, backend))
+        val port = FakeSubscriptionPort()
+        var commits = 0
+        val controller = SubscriptionController(port, fixture.composition,
+            { commits++; ResultRevision("1", "1") }, { ResultRevision("1", "2") })
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        val oldObserver = checkNotNull(port.observer)
+        assertEquals(UpgradeRecoveryResult.REBOOT_REQUIRED, recovery.arm())
+        val late = Snapshot(listOf(record("late", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, late)
+        assertTrue(late.closed)
+        assertEquals(0, commits)
+        assertNull(fixture.revisions.value)
+        assertTrue(recovery.blocked())
+
+        val restoredRevision = ResultRevision("2", "9")
+        backend.reconcileAction = { fixture.revisions.value = restoredRevision; true }
+        backend.stamp = RecoveryStamp("22222222-2222-4222-8222-222222222222")
+        assertEquals(UpgradeRecoveryResult.RECOVERED, recovery.recover())
+        assertTrue(fixture.composition.controller.completeUpgradeRecovery())
+        val restored = Snapshot(listOf(record("chosen", true)))
+        assertTrue(controller.restore(restored, setOf("chosen"), restoredRevision, requestGeneration = 4))
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        val stillLate = Snapshot(listOf(record("stale", true)))
+        oldObserver.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, stillLate)
+        assertTrue(stillLate.closed)
+        assertEquals(0, commits)
+        assertEquals(restoredRevision, fixture.revisions.value)
+        assertEquals(setOf("chosen"), controller.state.value.selectedIds)
+        assertFalse(restored.closed)
+    }
     @Test
     fun serverSummaryFollowsCommittedSnapshotAcrossRefreshAndInterruptedSearch(): Unit {
         val fixture = Fixture()
@@ -1248,7 +1358,7 @@ class SubscriptionControllerTest {
         })
     }
 
-    private class Fixture(val runtime: FakeSearchPort = FakeSearchPort(), initialMarker: MarkerState = MarkerState.CLEAR) {
+    private class Fixture(val runtime: FakeSearchPort = FakeSearchPort(), initialMarker: MarkerState = MarkerState.CLEAR, overrideMarker: SessionMarker? = null) {
         val storage = FakeStorage()
         val revisions = FakeRevisions()
         val marker = FakeMarker(initialMarker)
@@ -1264,7 +1374,7 @@ class SubscriptionControllerTest {
             storage,
             revisions,
             runtime,
-            marker,
+            overrideMarker ?: marker,
             registry,
             MemorySearchCompletionReceiptStorage(),
         )

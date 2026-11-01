@@ -45,6 +45,22 @@ import org.junit.Test
 
 class ResultActivationCompositionTest {
     @Test
+    fun upgradeRevisionReplayKeepsOldReceiptAndResultUnavailable(): Unit {
+        val f = Fixture()
+        f.publishResult()
+        val receipt = f.completionReceipts.read()
+        val manifest = f.storage.readManifest()
+        assertEquals(ResultRevision("1", "3"), f.composition.reissueForUpgrade { ResultRevision(it.source, "3") })
+        assertNull(f.composition.loadCleanComplete(f.accepted))
+        assertFalse(f.composition.activation.ready())
+        assertEquals(receipt, f.completionReceipts.read())
+        assertEquals(manifest, f.storage.readManifest())
+        assertEquals(ResultRevision("1", "4"), f.recovered().reissueForUpgrade { ResultRevision(it.source, "4") })
+        assertNull(f.recovered().loadCleanComplete(f.accepted))
+        assertEquals(receipt, f.completionReceipts.read())
+        assertEquals(manifest, f.storage.readManifest())
+    }
+    @Test
     fun cleanCompleteReceiptRestoresReadinessWithoutStartingSearchOrVpn(): Unit {
         val f = Fixture()
         f.publishResult()
@@ -703,6 +719,13 @@ class ResultActivationCompositionTest {
         private var nextGeneration = 0L
 
         var failManifestRead = false
+        override fun safeForUpgrade(candidate: ResultRevision?): Boolean = !failManifestRead &&
+            (candidate == null || manifest?.revision != candidate)
+        override fun hasVerifiedManifestForUpgrade(): Boolean = !failManifestRead && manifest != null
+        override fun verifiedGenerationForUpgrade(manifest: ResultManifest): Boolean {
+            val result = readGeneration(manifest.generation) ?: return false
+            return result.input.use { result.revision == manifest.revision && result.sha256 == manifest.sha256 && digest(it) == manifest.sha256 }
+        }
         override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String {
             val id = "00000000-0000-0000-0000-${(nextGeneration++).toString().padStart(12, '0')}"
             results[id] = Stored(revision, sha256, input.readBytes())

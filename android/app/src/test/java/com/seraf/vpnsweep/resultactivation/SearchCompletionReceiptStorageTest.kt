@@ -23,6 +23,9 @@ internal class MemorySearchCompletionReceiptStorage : SearchCompletionReceiptSto
     private var prepared: SearchCompletionReceiptV1? = null
     private var pending = false
 
+    override fun safeForUpgrade(candidate: ResultRevision?, verify: (SearchCompletionReceiptV1) -> Boolean): Boolean = !failRead && !pending &&
+        (receipt == null || (candidate == null || receipt?.result?.revision != candidate) && verify(checkNotNull(receipt)))
+
     override fun read(): SearchCompletionReceiptV1? {
         if (failRead) throw IOException("synthetic")
         return receipt
@@ -52,6 +55,20 @@ internal class MemorySearchCompletionReceiptStorage : SearchCompletionReceiptSto
 }
 
 class SearchCompletionReceiptStorageTest {
+    @Test
+    fun upgradeRequiresNoPendingValidReceiptsAndDifferentRevision(): Unit = withTempDirectory { root ->
+        val storage = PrivateSearchCompletionReceiptStorage(root, directorySync = {})
+        assertTrue(storage.safeForUpgrade(null) { true })
+        val previous = receipt()
+        assertTrue(storage.write(previous))
+        assertFalse(storage.safeForUpgrade(previous.result.revision) { true })
+        assertTrue(storage.safeForUpgrade(ResultRevision("9", "9")) { true })
+        File(root, "completion.pending").writeText("corrupt")
+        assertFalse(storage.safeForUpgrade(ResultRevision("9", "9")) { true })
+        assertTrue(File(root, "completion.pending").delete())
+        File(root, "completion").writeText("corrupt")
+        assertFalse(storage.safeForUpgrade(ResultRevision("9", "9")) { true })
+    }
     @Test
     fun versionedRecordRoundTripsExactReceiptAndManifest(): Unit = withTempDirectory { root ->
         val storage = PrivateSearchCompletionReceiptStorage(root, directorySync = {})

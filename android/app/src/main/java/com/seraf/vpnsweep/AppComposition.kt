@@ -24,6 +24,18 @@ import com.seraf.vpnsweep.searchstate.SearchStartReason
 import com.seraf.vpnsweep.searchstate.SearchStartRejection
 import com.seraf.vpnsweep.searchstate.SearchStartStage
 import com.seraf.vpnsweep.searchstate.SessionMarker
+import com.seraf.vpnsweep.searchstate.RecoveryFencedMarker
+import com.seraf.vpnsweep.searchstate.RecoveryIntentState
+import com.seraf.vpnsweep.searchstate.RecoveryIntentStore
+import com.seraf.vpnsweep.searchstate.RecoveryOwner
+import com.seraf.vpnsweep.searchstate.PrivateSessionMarker
+import com.seraf.vpnsweep.searchstate.RecoveryStamp
+import com.seraf.vpnsweep.searchstate.SearchRunPathAllocator
+import com.seraf.vpnsweep.searchstate.UpgradeRecovery
+import com.seraf.vpnsweep.searchstate.UpgradeRecoveryBackend
+import com.seraf.vpnsweep.searchstate.UpgradeRecoveryResult
+import com.seraf.vpnsweep.searchstate.readKernelBootId
+import com.seraf.vpnsweep.searchstate.recoveryRequiredAtStartup
 import com.seraf.vpnsweep.searchstorage.ResultRevision
 import com.seraf.vpnsweep.searchworker.NetworkOwnerOpen
 import com.seraf.vpnsweep.searchworker.SearchEngineWorkerAdapter
@@ -55,7 +67,6 @@ import com.seraf.vpnsweep.vpn.AppVpnRegistry
 import com.seraf.vpnsweep.vpn.VpnRun
 import java.io.File
 import java.io.IOException
-import java.io.FileOutputStream
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlinx.coroutines.flow.StateFlow
@@ -71,7 +82,23 @@ internal class SweepApplication : Application() {
     val integration: AppComposition by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppComposition(this) }
 }
 
-internal enum class SearchReadiness { READY, SELECT_REQUIRED, BUSY, UNKNOWN }
+internal enum class SearchReadiness { READY, SELECT_REQUIRED, BUSY, UNKNOWN, REBOOT_REQUIRED, RECOVERY_UNAVAILABLE }
+
+internal fun readinessEvent(readiness: SearchReadiness): ScreenEvent = when (readiness) {
+    SearchReadiness.READY -> ScreenEvent.READINESS_READY
+    SearchReadiness.SELECT_REQUIRED -> ScreenEvent.READINESS_SELECT_REQUIRED
+    SearchReadiness.BUSY -> ScreenEvent.READINESS_BUSY
+    SearchReadiness.UNKNOWN -> ScreenEvent.READINESS_UNKNOWN
+    SearchReadiness.REBOOT_REQUIRED -> ScreenEvent.READINESS_REBOOT_REQUIRED
+    SearchReadiness.RECOVERY_UNAVAILABLE -> ScreenEvent.READINESS_RECOVERY_UNAVAILABLE
+}
+
+internal fun currentVpnIdentityMatches(
+    monitor: Any,
+    identity: VpnStartIdentityV1,
+    blocked: () -> Boolean,
+    current: () -> VpnStartIdentityV1?,
+): Boolean = synchronized(monitor) { !blocked() && current() == identity }
 
 internal fun readinessAfterChecks(ownerRecovery: SearchStartV3?, selectionAvailable: Boolean, selected: Boolean, searchEnabled: Boolean): SearchReadiness = when {
     ownerRecovery == SearchStartV3.BUSY -> SearchReadiness.BUSY
@@ -143,7 +170,32 @@ internal class AppComposition(context: Context) {
     private var restoredCompletedSearch: SearchLeaseReceiptV1? = null
     private val startGate = VpnStartGateV1()
     private val workerTransportLimits = SearchWorkerTransportLimits.production()
-    private val marker = PrivateSessionMarker(File(app.noBackupFilesDir, "session-state"))
+    private val rawMarker = PrivateSessionMarker(File(app.noBackupFilesDir, "session-state"), ::syncDirectory)
+    private val intentStore = RecoveryIntentStore(File(app.noBackupFilesDir, "upgrade-recovery"), ::syncDirectory)
+    private val recoveryBackend = object : UpgradeRecoveryBackend {
+        override var recoveryBlocked: Boolean = false
+        override var quarantined: Boolean = false
+        override fun readIntent(): RecoveryIntentState = intentStore.read()
+        override fun writeIntent(stamp: RecoveryStamp): Boolean = intentStore.create(stamp)
+        override fun finishIntent(): Boolean = intentStore.finish()
+        override fun readStamp(): RecoveryStamp? = readKernelBootId()
+        override fun readRawMarker(): MarkerState = rawMarker.readForRecovery()
+        override fun clearRawMarker(): Boolean = rawMarker.markClear()
+        override fun acquireOwner(): RecoveryOwner? {
+            val lease = this@AppComposition.acquireOwner() ?: return null
+            if (!lease.mayLoadMobile()) {
+                lease.quarantine()
+                return null
+            }
+            return object : RecoveryOwner { override fun close(): Unit = lease.close() }
+        }
+        override fun reconcile(): Boolean = reconcileUpgrade()
+    }
+    private val startupRecovery = recoveryRequiredAtStartup(rawMarker, intentStore.read(), rawMarker::readForRecovery)
+    private val recoveryMode = StartupRecoveryMode(startupRecovery)
+    private val upgradeRecovery = UpgradeRecovery(recoveryBackend, startupRecovery)
+    private val marker: SessionMarker = RecoveryFencedMarker(rawMarker, recoveryBackend)
+    private val searchPaths = SearchRunPathAllocator(File(app.noBackupFilesDir, "search-runs"), ::syncDirectory)
     private val searchPort = ProductionSearchPort()
     val activation: ResultActivationComposition = ResultActivationComposition.create(
         app, searchPort, marker, AppVpnRegistry.instance,
@@ -161,45 +213,89 @@ internal class AppComposition(context: Context) {
         selectionMutation = { ids -> activation.withOwnedSourceMutation(::acquireOwner) { commitSelection(ids) } },
     )
     val searchState = activation.controller.state
+    private val readiness = ReadinessCheckCoordinator(
+        Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "search-readiness") },
+        ::recheckSearchReadiness,
+        onComplete = { result -> addEvent(readinessEvent(result)) },
+    )
+    val readinessState = readiness.state
+
+    fun requestReadinessCheck(): Boolean = readiness.request(synchronous = { !recoveryMode.blocked() })
 
     init {
         activation.controller.setPhaseListener { state ->
             if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state.phase)?.let(::addEvent)
         }
-        restoreSubscription()
+        if (!recoveryMode.blocked()) restoreSubscription()
     }
 
-    fun loadSubscription(input: String): SubscriptionLoadResult = subscriptions.loadWithReceipt(input)
+    fun loadSubscription(input: String): SubscriptionLoadResult =
+        if (recoveryMode.blocked() || upgradeRecovery.blocked()) SubscriptionLoadResult(SubscriptionStartV1.BUSY)
+        else subscriptions.loadWithReceipt(input)
 
-    fun select(ids: Set<String>): Boolean = subscriptions.select(ids)
+    fun select(ids: Set<String>): Boolean = !recoveryMode.blocked() && subscriptions.select(ids)
 
-    fun selectionAvailable(): Boolean {
+    fun selectionAvailable(): Boolean = !recoveryMode.blocked() && selectionAvailableUnchecked()
+
+    private fun selectionAvailableUnchecked(): Boolean {
         if (!subscriptions.canSelect()) return false
         return activation.ownerAvailable(::acquireOwner)
     }
 
-    fun retryOwnerBusyForSelection(): SearchStartV3 = synchronized(activation.controller) {
+    private fun retryOwnerBusyForSelection(): SearchStartV3 = synchronized(activation.controller) {
         val state = subscriptions.state.value
         val receipt = synchronized(lock) { acceptedSnapshot }
         val revision = try { activation.currentRevision() } catch (_: Exception) { null }
         return recoverOwnerBusyForSelection(activation.controller, state, receipt, revision, workerTransportLimits.isProven)
     }
 
-    fun recheckSearchReadiness(): SearchReadiness = synchronized(activation.controller) {
-        recheckSearchReadinessFlow(
+    private fun recheckSearchReadiness(): SearchReadiness {
+        if (recoveryMode.blocked()) {
+            var completed = false
+            val result = subscriptions.withRecovery {
+                synchronized(activation.controller) {
+                    val outcome = when (intentStore.read()) {
+                        RecoveryIntentState.Absent, RecoveryIntentState.Done -> upgradeRecovery.arm()
+                        is RecoveryIntentState.Armed -> upgradeRecovery.recover()
+                        RecoveryIntentState.Unknown -> UpgradeRecoveryResult.UNKNOWN
+                    }
+                    when (outcome) {
+                        UpgradeRecoveryResult.REBOOT_REQUIRED -> SearchReadiness.REBOOT_REQUIRED
+                        UpgradeRecoveryResult.UNKNOWN -> SearchReadiness.RECOVERY_UNAVAILABLE
+                        UpgradeRecoveryResult.RECOVERED -> {
+                            if (!activation.controller.completeUpgradeRecovery()) {
+                                synchronized(recoveryBackend) { recoveryBackend.quarantined = true }
+                                SearchReadiness.RECOVERY_UNAVAILABLE
+                            } else {
+                                completed = true
+                                readinessChecks()
+                            }
+                        }
+                    }
+                }
+            }
+            if (completed) recoveryMode.complete()
+            return result
+        }
+        return subscriptions.withRecovery { synchronized(activation.controller) { readinessChecks() } }
+    }
+
+    private fun readinessChecks(): SearchReadiness = recheckSearchReadinessFlow(
             ownerBusyRetry = searchState.value.ownerBusyRetry,
             recover = ::retryOwnerBusyForSelection,
-            selectionAvailable = ::selectionAvailable,
+            selectionAvailable = ::selectionAvailableUnchecked,
             hasCommittedSelection = { subscriptions.state.value.selectedIds.isNotEmpty() },
-            searchEnabled = ::searchEnabled,
+            searchEnabled = ::searchEnabledUnchecked,
         )
-    }
 
     fun subscriptionState(): StateFlow<SubscriptionUiState> = subscriptions.state
 
     fun selectedForDisplay(): Boolean = canStartVpn()
 
-    fun canStartVpn(): Boolean = synchronized(activation.controller) {
+    fun canStartVpn(): Boolean = !recoveryMode.blocked() && canStartVpnUnchecked()
+
+    private fun canStartVpnUnchecked(): Boolean = synchronized(activation.controller) {
+        if (upgradeRecovery.blocked()) return false
         val imported = synchronized(lock) { acceptedSnapshot } ?: return false
         val searched = synchronized(lock) { completedSearch } ?: return false
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return false
@@ -214,7 +310,10 @@ internal class AppComposition(context: Context) {
             AppVpnRegistry.instance.available()
     }
 
-    fun searchEnabled(): Boolean = synchronized(activation.controller) {
+    fun searchEnabled(): Boolean = !recoveryMode.blocked() && searchEnabledUnchecked()
+
+    private fun searchEnabledUnchecked(): Boolean = synchronized(activation.controller) {
+        if (upgradeRecovery.blocked()) return false
         val state = subscriptions.state.value
         val receipt = synchronized(lock) { acceptedSnapshot }
         val revision = try { activation.currentRevision() } catch (_: Exception) { null }
@@ -224,7 +323,10 @@ internal class AppComposition(context: Context) {
             (searchState.value.ownerBusyRetry || searchState.value.phase in setOf(SearchPhase.IDLE, SearchPhase.COMPLETE, SearchPhase.CANCELLED, SearchPhase.FAILED))
     }
 
-    fun startSearch(): SearchStartV3 = synchronized(activation.controller) {
+    fun startSearch(): SearchStartV3 = if (recoveryMode.blocked()) SearchStartV3.BUSY else startSearchUnchecked()
+
+    private fun startSearchUnchecked(): SearchStartV3 = synchronized(activation.controller) {
+        if (upgradeRecovery.blocked()) return SearchStartV3.BUSY
         activation.controller.clearStartRejection()
         val before = subscriptions.state.value
         val receipt = synchronized(lock) { acceptedSnapshot }
@@ -258,9 +360,12 @@ internal class AppComposition(context: Context) {
         return SearchStartV3.REJECTED
     }
 
-    fun cancelSearch(): Unit = activation.controller.cancel()
+    fun cancelSearch(): Unit { if (!recoveryMode.blocked()) activation.controller.cancel() }
 
-    fun prepareVpnStart(): VpnStartTicketV1? = synchronized(activation.controller) {
+    fun prepareVpnStart(): VpnStartTicketV1? = if (recoveryMode.blocked()) null else prepareVpnStartUnchecked()
+
+    private fun prepareVpnStartUnchecked(): VpnStartTicketV1? = synchronized(activation.controller) {
+        if (upgradeRecovery.blocked()) return null
         if (!workerTransportLimits.isProven) return null
         val imported = synchronized(lock) { acceptedSnapshot } ?: return null
         val searched = synchronized(lock) { completedSearch } ?: return null
@@ -278,7 +383,11 @@ internal class AppComposition(context: Context) {
     }
 
     fun consumeVpnStart(token: String?, reserveRun: () -> VpnRun?): VpnStartAdmissionV1? =
+        if (recoveryMode.blocked()) null else consumeVpnStartUnchecked(token, reserveRun)
+
+    private fun consumeVpnStartUnchecked(token: String?, reserveRun: () -> VpnRun?): VpnStartAdmissionV1? =
         synchronized(activation.controller) {
+            if (upgradeRecovery.blocked()) return@synchronized null
             val imported = synchronized(lock) { acceptedSnapshot }
             val searched = synchronized(lock) { completedSearch }
             val revision = try { activation.currentRevision() } catch (_: Exception) { null }
@@ -355,19 +464,22 @@ internal class AppComposition(context: Context) {
         if (token != null) startGate.cancel(token)
     }
 
-    fun isCurrentVpnIdentity(identity: VpnStartIdentityV1): Boolean = synchronized(activation.controller) {
-        val imported = synchronized(lock) { acceptedSnapshot } ?: return false
-        val searched = synchronized(lock) { completedSearch } ?: return false
-        val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return false
-        val current = VpnStartIdentityV1.fromCommittedSearch(
+    fun isCurrentVpnIdentity(identity: VpnStartIdentityV1): Boolean = !recoveryMode.blocked() && currentVpnIdentityMatches(
+        activation.controller, identity, upgradeRecovery::blocked,
+    ) { currentVpnIdentitySnapshot(identity) }
+
+    private fun currentVpnIdentitySnapshot(identity: VpnStartIdentityV1): VpnStartIdentityV1? {
+        val imported = synchronized(lock) { acceptedSnapshot } ?: return null
+        val searched = synchronized(lock) { completedSearch } ?: return null
+        val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return null
+        return VpnStartIdentityV1.fromCommittedSearch(
             imported,
             searched,
             revision,
             searchComplete = hasCleanCompletion(searched),
             resultCommitted = hasCleanCompletion(searched),
             vpnLeaseIdentity = identity.vpnLeaseIdentity,
-        ) ?: return false
-        return current == identity
+        )
     }
 
     private fun hasCleanCompletion(searched: SearchLeaseReceiptV1): Boolean {
@@ -414,6 +526,22 @@ internal class AppComposition(context: Context) {
         else -> null
     }
 
+    private fun reconcileUpgrade(): Boolean {
+        val revision = activation.reissueForUpgrade(storage::reissueCurrent) ?: return false
+        val recovered = storage.recover(revision) ?: return false
+        val receipt = AcceptedSubscriptionReceiptV1.fromCommittedSnapshot(
+            recovered.requestGeneration, recovered.snapshot, recovered.revision,
+        ) ?: run { recovered.snapshot.close(); return false }
+        if (!subscriptions.restore(recovered.snapshot, recovered.selectedIds, revision, recovered.requestGeneration)) return false
+        synchronized(lock) {
+            acceptedSnapshot = receipt
+            activeSearch = null
+            completedSearch = null
+            restoredCompletedSearch = null
+        }
+        return true
+    }
+
     private fun restoreSubscription(): Unit {
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return
         val recovered: RecoveredSubscription = storage.recover(revision) ?: return
@@ -447,6 +575,7 @@ internal class AppComposition(context: Context) {
         private val onGeneration: (Long) -> Unit,
     ) : SubscriptionPortV1 {
         override fun start(generation: Long, input: String, observer: SubscriptionObserverV1): SubscriptionStartV1 {
+            if (recoveryMode.blocked() || upgradeRecovery.blocked()) return SubscriptionStartV1.BUSY
             onGeneration(generation)
             return delegate.start(generation, input, observer)
         }
@@ -636,6 +765,8 @@ internal class AppComposition(context: Context) {
             if (profiles.isEmpty() || profiles.size > MAX_SEARCH_PROFILES_BYTES) throw IOException("search_profile_size")
             stage = ScreenEvent.SEARCH_INIT_CORE_IDENTITY_FAILED
             val digest = requireCoreIdentity { installedCoreSha256(app) }
+            stage = ScreenEvent.SEARCH_INIT_SESSION_FAILED
+            val paths = searchPaths.reserve()
             stage = ScreenEvent.SEARCH_INIT_MANIFEST_FAILED
             val manifest = Mobile.buildDefaultSearchManifest(profiles, digest)
             val cleanupMillis = Mobile.searchManifestCleanupMillis(manifest)
@@ -725,8 +856,8 @@ internal class AppComposition(context: Context) {
                 snapshot.sessionGeneration,
                 manifest,
                 profiles,
-                File(app.noBackupFilesDir, "search-state/${snapshot.sessionGeneration}").absolutePath,
-                File(app.noBackupFilesDir, "search-staging/${snapshot.sessionGeneration}").absolutePath,
+                paths.state.absolutePath,
+                paths.staging.absolutePath,
                 adapter as SearchEngineWorker,
             )
             val phaseProgress = SearchMobilePhaseProgress { epoch, value -> progress(epoch, value) }
@@ -772,54 +903,20 @@ internal class AppComposition(context: Context) {
         }
     }
 
-    private class PrivateSessionMarker(private val directory: File) : SessionMarker {
-        private val marker = File(directory, "current")
-
-        @Synchronized
-        override fun read(): MarkerState = try {
-            if (!marker.exists()) MarkerState.CLEAR else when (marker.readText(Charsets.US_ASCII)) {
-                ACTIVE -> MarkerState.ACTIVE
-                CLEAR -> MarkerState.CLEAR
-                else -> MarkerState.UNKNOWN
-            }
-        } catch (_: Exception) { MarkerState.UNKNOWN }
-
-        @Synchronized
-        override fun markActive(): Boolean = write(ACTIVE)
-
-        @Synchronized
-        override fun markClear(): Boolean = write(CLEAR)
-
-        private fun write(value: String): Boolean {
-            return try {
-                if (!directory.isDirectory && !directory.mkdirs() && !directory.isDirectory) return false
-                val temporary = File(directory, "marker-${UUID.randomUUID()}")
-                FileOutputStream(temporary).use { output ->
-                    output.write(value.toByteArray(Charsets.US_ASCII))
-                    output.fd.sync()
-                }
-                if (!temporary.renameTo(marker)) {
-                    temporary.delete()
-                    return false
-                }
-                val fd = android.system.Os.open(directory.absolutePath, android.system.OsConstants.O_RDONLY or android.system.OsConstants.O_CLOEXEC, 0)
-                try { android.system.Os.fsync(fd) } finally { android.system.Os.close(fd) }
-                true
-            } catch (_: Exception) {
-                false
-            }
-        }
-
-        private companion object {
-            const val ACTIVE = "ACTIVE"
-            const val CLEAR = "CLEAR"
-        }
-    }
-
     private companion object {
         const val SUBSCRIPTION_TIMEOUT_MS = 30_000L
         const val MAX_SEARCH_PROFILES_BYTES = 8 * 1024 * 1024
         const val DEFAULT_CLEANUP_MILLIS = 10_000L
         const val WORKER_FRAME_HEADER_BYTES = 16
+    }
+}
+
+private fun syncDirectory(directory: File): Unit {
+    val fd = android.system.Os.open(directory.absolutePath, android.system.OsConstants.O_RDONLY or android.system.OsConstants.O_CLOEXEC, 0)
+    try {
+        if (!android.system.OsConstants.S_ISDIR(android.system.Os.fstat(fd).st_mode)) throw IOException("directory_invalid")
+        android.system.Os.fsync(fd)
+    } finally {
+        android.system.Os.close(fd)
     }
 }

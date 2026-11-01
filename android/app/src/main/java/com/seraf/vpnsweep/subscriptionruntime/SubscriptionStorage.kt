@@ -63,6 +63,30 @@ internal class SubscriptionStorage(
         }
     }
 
+    fun reissueCurrent(expected: ResultRevision): ResultRevision {
+        if (currentRevision() != expected) throw IOException("subscription_revision")
+        val recovered = recover(expected) ?: throw IOException("subscription_revision")
+        try {
+            val payload = File(root, "${expected.source}-${expected.selection}/snapshot")
+            val attributes = java.nio.file.Files.readAttributes(
+                payload.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java, java.nio.file.LinkOption.NOFOLLOW_LINKS,
+            )
+            if (!attributes.isRegularFile || attributes.size() !in 1..MAX_SNAPSHOT_BYTES) throw IOException("subscription_snapshot")
+            val revision = store(recovered.snapshot, recovered.selectedIds, expected.source, recovered.requestGeneration, payload)
+            val verified = recover(revision) ?: throw IOException("subscription_snapshot")
+            try {
+                if (verified.selectedIds != recovered.selectedIds || verified.requestGeneration != recovered.requestGeneration) {
+                    throw IOException("subscription_snapshot")
+                }
+            } finally {
+                verified.snapshot.close()
+            }
+            return revision
+        } finally {
+            recovered.snapshot.close()
+        }
+    }
+
     fun recover(revision: ResultRevision): RecoveredSubscription? {
         if (!validRevision(revision)) return null
         var snapshot: SubscriptionSnapshotV1? = null
@@ -91,6 +115,7 @@ internal class SubscriptionStorage(
         selectedIds: Set<String>,
         source: String?,
         requestGeneration: Long,
+        copyFrom: File? = null,
     ): ResultRevision {
         if (requestGeneration <= 0) throw IOException("subscription_generation")
         if (!validSelection(snapshot, selectedIds)) throw IOException("subscription_selection")
@@ -105,7 +130,23 @@ internal class SubscriptionStorage(
         if (!directory.isDirectory) throw IOException("subscription_storage")
         try {
             val payload = File(directory, "snapshot")
-            files.write(snapshot, payload)
+            if (copyFrom == null) {
+                files.write(snapshot, payload)
+            } else {
+                FileInputStream(copyFrom).use { input -> FileOutputStream(payload).use { output ->
+                    val buffer = ByteArray(8 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        if (total > MAX_SNAPSHOT_BYTES) throw IOException("subscription_snapshot")
+                        output.write(buffer, 0, count)
+                    }
+                } }
+                if (copyFrom.length() != payload.length() ||
+                    !MessageDigest.isEqual(fileDigest(copyFrom), fileDigest(payload))) throw IOException("subscription_snapshot")
+            }
             if (!payload.isFile || payload.length() !in 1..MAX_SNAPSHOT_BYTES) throw IOException("subscription_snapshot")
             FileOutputStream(payload, true).use { it.fd.sync() }
             val data = metadata(revision, selectedIds, requestGeneration)
@@ -122,6 +163,22 @@ internal class SubscriptionStorage(
             directory.delete()
             throw failure
         }
+    }
+
+    private fun fileDigest(file: File): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(8 * 1024)
+        var total = 0L
+        FileInputStream(file).use { input ->
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > MAX_SNAPSHOT_BYTES) throw IOException("subscription_snapshot")
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest()
     }
 
     private fun metadata(revision: ResultRevision, selectedIds: Set<String>, requestGeneration: Long): ByteArray {

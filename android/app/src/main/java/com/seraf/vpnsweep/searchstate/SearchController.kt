@@ -146,6 +146,16 @@ internal class SearchController(
     }
 
     @Synchronized
+    fun completeUpgradeRecovery(): Boolean {
+        if (active != null || pendingDeliveries != 0 || cleanupInProgress || pendingResultClose.isNotEmpty()) return false
+        val clear = try { marker.read() == MarkerState.CLEAR } catch (_: Exception) { false }
+        if (!clear) return false
+        admissionBlocked = false
+        publish(SearchUiState(phase = SearchPhase.IDLE))
+        return true
+    }
+
+    @Synchronized
     fun recordStartRejection(rejection: SearchStartRejection): Unit {
         publish(mutableState.value.copy(startRejection = rejection))
     }

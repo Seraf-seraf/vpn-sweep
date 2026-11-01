@@ -32,6 +32,20 @@ internal class ResultActivationComposition private constructor(
 
     fun currentRevision(): ResultRevision? = synchronized(controller) { revisions.load() }
 
+    fun reissueForUpgrade(reissue: (ResultRevision) -> ResultRevision): ResultRevision? = synchronized(controller) {
+        val previous = revisions.load() ?: return@synchronized null
+        try {
+            fun safeReceipts(candidate: ResultRevision?): Boolean = completionReceipts.safeForUpgrade(candidate) {
+                storage.hasVerifiedManifestForUpgrade() && storage.verifiedGenerationForUpgrade(it.result)
+            }
+            if (!safeReceipts(null) || !storage.safeForUpgrade(null)) return@synchronized null
+            val candidate = reissue(previous)
+            if (candidate == previous || !safeReceipts(candidate) || !storage.safeForUpgrade(candidate)) return@synchronized null
+            if (!revisions.update(candidate) || revisions.load() != candidate) return@synchronized null
+            candidate
+        } catch (_: Exception) { null } catch (_: LinkageError) { null }
+    }
+
     fun prepareCleanComplete(
         accepted: AcceptedSubscriptionReceiptV1,
         searched: SearchLeaseReceiptV1,

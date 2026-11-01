@@ -10,6 +10,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -37,12 +38,20 @@ class MainActivity : ComponentActivity() {
             val subscriptionState by graph.subscriptionState().collectAsStateWithLifecycle()
             val searchState by graph.searchState.collectAsStateWithLifecycle()
             val events by graph.events.collectAsStateWithLifecycle()
+            val readiness by graph.readinessState.collectAsStateWithLifecycle()
             var permissionMessage by remember { mutableStateOf("") }
             var operationMessage by remember { mutableStateOf("") }
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
             var selectionError by remember { mutableStateOf("") }
             var selectionProbe by remember { mutableStateOf(0) }
+            LaunchedEffect(readiness.sequence) {
+                val result = readiness.result
+                if (readiness.sequence > 0 && result != null) {
+                    selectionError = eventText(readinessEvent(result))
+                    selectionProbe++
+                }
+            }
             fun addEvent(event: ScreenEvent) {
                 graph.addEvent(event)
             }
@@ -99,8 +108,8 @@ class MainActivity : ComponentActivity() {
                         serversOpen = true
                     },
                     permissionMessage = permissionMessage,
-                    sourceEnabled = !busy && !searchRunning && subscriptionState.phase != SubscriptionPhase.LOADING,
-                    searchEnabled = graph.searchEnabled() || searchRunning,
+                    sourceEnabled = !readiness.inProgress && !busy && !searchRunning && subscriptionState.phase != SubscriptionPhase.LOADING,
+                    searchEnabled = searchRunning || (!readiness.inProgress && graph.searchEnabled()),
                     searchRunning = searchRunning,
                     searchMessage = "",
                     information = ScreenInformation(events = events.toList(), startRejection = searchState.startRejection?.safeCode),
@@ -144,19 +153,11 @@ class MainActivity : ComponentActivity() {
                             ServerChoice(record.id, record.title, record.subtitle, record.supported)
                         },
                         selectedIds = subscriptionState.selectedIds,
-                        canConfirm = remember(subscriptionState, searchState, selectionProbe) { graph.selectionAvailable() },
+                        canConfirm = remember(subscriptionState, searchState, selectionProbe, readiness.inProgress) { graph.selectionAvailable() },
+                        checking = readiness.inProgress,
                         errorMessage = selectionError,
                         onRefreshAvailability = {
-                            val readiness = graph.recheckSearchReadiness()
-                            val event = when (readiness) {
-                                SearchReadiness.READY -> ScreenEvent.READINESS_READY
-                                SearchReadiness.SELECT_REQUIRED -> ScreenEvent.READINESS_SELECT_REQUIRED
-                                SearchReadiness.BUSY -> ScreenEvent.READINESS_BUSY
-                                SearchReadiness.UNKNOWN -> ScreenEvent.READINESS_UNKNOWN
-                            }
-                            addEvent(event)
-                            selectionError = eventText(event)
-                            selectionProbe++
+                            graph.requestReadinessCheck()
                         },
                         onDismiss = { serversOpen = false },
                         onConfirm = { ids ->

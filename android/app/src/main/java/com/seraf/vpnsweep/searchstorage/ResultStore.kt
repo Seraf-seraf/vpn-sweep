@@ -18,6 +18,9 @@ internal interface ResultStorage {
     fun readManifest(): ResultManifest?
     fun publish(manifest: ResultManifest): Unit
     fun discard(generation: String): Unit
+    fun safeForUpgrade(candidate: ResultRevision?): Boolean = false
+    fun verifiedGenerationForUpgrade(manifest: ResultManifest): Boolean = false
+    fun hasVerifiedManifestForUpgrade(): Boolean = false
 }
 
 internal enum class Publication { SUCCESS, CANCELLED, INVALID, FAILED, INDETERMINATE }

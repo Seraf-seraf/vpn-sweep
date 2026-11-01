@@ -22,6 +22,29 @@ class SubscriptionStorageTest {
     @get:Rule val temporary = TemporaryFolder()
 
     @Test
+    fun upgradeClonePreservesPayloadSelectionAndGenerationUnderNewRevision(): Unit {
+        for (selection in listOf(emptySet(), setOf(FIRST_ID))) {
+            val files = FakeSnapshotFiles()
+            var current: ResultRevision? = null
+            val root = temporary.newFolder()
+            val store = SubscriptionStorage(root, files) { current }
+            current = store.commitSource(FakeSnapshot(), requestGeneration = 17)
+            if (selection.isNotEmpty()) current = store.commitSelection(selection)
+            val before = requireNotNull(current)
+            val oldPayload = File(root, "${before.source}-${before.selection}/snapshot").readBytes()
+            val cloned = store.reissueCurrent(before)
+            assertNotEquals(before, cloned)
+            assertEquals(before.source, cloned.source)
+            assertTrue(oldPayload.contentEquals(File(root, "${cloned.source}-${cloned.selection}/snapshot").readBytes()))
+            val recovered = requireNotNull(store.recover(cloned))
+            assertEquals(selection, recovered.selectedIds)
+            assertEquals(17L, recovered.requestGeneration)
+            recovered.snapshot.close()
+            assertTrue(oldPayload.contentEquals(File(root, "${before.source}-${before.selection}/snapshot").readBytes()))
+        }
+    }
+
+    @Test
     fun currentRevisionControlsRecoveryAndSelectionSurvivesRestart(): Unit {
         val files = FakeSnapshotFiles()
         var current: ResultRevision? = null
