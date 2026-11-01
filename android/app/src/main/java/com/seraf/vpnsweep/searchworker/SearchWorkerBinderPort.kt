@@ -32,6 +32,7 @@ internal fun createSearchWorkerRound(
     identity: WorkerIdentityV1,
     network: SearchNetworkV1,
     localDrain: SearchWorkerLocalDrain,
+    scheduleRecoveryClose: (() -> Unit) -> Boolean,
     provenFrameBound: Int?,
     provenReplyBound: Int?,
     reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {},
@@ -40,7 +41,7 @@ internal fun createSearchWorkerRound(
     reportServiceObservation: (WorkerServiceObservation) -> Unit = {},
 ): WorkerRoundClient? {
     if (provenFrameBound == null || provenFrameBound < FRAME_HEADER_BYTES || provenReplyBound == null || provenReplyBound < 1) return null
-    val coordinator = SearchWorkerCoordinator(context, ownerLease, identity, network, owner)
+    val coordinator = SearchWorkerCoordinator(context, ownerLease, identity, network, owner, localDrain, scheduleRecoveryClose)
     val duplicate = coordinator.prepare() ?: return null
     return WorkerRoundClient(
         SearchWorkerBinderPort(coordinator, ownerLease, duplicate, identity, network, localDrain, provenFrameBound, provenReplyBound, reportRetirementFailure, reportServiceFailure, reportBindFailure, reportServiceObservation),

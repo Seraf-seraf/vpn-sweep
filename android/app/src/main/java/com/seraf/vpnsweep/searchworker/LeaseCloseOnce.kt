@@ -9,7 +9,11 @@ internal class LeaseCloseOnce(private val closeOwner: () -> Unit) {
     private var started = false
     @Volatile private var failure: Throwable? = null
 
-    fun close(): Unit {
+    fun close(): Unit = close(waitUninterruptibly = false)
+
+    fun closeUninterruptibly(): Unit = close(waitUninterruptibly = true)
+
+    private fun close(waitUninterruptibly: Boolean): Unit {
         val closeHere = synchronized(lock) {
             if (started) false else {
                 started = true
@@ -24,6 +28,15 @@ internal class LeaseCloseOnce(private val closeOwner: () -> Unit) {
                 failure = t
             } finally {
                 done.countDown()
+            }
+        } else if (waitUninterruptibly) {
+            var interrupted = false
+            try {
+                while (true) {
+                    try { done.await(); break } catch (_: InterruptedException) { interrupted = true }
+                }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt()
             }
         } else {
             try {

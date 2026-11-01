@@ -804,6 +804,9 @@ internal class AppComposition(context: Context) {
                         identity,
                         network.network,
                         localDrain,
+                        { action ->
+                            try { searchResourceReaper.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
+                        },
                         limits.frameBytes,
                         limits.replyBytes,
                         reportRetirementFailure = { reason ->

@@ -126,7 +126,7 @@ internal class SearchOwnerLease internal constructor(
     private val closeFd: (Int) -> Boolean = { SearchOwnerLock.close(it) },
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
 ) : AutoCloseable, SearchOwnerLeaseControl {
-    private enum class State { OPEN, SEALED, CLOSING, CLOSED_PENDING, RELEASED, QUARANTINED }
+    private enum class State { OPEN, SEALED, RECOVERING, CLOSING, CLOSED_PENDING, RELEASED, QUARANTINED }
     private val workerOutstanding = AtomicBoolean()
     private val state = AtomicReference(State.OPEN)
     private val custodyLock = Any()
@@ -183,11 +183,31 @@ internal class SearchOwnerLease internal constructor(
     @Synchronized
     override fun mayLoadMobile(): Boolean = state.get() == State.OPEN && fd >= 0 && SearchOwnerLock.ownerMayLoad(fd) && state.get() == State.OPEN
 
+    override fun anchorHeldForWorker(): Boolean = observeAnchor() == WorkerAnchorObservation.HELD
+
     @Synchronized
-    override fun anchorHeldForWorker(): Boolean = ownerHeld() && workerOutstanding.get() && fd >= 0 &&
-        SearchOwnerLock.ownerMayLoad(fd) && ownerHeld()
+    override fun observeAnchor(): WorkerAnchorObservation {
+        val before = state.get()
+        if (before == State.RECOVERING) return WorkerAnchorObservation.FENCED
+        if ((before != State.OPEN && before != State.SEALED) || !workerOutstanding.get() || fd < 0) return WorkerAnchorObservation.UNKNOWN
+        if (!SearchOwnerLock.ownerMayLoad(fd)) return WorkerAnchorObservation.UNKNOWN
+        return when (state.get()) {
+            State.RECOVERING -> WorkerAnchorObservation.FENCED
+            State.OPEN, State.SEALED -> WorkerAnchorObservation.HELD
+            else -> WorkerAnchorObservation.UNKNOWN
+        }
+    }
 
     private fun ownerHeld(): Boolean = state.get() == State.OPEN || state.get() == State.SEALED
+
+    private fun reservationHeld(): Boolean = ownerHeld() || state.get() == State.RECOVERING
+
+    override fun sealForRecovery(): Boolean = sealForRecovery(null)
+
+    internal fun sealForRecovery(owner: SearchOwnerLeaseAccess?): Boolean = synchronized(custodyLock) {
+        val authorized = if (owner == null) custody == null else owner.owns(this) && custody === owner.token
+        authorized && activeOperations == 0 && workerOutstanding.get() && state.compareAndSet(State.OPEN, State.RECOVERING)
+    }
 
     override fun workerDeathConfirmed(): Unit = withAccess(null, { throw IllegalStateException("owner_custody_transferred") }) {
         workerDeathConfirmedImpl()
@@ -199,7 +219,7 @@ internal class SearchOwnerLease internal constructor(
 
     private fun workerDeathConfirmedImpl(): Unit = synchronized(this) {
         val completed = workerRetired
-        check(ownerHeld() && workerOutstanding.compareAndSet(true, false)) { "worker_death_not_releasable" }
+        check(reservationHeld() && workerOutstanding.compareAndSet(true, false)) { "worker_death_not_releasable" }
         completed.countDown()
     }
 
@@ -213,7 +233,7 @@ internal class SearchOwnerLease internal constructor(
 
     @Synchronized
     private fun releaseUnstartedReservationImpl(): Unit {
-        check(fd >= 0 && ownerHeld() && workerOutstanding.compareAndSet(true, false)) { "worker_reservation_not_releasable" }
+        check(fd >= 0 && reservationHeld() && workerOutstanding.compareAndSet(true, false)) { "worker_reservation_not_releasable" }
         duplicateIssued = false
         workerRetired.countDown()
     }
@@ -243,6 +263,7 @@ internal class SearchOwnerLease internal constructor(
     }
 
     private fun retireWorkerUntilImpl(deadlineElapsedMillis: Long): Boolean {
+        if (state.get() == State.RECOVERING) return false
         val initial = nowMillis()
         if (initial < 0 || deadlineElapsedMillis <= initial) {
             quarantineImpl()
@@ -380,7 +401,9 @@ internal class SearchOwnerLeaseAccess internal constructor(
 
     internal fun duplicate(): WorkerLeaseDuplicate? = lease.duplicate(this)
     internal fun anchorHeldForWorker(): Boolean = lease.anchorHeldForWorker()
+    internal fun observeAnchor(): WorkerAnchorObservation = lease.observeAnchor()
     internal fun workerDeathConfirmed(): Unit = lease.workerDeathConfirmed(this)
+    internal fun sealForRecovery(): Boolean = lease.sealForRecovery(this)
     internal fun quarantine(): Unit = lease.quarantine(this)
     internal fun reserveWorker(): Boolean = lease.reserveWorker(this)
     internal fun releaseUnstartedReservation(): Unit = lease.releaseUnstartedReservation(this)
@@ -396,6 +419,8 @@ private class SearchOwnerLeaseSessionControl(
 ) : SearchOwnerLeaseControl {
     override fun duplicate(): SearchLeaseDuplicateV1? = access.duplicate()
     override fun anchorHeldForWorker(): Boolean = access.anchorHeldForWorker()
+    override fun observeAnchor(): WorkerAnchorObservation = access.observeAnchor()
+    override fun sealForRecovery(): Boolean = access.sealForRecovery()
     override fun workerDeathConfirmed(): Unit = access.workerDeathConfirmed()
     override fun quarantine(): Unit = access.quarantine()
     override fun reserveWorker(): Boolean = access.reserveWorker()
