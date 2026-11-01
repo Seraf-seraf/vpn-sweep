@@ -21,7 +21,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 internal enum class SearchLeaseHandoff { CLAIMED, RETURNED, UNKNOWN }
-internal class SearchNetworkPolicyUnavailable : IOException("search_network_policy_unavailable")
+internal class SearchNetworkPolicyUnavailable(
+    val reason: NetworkPolicyUnavailableReason = NetworkPolicyUnavailableReason.UNCONFIRMED,
+) : IOException("search_network_policy_unavailable")
 
 // The factory owns one session and the lease/network resources used by it.
 // It must consume profiles synchronously; the producer closes the input.
@@ -47,7 +49,7 @@ internal class SearchSessionProducer(
     private val createSession: (SearchSnapshotV1, SearchOwnerLeaseControl, (Long, SearchProgressV1) -> Unit) -> SearchPhaseSession,
     // Must be a local, nonblocking elapsed-realtime clock, including in tests.
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
-    private val reportNetworkUnavailable: (Long) -> Unit = {},
+    private val reportNetworkUnavailable: (Long, NetworkPolicyUnavailableReason) -> Unit = { _, _ -> },
 ) : SearchSessionPortV4 {
     constructor(
         cleanupMillis: Long,
@@ -279,7 +281,7 @@ internal class SearchSessionProducer(
                 return
             }
             if (failure is SearchNetworkPolicyUnavailable) {
-                try { reportNetworkUnavailable(current.snapshot.sessionGeneration) } catch (_: Exception) { } catch (_: LinkageError) { }
+                try { reportNetworkUnavailable(current.snapshot.sessionGeneration, failure.reason) } catch (_: Exception) { } catch (_: LinkageError) { }
                 val released = cleanup(current) { deadline ->
                     profiles.close()
                     if (current.sessionLease.releaseUntil(deadline)) SearchResourceStateV2.RELEASED else SearchResourceStateV2.QUARANTINED

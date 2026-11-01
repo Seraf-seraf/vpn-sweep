@@ -135,7 +135,7 @@ internal class SearchController(
     private fun publish(next: SearchUiState): Unit {
         val previous = mutableState.value
         mutableState.value = next
-        if (previous.phase != next.phase || previous.ownerBusyPending != next.ownerBusyPending) phaseListener(next)
+        if (previous.phase != next.phase || previous.ownerBusyPending != next.ownerBusyPending || previous.ownerBusyRetry != next.ownerBusyRetry) phaseListener(next)
     }
 
     @Synchronized

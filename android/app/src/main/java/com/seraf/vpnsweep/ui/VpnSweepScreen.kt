@@ -82,6 +82,12 @@ private val ControlShape = RoundedCornerShape(12.dp)
 internal fun informationPaneHeight(viewportHeight: Dp, fontScale: Float = 1f): Dp =
     (viewportHeight * if (fontScale >= 1.5f) 0.65f else 0.33f).coerceIn(0.dp, 220.dp)
 
+internal fun journalLevelColor(level: String): Color = when (level) {
+    "ERROR" -> SweepColors.error
+    "WARN" -> SweepColors.journalWarning
+    else -> SweepColors.text
+}
+
 @Composable
 internal fun VpnSweepScreenContent(
     state: VpnState,
@@ -335,7 +341,7 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
                 .fillMaxWidth()
                 .height(paneHeight)
                 .border(1.dp, Outline, ControlShape)
-                .background(ScreenBackground, ControlShape)
+                .background(if (selectedTab == 0) SweepColors.journalBackground else ScreenBackground, ControlShape)
                 .padding(if (largeText) 8.dp else 16.dp),
         ) {
             if (selectedTab == 0) EventLogHeader() else ParametersHeader()
@@ -360,12 +366,12 @@ internal fun EventLogPanel(entries: List<EventLogEntry>, showHeader: Boolean = t
         EventLogHeader()
         Spacer(Modifier.height(16.dp))
     }
-    Column(Modifier.fillMaxWidth()) {
+    Column(Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite }) {
         if (entries.isEmpty()) {
             Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
         } else {
             for (entry in entries) {
-                Text("${entry.time}  [${entry.level}] ${entry.message}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
+                Text("${entry.time}  [${entry.level}] ${entry.message}", color = journalLevelColor(entry.level), fontFamily = SweepMono, fontSize = 14.sp)
             }
         }
     }

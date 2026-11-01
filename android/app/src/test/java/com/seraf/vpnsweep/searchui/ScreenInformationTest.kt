@@ -4,7 +4,12 @@ import com.seraf.vpnsweep.ui.presentInformation
 import com.seraf.vpnsweep.SearchReadiness
 import com.seraf.vpnsweep.readinessAfterChecks
 import com.seraf.vpnsweep.recheckSearchReadinessFlow
+import com.seraf.vpnsweep.networkPolicyEvent
+import com.seraf.vpnsweep.searchworker.NetworkPolicyUnavailableReason
 import com.seraf.vpnsweep.ui.informationPaneHeight
+import com.seraf.vpnsweep.ui.journalLevelColor
+import com.seraf.vpnsweep.ui.SweepColors
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -54,6 +59,34 @@ class ScreenInformationTest {
     fun warningAndFailureEventsUseHonestSeverity(): Unit {
         val entries = presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_STARTING, ScreenEvent.SEARCH_BUSY, ScreenEvent.SEARCH_INTERRUPTED, ScreenEvent.WORKER_START_FAILED))).events
         assertEquals(listOf("INFO", "WARN", "ERROR", "ERROR"), entries.map { it.level })
+    }
+
+    @Test
+    fun networkAndRecoveryMessagesDoNotClaimAnUnobservedCauseOrRequireReboot(): Unit {
+        val network = eventText(ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE)
+        assertTrue(!network.contains("сеть недоступна", ignoreCase = true))
+        val recovery = eventText(ScreenEvent.READINESS_REBOOT_REQUIRED)
+        assertTrue(!recovery.contains("Перезагруз", ignoreCase = true))
+    }
+
+    @Test
+    fun journalHasDistinctBackgroundAndReadableLevelColors(): Unit {
+        val background = SweepColors.journalBackground
+        assertTrue(background != SweepColors.background)
+        for (level in listOf("INFO", "WARN", "ERROR")) {
+            val contrast = (journalLevelColor(level).luminance() + 0.05f) / (background.luminance() + 0.05f)
+            assertTrue("$level contrast $contrast", contrast >= 4.5f)
+        }
+    }
+
+    @Test
+    fun networkAndVpnFeedbackAreAllowlistedJournalEvents(): Unit {
+        val networkEvents = NetworkPolicyUnavailableReason.entries.map(::networkPolicyEvent)
+        assertEquals(networkEvents.size, networkEvents.toSet().size)
+        val events = networkEvents + listOf(ScreenEvent.VPN_PERMISSION_DENIED, ScreenEvent.VPN_START_UNAVAILABLE, ScreenEvent.VPN_SERVICE_START_FAILED)
+        val entries = presentInformation(ScreenInformation(events = events)).events
+        assertEquals(events.size, entries.size)
+        assertTrue(entries.all { it.level == "ERROR" && it.message.isNotEmpty() })
     }
 
     @Test

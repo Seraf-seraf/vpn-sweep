@@ -4,6 +4,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import com.seraf.vpnsweep.searchprotocol.SearchNetworkV1
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
 
 internal data class DefaultNetworkSnapshot(val identity: Long, val notVpn: Boolean)
@@ -17,8 +18,16 @@ internal sealed interface DefaultNetworkEvent {
 
 internal sealed interface NetworkOwnerOpen {
     data class Ready(val owner: NetworkEpochOwner, val network: SearchNetworkV1) : NetworkOwnerOpen
-    data object Unavailable : NetworkOwnerOpen
+    data class Unavailable(val reason: NetworkPolicyUnavailableReason) : NetworkOwnerOpen
     data object Unknown : NetworkOwnerOpen
+}
+
+internal enum class NetworkPolicyUnavailableReason { UNCONFIRMED, CHECK_FAILED, CALLBACK_EVENT, NON_DIRECT, BLOCKED }
+
+internal fun requireSearchNetwork(opened: NetworkOwnerOpen): NetworkOwnerOpen.Ready = when (opened) {
+    is NetworkOwnerOpen.Ready -> opened
+    is NetworkOwnerOpen.Unavailable -> throw SearchNetworkPolicyUnavailable(opened.reason)
+    NetworkOwnerOpen.Unknown -> throw IOException("search_resolver_unknown")
 }
 
 // RETURNED confirms only callback return, not worker death or DNS cleanup.
@@ -175,25 +184,37 @@ internal class NetworkEpochOwner private constructor(
                 owner.registration = registration
                 owner.eventSerial
             }
-            val observed = try {
-                if (leaseCurrent()) snapshot()?.takeIf { it.notVpn && leaseCurrent() } else null
+            fun currentLease(): Boolean = try { leaseCurrent() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+            val initialLease = currentLease()
+            var checkFailed = false
+            val observed = if (initialLease) try {
+                snapshot()
             } catch (_: Exception) {
+                checkFailed = true
                 null
             } catch (_: LinkageError) {
+                checkFailed = true
                 null
-            }
-            val token = synchronized(owner.lock) {
-                if (observed == null || owner.closed || owner.revoked || owner.eventSerial != before || owner.lastEventLost ||
-                    owner.lastObservedIdentity?.let { it != observed.identity } == true ||
-                    owner.lastBlocked == (observed.identity to true)
-                ) {
-                    null
-                } else {
-                    nextEpoch()?.let { SearchNetworkV1(observed.identity, it).also { value -> owner.network = value } }
+            } else null
+            val finalLease = initialLease && currentLease()
+            val result = synchronized(owner.lock) {
+                when {
+                    !initialLease || !finalLease || owner.closed || owner.revoked -> NetworkOwnerOpen.Unknown
+                    owner.eventSerial != before || owner.lastEventLost -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT)
+                    checkFailed -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CHECK_FAILED)
+                    observed == null -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.UNCONFIRMED)
+                    !observed.notVpn -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.NON_DIRECT)
+                    owner.lastObservedIdentity?.let { it != observed.identity } == true -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT)
+                    owner.lastBlocked == (observed.identity to true) -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.BLOCKED)
+                    else -> {
+                        val token = nextEpoch()?.let { SearchNetworkV1(observed.identity, it) }
+                        if (token == null) NetworkOwnerOpen.Unknown
+                        else NetworkOwnerOpen.Ready(owner, token.also { owner.network = it })
+                    }
                 }
             }
-            if (token != null) return NetworkOwnerOpen.Ready(owner, token)
-            return if (owner.close()) NetworkOwnerOpen.Unavailable else NetworkOwnerOpen.Unknown
+            if (result is NetworkOwnerOpen.Ready) return result
+            return if (owner.close()) result else NetworkOwnerOpen.Unknown
         }
     }
 }

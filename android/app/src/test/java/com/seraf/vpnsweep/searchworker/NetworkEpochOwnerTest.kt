@@ -124,29 +124,63 @@ internal class NetworkEpochOwnerTest {
     fun unknownOrChangedDuringInitialSnapshotNeverAdmits(): Unit {
         val changed = Source()
         changed.onSnapshot = { changed.event(DefaultNetworkEvent.Available(22)) }
-        assertEquals(NetworkOwnerOpen.Unavailable, NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
         assertEquals(1, changed.closes)
         val vpn = Source().apply { snapshot = DefaultNetworkSnapshot(11, false) }
-        assertEquals(NetworkOwnerOpen.Unavailable, NetworkEpochOwner.open(vpn::register, vpn::read, { true }, {}))
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.NON_DIRECT), NetworkEpochOwner.open(vpn::register, vpn::read, { true }, {}))
         assertEquals(1, vpn.closes)
         val blocked = Source()
         val open = NetworkEpochOwner.open({ callback ->
             blocked.register(callback).also { callback(DefaultNetworkEvent.Blocked(11, true)) }
         }, blocked::read, { true }, {})
-        assertEquals(NetworkOwnerOpen.Unavailable, open)
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.BLOCKED), open)
         assertEquals(1, blocked.closes)
         val lost = Source()
         val lostOpen = NetworkEpochOwner.open({ callback ->
             lost.register(callback).also { callback(DefaultNetworkEvent.Lost) }
         }, lost::read, { true }, {})
-        assertEquals(NetworkOwnerOpen.Unavailable, lostOpen)
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), lostOpen)
         assertEquals(1, lost.closes)
         val mismatched = Source()
         val mismatchOpen = NetworkEpochOwner.open({ callback ->
             mismatched.register(callback).also { callback(DefaultNetworkEvent.Available(22)) }
         }, mismatched::read, { true }, {})
-        assertEquals(NetworkOwnerOpen.Unavailable, mismatchOpen)
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), mismatchOpen)
         assertEquals(1, mismatched.closes)
+    }
+
+    @Test
+    fun failedLeaseChecksStayUnknownAfterRegistrationCloses(): Unit {
+        for (check in listOf<() -> Boolean>({ false }, { throw IOException("synthetic") })) {
+            val source = Source()
+            assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(source::register, source::read, check, {}))
+            assertEquals(1, source.closes)
+        }
+        val source = Source()
+        var calls = 0
+        assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(source::register, source::read, { ++calls == 1 }, {}))
+        assertEquals(1, source.closes)
+        val missing = Source().apply { snapshot = null }
+        calls = 0
+        assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(missing::register, missing::read, { ++calls == 1 }, {}))
+        assertEquals(1, missing.closes)
+    }
+
+    @Test
+    fun missingSnapshotAndReadFailureRemainDistinctFromLeaseFailure(): Unit {
+        val missing = Source().apply { snapshot = null }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.UNCONFIRMED),
+            NetworkEpochOwner.open(missing::register, missing::read, { true }, {}))
+        assertEquals(1, missing.closes)
+        val failed = Source()
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CHECK_FAILED),
+            NetworkEpochOwner.open(failed::register, { throw IOException("synthetic") }, { true }, {}))
+        assertEquals(1, failed.closes)
+        val changed = Source()
+        changed.onSnapshot = { changed.event(DefaultNetworkEvent.Available(11)) }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT),
+            NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
+        assertEquals(1, changed.closes)
     }
 
     @Test

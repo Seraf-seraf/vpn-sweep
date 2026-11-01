@@ -8,7 +8,7 @@ import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchprotocol.WorkerCandidateFailureV2
 import com.seraf.vpnsweep.searchprotocol.WorkerFatalV2
 
-enum class ScreenEvent { READINESS_READY, READINESS_SELECT_REQUIRED, READINESS_BUSY, READINESS_UNKNOWN, READINESS_REBOOT_REQUIRED, READINESS_RECOVERY_UNAVAILABLE, SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CANCEL_REQUESTED, SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE, SEARCH_INIT_PROFILES_FAILED, SEARCH_INIT_CORE_IDENTITY_FAILED, SEARCH_INIT_MANIFEST_FAILED, SEARCH_INIT_NETWORK_UNKNOWN, SEARCH_INIT_SESSION_FAILED, WORKER_ADMISSION_FAILED, WORKER_BIND_FAILED, WORKER_CALL_FAILED, WORKER_CALL_INVALID, WORKER_CALL_STATE, WORKER_CALL_DEADLINE, WORKER_CALL_CANCELLED, WORKER_CANCEL_FAILED, WORKER_CLOSE_FAILED, WORKER_SERVICE_BUSY, WORKER_SERVICE_UNAVAILABLE, WORKER_SERVICE_DEADLINE, WORKER_SERVICE_CANCELLED, WORKER_BUSY, WORKER_OWNER_LOST, WORKER_CAPABILITY_UNAVAILABLE, WORKER_DELIVERY_UNKNOWN, WORKER_DIED, WORKER_CLEANUP_INCOMPLETE, WORKER_CONFIG_REJECTED, WORKER_START_FAILED, WORKER_START_TIMEOUT, WORKER_EXITED_EARLY, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
+enum class ScreenEvent { READINESS_READY, READINESS_SELECT_REQUIRED, READINESS_BUSY, READINESS_UNKNOWN, READINESS_REBOOT_REQUIRED, READINESS_RECOVERY_UNAVAILABLE, SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, VPN_PERMISSION_DENIED, VPN_START_UNAVAILABLE, VPN_SERVICE_START_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CANCEL_REQUESTED, SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE, SEARCH_INIT_NETWORK_CHECK_FAILED, SEARCH_INIT_NETWORK_CALLBACK_EVENT, SEARCH_INIT_NETWORK_NON_DIRECT, SEARCH_INIT_NETWORK_BLOCKED, SEARCH_INIT_PROFILES_FAILED, SEARCH_INIT_CORE_IDENTITY_FAILED, SEARCH_INIT_MANIFEST_FAILED, SEARCH_INIT_NETWORK_UNKNOWN, SEARCH_INIT_SESSION_FAILED, WORKER_ADMISSION_FAILED, WORKER_BIND_FAILED, WORKER_CALL_FAILED, WORKER_CALL_INVALID, WORKER_CALL_STATE, WORKER_CALL_DEADLINE, WORKER_CALL_CANCELLED, WORKER_CANCEL_FAILED, WORKER_CLOSE_FAILED, WORKER_SERVICE_BUSY, WORKER_SERVICE_UNAVAILABLE, WORKER_SERVICE_DEADLINE, WORKER_SERVICE_CANCELLED, WORKER_BUSY, WORKER_OWNER_LOST, WORKER_CAPABILITY_UNAVAILABLE, WORKER_DELIVERY_UNKNOWN, WORKER_DIED, WORKER_CLEANUP_INCOMPLETE, WORKER_CONFIG_REJECTED, WORKER_START_FAILED, WORKER_START_TIMEOUT, WORKER_EXITED_EARLY, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
 enum class Fingerprint(val wireValue: String) {
     CHROME("chrome"), FIREFOX("firefox"), SAFARI("safari"), IOS("ios"), ANDROID("android"),
     EDGE("edge"), BROWSER_360("360"), QQ("qq"), RANDOM("random"), RANDOMIZED("randomized"),
@@ -96,7 +96,7 @@ internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.READINESS_SELECT_REQUIRED -> "readiness:select_required — Выберите серверы и подтвердите выбор."
     ScreenEvent.READINESS_BUSY -> "readiness:busy — Другая операция ещё выполняется. Дождитесь её завершения и проверьте снова."
     ScreenEvent.READINESS_UNKNOWN -> "readiness:unknown — Безопасность повторного запуска не подтверждена. Проверьте состояние приложения и повторите проверку."
-    ScreenEvent.READINESS_REBOOT_REQUIRED -> "readiness:reboot_required — Перезагрузите устройство, затем откройте приложение и снова проверьте готовность."
+    ScreenEvent.READINESS_REBOOT_REQUIRED -> "readiness:unknown — Завершение предыдущей операции пока не подтверждено."
     ScreenEvent.READINESS_RECOVERY_UNAVAILABLE -> "readiness:recovery_unavailable — Не удалось подтвердить безопасное восстановление. Сохраните данные приложения и обратитесь в поддержку."
     ScreenEvent.SUBSCRIPTION_LOADING -> "Загрузка подписки"
     ScreenEvent.SUBSCRIPTION_READY -> "Подписка обработана"
@@ -105,16 +105,23 @@ internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.SUBSCRIPTION_CANCELLED -> "Загрузка подписки отменена"
     ScreenEvent.SELECTION_SAVED -> "Выбор серверов сохранён"
     ScreenEvent.SELECTION_FAILED -> "Не удалось сохранить выбор серверов"
+    ScreenEvent.VPN_PERMISSION_DENIED -> "Подключение VPN не разрешено"
+    ScreenEvent.VPN_START_UNAVAILABLE -> "Сначала завершите подбор и дождитесь сохранения результата"
+    ScreenEvent.VPN_SERVICE_START_FAILED -> "Не удалось запустить VPN-сервис"
     ScreenEvent.SEARCH_STARTING -> "Запуск подбора"
     ScreenEvent.SEARCH_BUSY -> "Подбор временно занят"
     ScreenEvent.SEARCH_REJECTED -> "Не удалось начать подбор"
     ScreenEvent.SEARCH_UNKNOWN -> "Результат запуска подбора неизвестен"
     ScreenEvent.SEARCH_INTERRUPTED -> "Подбор прерван; повторный запуск заблокирован"
-    ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE -> "search_init:network_policy_unavailable — Выбранная сеть недоступна; проверьте подключение."
+    ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE -> "search_init:network_policy_unavailable — Не удалось подтвердить подходящую сеть; проверьте настройки сети и повторите подбор."
+    ScreenEvent.SEARCH_INIT_NETWORK_CHECK_FAILED -> "search_init:network_check_failed — Не удалось проверить состояние сети; проверьте настройки сети и повторите подбор."
+    ScreenEvent.SEARCH_INIT_NETWORK_CALLBACK_EVENT -> "search_init:network_callback_event — Во время проверки получено событие сети; повторите подбор."
+    ScreenEvent.SEARCH_INIT_NETWORK_NON_DIRECT -> "search_init:network_non_direct — Android не подтвердил сеть без VPN; проверьте настройки сети и VPN, затем повторите подбор."
+    ScreenEvent.SEARCH_INIT_NETWORK_BLOCKED -> "search_init:network_blocked — Android сообщил о блокировке доступа к сети; проверьте настройки сети и повторите подбор."
     ScreenEvent.SEARCH_INIT_PROFILES_FAILED -> "search_init:profiles_failed — Не удалось прочитать выбор; проверьте подписку и выбор серверов."
     ScreenEvent.SEARCH_INIT_CORE_IDENTITY_FAILED -> "search_init:core_identity_failed — Не удалось проверить модуль; переустановите совместимую сборку."
     ScreenEvent.SEARCH_INIT_MANIFEST_FAILED -> "search_init:manifest_failed — Не удалось подготовить параметры; проверьте подписку."
-    ScreenEvent.SEARCH_INIT_NETWORK_UNKNOWN -> "search_init:network_unknown — Не удалось подтвердить состояние сети; повторный запуск заблокирован."
+    ScreenEvent.SEARCH_INIT_NETWORK_UNKNOWN -> "search_init:network_unknown — Не удалось подтвердить состояние сети или владение; повторный запуск заблокирован."
     ScreenEvent.SEARCH_INIT_SESSION_FAILED -> "search_init:session_failed — Не удалось создать сессию; проверьте состояние приложения."
     ScreenEvent.WORKER_ADMISSION_FAILED -> "worker_admission:failed — Не удалось подготовить worker; проверьте состояние приложения."
     ScreenEvent.WORKER_BIND_FAILED -> "worker_bind:failed — Не удалось запустить worker; проверьте состояние приложения."

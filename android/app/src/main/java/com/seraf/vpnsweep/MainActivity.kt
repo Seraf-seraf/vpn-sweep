@@ -10,7 +10,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -24,7 +23,6 @@ import com.seraf.vpnsweep.searchstate.SubscriptionUiState
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionFailureV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchui.ScreenEvent
-import com.seraf.vpnsweep.searchui.eventText
 import com.seraf.vpnsweep.searchui.ScreenInformation
 import com.seraf.vpnsweep.searchui.searchOutcomeEvent
 import com.seraf.vpnsweep.searchui.subscriptionOutcomeEvent
@@ -38,20 +36,8 @@ class MainActivity : ComponentActivity() {
             val subscriptionState by graph.subscriptionState().collectAsStateWithLifecycle()
             val searchState by graph.searchState.collectAsStateWithLifecycle()
             val events by graph.events.collectAsStateWithLifecycle()
-            val readiness by graph.readinessState.collectAsStateWithLifecycle()
-            var permissionMessage by remember { mutableStateOf("") }
-            var operationMessage by remember { mutableStateOf("") }
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
-            var selectionError by remember { mutableStateOf("") }
-            var selectionProbe by remember { mutableStateOf(0) }
-            LaunchedEffect(readiness.sequence) {
-                val result = readiness.result
-                if (readiness.sequence > 0 && result != null) {
-                    selectionError = eventText(readinessEvent(result))
-                    selectionProbe++
-                }
-            }
             fun addEvent(event: ScreenEvent) {
                 graph.addEvent(event)
             }
@@ -65,17 +51,15 @@ class MainActivity : ComponentActivity() {
             val selected = graph.canStartVpn()
             val permission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 if (result.resultCode == RESULT_OK) {
-                    permissionMessage = ""
-                    startVpn(graph) { message -> permissionMessage = message }
+                    startVpn(graph, ::addEvent)
                 } else {
-                    permissionMessage = "Подключение VPN не разрешено"
+                    addEvent(ScreenEvent.VPN_PERMISSION_DENIED)
                 }
             }
             val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
                 val intent = VpnService.prepare(this@MainActivity)
                 if (intent == null) {
-                    permissionMessage = ""
-                    startVpn(graph) { message -> permissionMessage = message }
+                    startVpn(graph, ::addEvent)
                 } else {
                     permission.launch(intent)
                 }
@@ -85,7 +69,7 @@ class MainActivity : ComponentActivity() {
                     state = vpnState,
                     selected = selected,
                     importing = subscriptionState.phase == SubscriptionPhase.LOADING,
-                    message = operationMessage,
+                    message = "",
                     testing = searchRunning,
                     checkResults = emptyList(),
                     onPower = {
@@ -98,24 +82,18 @@ class MainActivity : ComponentActivity() {
                     onImport = {},
                     onRunChecks = {},
                     onSubscription = {
-                        operationMessage = ""
                         subscriptionOpen = true
                     },
                     onServers = {
-                        operationMessage = ""
-                        selectionError = ""
-                        selectionProbe++
                         serversOpen = true
                     },
-                    permissionMessage = permissionMessage,
-                    sourceEnabled = !readiness.inProgress && !busy && !searchRunning && subscriptionState.phase != SubscriptionPhase.LOADING,
-                    searchEnabled = searchRunning || (!readiness.inProgress && graph.searchEnabled()),
+                    sourceEnabled = !busy && !searchRunning && subscriptionState.phase != SubscriptionPhase.LOADING,
+                    searchEnabled = searchRunning || graph.searchEnabled(),
                     searchRunning = searchRunning,
                     searchMessage = "",
                     information = ScreenInformation(events = events.toList(), startRejection = searchState.startRejection?.safeCode),
                     serverSummary = committedServerSummary(subscriptionState),
                     onSearch = {
-                        operationMessage = ""
                         if (searchRunning) {
                             graph.cancelSearch()
                         } else {
@@ -130,20 +108,7 @@ class MainActivity : ComponentActivity() {
                         onSubmit = { input ->
                             val outcome = graph.loadSubscription(input).status
                             subscriptionOutcomeEvent(outcome, graph.subscriptionState().value.phase)?.let(::addEvent)
-                            when (outcome) {
-                                SubscriptionStartV1.ACCEPTED -> {
-                                    operationMessage = ""
-                                    true
-                                }
-                                SubscriptionStartV1.BUSY -> {
-                                    operationMessage = "Дождитесь окончания текущей загрузки"
-                                    false
-                                }
-                                SubscriptionStartV1.REJECTED -> {
-                                    operationMessage = "Не удалось начать загрузку подписки"
-                                    false
-                                }
-                            }
+                            outcome == SubscriptionStartV1.ACCEPTED
                         },
                     )
                 }
@@ -153,23 +118,14 @@ class MainActivity : ComponentActivity() {
                             ServerChoice(record.id, record.title, record.subtitle, record.supported)
                         },
                         selectedIds = subscriptionState.selectedIds,
-                        canConfirm = remember(subscriptionState, searchState, selectionProbe, readiness.inProgress) { graph.selectionAvailable() },
-                        checking = readiness.inProgress,
-                        errorMessage = selectionError,
-                        onRefreshAvailability = {
-                            graph.requestReadinessCheck()
-                        },
+                        canConfirm = remember(subscriptionState, searchState) { graph.selectionAvailable() },
                         onDismiss = { serversOpen = false },
                         onConfirm = { ids ->
                             if (graph.select(ids)) {
                                 addEvent(ScreenEvent.SELECTION_SAVED)
-                                operationMessage = ""
                                 serversOpen = false
                             } else {
                                 addEvent(ScreenEvent.SELECTION_FAILED)
-                                selectionError = "Не удалось сохранить выбор серверов"
-                                selectionProbe++
-                                operationMessage = "Не удалось сохранить выбор серверов"
                             }
                         },
                     )
@@ -178,10 +134,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startVpn(graph: AppComposition, report: (String) -> Unit): Unit {
+    private fun startVpn(graph: AppComposition, report: (ScreenEvent) -> Unit): Unit {
         val ticket = graph.prepareVpnStart()
         if (ticket == null) {
-            report("Сначала завершите подбор и дождитесь сохранения результата")
+            report(ScreenEvent.VPN_START_UNAVAILABLE)
             return
         }
         try {
@@ -192,7 +148,7 @@ class MainActivity : ComponentActivity() {
             )
         } catch (_: RuntimeException) {
             graph.cancelVpnStart(ticket.token)
-            report("Не удалось запустить VPN-сервис")
+            report(ScreenEvent.VPN_SERVICE_START_FAILED)
         }
     }
 }
