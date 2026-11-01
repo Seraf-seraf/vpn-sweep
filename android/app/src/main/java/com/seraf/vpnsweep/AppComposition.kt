@@ -37,6 +37,7 @@ import com.seraf.vpnsweep.searchstate.SubscriptionController
 import com.seraf.vpnsweep.searchstate.SubscriptionLoadResult
 import com.seraf.vpnsweep.searchstate.SubscriptionPhase
 import com.seraf.vpnsweep.searchstate.SubscriptionUiState
+import com.seraf.vpnsweep.searchstate.SearchController
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionObserverV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionPortV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionSnapshotV1
@@ -62,6 +63,21 @@ import com.seraf.vpnsweep.searchui.searchEvent
 
 internal class SweepApplication : Application() {
     val integration: AppComposition by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppComposition(this) }
+}
+
+internal fun recoverOwnerBusyForSelection(
+    controller: SearchController,
+    state: SubscriptionUiState,
+    receipt: AcceptedSubscriptionReceiptV1?,
+    revision: ResultRevision?,
+    limitsProven: Boolean,
+): SearchStartV3 = synchronized(controller) {
+    if (!controller.state.value.ownerBusyRetry || receipt == null || revision == null ||
+        state.phase != SubscriptionPhase.READY || state.selectedIds.isEmpty() ||
+        state.generation != receipt.requestGeneration ||
+        revision != ResultRevision(receipt.sourceRevision, receipt.selectionRevision) || !limitsProven
+    ) return@synchronized SearchStartV3.REJECTED
+    controller.retryOwnerBusy()
 }
 
 internal class AppComposition(context: Context) {
@@ -102,7 +118,7 @@ internal class AppComposition(context: Context) {
 
     init {
         activation.controller.setPhaseListener { state ->
-            if (state.startRejection == null) searchEvent(state.phase)?.let(::addEvent)
+            if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state.phase)?.let(::addEvent)
         }
         restoreSubscription()
     }
@@ -110,6 +126,18 @@ internal class AppComposition(context: Context) {
     fun loadSubscription(input: String): SubscriptionLoadResult = subscriptions.loadWithReceipt(input)
 
     fun select(ids: Set<String>): Boolean = subscriptions.select(ids)
+
+    fun selectionAvailable(): Boolean {
+        if (!subscriptions.canSelect()) return false
+        return activation.ownerAvailable(::acquireOwner)
+    }
+
+    fun retryOwnerBusyForSelection(): SearchStartV3 = synchronized(activation.controller) {
+        val state = subscriptions.state.value
+        val receipt = synchronized(lock) { acceptedSnapshot }
+        val revision = try { activation.currentRevision() } catch (_: Exception) { null }
+        return recoverOwnerBusyForSelection(activation.controller, state, receipt, revision, workerTransportLimits.isProven)
+    }
 
     fun subscriptionState(): StateFlow<SubscriptionUiState> = subscriptions.state
 
@@ -137,7 +165,7 @@ internal class AppComposition(context: Context) {
         return state.phase == SubscriptionPhase.READY && state.selectedIds.isNotEmpty() &&
             receipt != null && revision == ResultRevision(receipt.sourceRevision, receipt.selectionRevision) &&
             state.generation == receipt.requestGeneration && workerTransportLimits.isProven &&
-            searchState.value.phase in setOf(SearchPhase.IDLE, SearchPhase.COMPLETE, SearchPhase.CANCELLED, SearchPhase.FAILED)
+            (searchState.value.ownerBusyRetry || searchState.value.phase in setOf(SearchPhase.IDLE, SearchPhase.COMPLETE, SearchPhase.CANCELLED, SearchPhase.FAILED))
     }
 
     fun startSearch(): SearchStartV3 = synchronized(activation.controller) {
@@ -161,6 +189,10 @@ internal class AppComposition(context: Context) {
         }
         if (!workerTransportLimits.isProven) {
             return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.TRANSPORT_LIMITS_UNPROVEN)
+        }
+        if (searchState.value.ownerBusyRetry) {
+            val recovered = activation.controller.retryOwnerBusy()
+            if (recovered != SearchStartV3.ACCEPTED) return recovered
         }
         return subscriptions.startSelected()
     }
@@ -366,8 +398,9 @@ internal class AppComposition(context: Context) {
         override fun cancel(generation: Long): Unit = delegate.cancel(generation)
     }
 
-    private inner class ProductionSearchPort : SearchSessionPortV4, SearchTerminalCommitterV1 {
+    private inner class ProductionSearchPort : SearchSessionPortV4, SearchTerminalCommitterV1, com.seraf.vpnsweep.searchstate.NoOwnerBusyRecoveryPort {
         private val lock = Any()
+        private var noOwnerBusyGeneration: Long? = null
         private val identities = LinkedHashMap<Long, SearchLeaseReceiptV1>()
         private val producer = SearchSessionProducer(
             cleanupMillis = DEFAULT_CLEANUP_MILLIS,
@@ -386,7 +419,13 @@ internal class AppComposition(context: Context) {
             }
             val lease = when (val result = SearchOwnerLock.acquire(app)) {
                 is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> result.lease
-                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Busy -> return SearchStartV3.BUSY
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Busy -> {
+                    synchronized(lock) {
+                        if (noOwnerBusyGeneration != null) return SearchStartV3.UNKNOWN
+                        noOwnerBusyGeneration = snapshot.sessionGeneration
+                    }
+                    return SearchStartV3.BUSY
+                }
                 com.seraf.vpnsweep.searchworker.OwnerAcquisition.Unavailable -> return SearchStartV3.UNKNOWN
             }
             val leaseIdentity = UUID.randomUUID().toString()
@@ -398,14 +437,14 @@ internal class AppComposition(context: Context) {
             synchronized(lock) {
                 if (identities.containsKey(snapshot.sessionGeneration)) {
                     if (!closeUnusedLease(lease)) return SearchStartV3.UNKNOWN
-                    return SearchStartV3.BUSY
+                    return SearchStartV3.UNKNOWN
                 }
                 val offered = producer.offerLease(lease)
                 if (offered != com.seraf.vpnsweep.searchworker.SearchLeaseHandoff.CLAIMED) {
                     if (offered == com.seraf.vpnsweep.searchworker.SearchLeaseHandoff.RETURNED) {
                         if (!closeUnusedLease(lease)) return SearchStartV3.UNKNOWN
                     }
-                    return if (offered == com.seraf.vpnsweep.searchworker.SearchLeaseHandoff.UNKNOWN) SearchStartV3.UNKNOWN else SearchStartV3.BUSY
+                    return SearchStartV3.UNKNOWN
                 }
                 identities[snapshot.sessionGeneration] = receipt
                 synchronized(this@AppComposition.lock) {
@@ -425,7 +464,27 @@ internal class AppComposition(context: Context) {
                         if (activeSearch == receipt) activeSearch = null
                     }
                 }
-                return result
+                return if (result == SearchStartV3.ACCEPTED) result else SearchStartV3.UNKNOWN
+            }
+        }
+
+        override fun isNoOwnerBusy(sessionGeneration: Long): Boolean = synchronized(lock) {
+            noOwnerBusyGeneration == sessionGeneration
+        }
+
+        override fun verifyOwnerReleased(sessionGeneration: Long): com.seraf.vpnsweep.searchstate.OwnerBusyRecovery = synchronized(lock) {
+            if (noOwnerBusyGeneration != sessionGeneration) return@synchronized com.seraf.vpnsweep.searchstate.OwnerBusyRecovery.UNKNOWN
+            when (val acquired = SearchOwnerLock.acquire(app)) {
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Busy -> com.seraf.vpnsweep.searchstate.OwnerBusyRecovery.BUSY
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Unavailable -> {
+                    noOwnerBusyGeneration = null
+                    com.seraf.vpnsweep.searchstate.OwnerBusyRecovery.UNKNOWN
+                }
+                is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> {
+                    noOwnerBusyGeneration = null
+                    if (closeUnusedLease(acquired.lease)) com.seraf.vpnsweep.searchstate.OwnerBusyRecovery.READY
+                    else com.seraf.vpnsweep.searchstate.OwnerBusyRecovery.UNKNOWN
+                }
             }
         }
 

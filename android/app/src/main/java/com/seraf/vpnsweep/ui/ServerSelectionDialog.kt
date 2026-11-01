@@ -95,12 +95,13 @@ internal fun ServerSelectionDialogHost(
     onConfirm: (Set<String>) -> Unit,
     canConfirm: Boolean = true,
     errorMessage: String = "",
+    onRefreshAvailability: () -> Unit = {},
 ): Unit {
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage)
+        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage, onRefreshAvailability)
     }
 }
 
@@ -112,6 +113,7 @@ internal fun ServerSelectionDialogContent(
     onConfirm: (Set<String>) -> Unit,
     canConfirm: Boolean = true,
     errorMessage: String = "",
+    onRefreshAvailability: () -> Unit = {},
 ): Unit {
     val supportedIds = remember(servers) {
         servers.filter { it.supported }.map { it.id }.toSet()
@@ -209,6 +211,7 @@ internal fun ServerSelectionDialogContent(
                         Column(Modifier.fillMaxWidth()) {
                             ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
                             if (errorMessage.isNotEmpty()) Text(errorMessage, color = ServerDialogColors.text)
+                            if (!canConfirm) OutlinedButton(onClick = onRefreshAvailability) { Text("Проверить доступность снова") }
                         }
                     },
                     footer = {

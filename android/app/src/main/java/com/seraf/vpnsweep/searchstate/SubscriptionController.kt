@@ -288,7 +288,8 @@ internal class SubscriptionController(
                     uncertainSearchInput = input
                     publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL), notifyPhase = false)
                 }
-                SearchStartV3.BUSY, SearchStartV3.REJECTED -> closeResource(input)
+                SearchStartV3.BUSY -> composition.controller.confirmOwnerBusyInputClosed(closeResource(input, notifyPhase = false))
+                SearchStartV3.REJECTED -> closeResource(input, notifyPhase = false)
             }
         }
         return result
@@ -336,12 +337,16 @@ internal class SubscriptionController(
         return true
     }
 
-    private fun closeResource(resource: AutoCloseable): Boolean = try {
+    private fun closeResource(resource: AutoCloseable, notifyPhase: Boolean = true): Boolean = try {
         resource.close()
         true
     } catch (_: Exception) {
         pendingClose.add(resource)
-        publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
+        publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL), notifyPhase = notifyPhase)
+        false
+    } catch (_: LinkageError) {
+        pendingClose.add(resource)
+        publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL), notifyPhase = notifyPhase)
         false
     }
 }

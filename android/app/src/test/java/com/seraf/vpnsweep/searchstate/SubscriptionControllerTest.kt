@@ -1,5 +1,7 @@
 package com.seraf.vpnsweep.searchstate
 
+import com.seraf.vpnsweep.AcceptedSubscriptionReceiptV1
+import com.seraf.vpnsweep.recoverOwnerBusyForSelection
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
 import com.seraf.vpnsweep.resultactivation.MemorySearchCompletionReceiptStorage
 import com.seraf.vpnsweep.resultactivation.SearchCompletionReceiptStorage
@@ -19,6 +21,121 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SubscriptionControllerTest {
+    @Test
+    fun productionSelectionRecoveryChecksReceiptAndRevisionBeforeClear(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        var selectionRevision = 1
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { ResultRevision("1", (++selectionRevision).toString()) })
+        controller.load("synthetic")
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true), record("b", true))))
+        assertTrue(controller.select(setOf("a")))
+        fixture.runtime.result = SearchStartV3.BUSY
+        fixture.runtime.noOwnerBusy = true
+        assertEquals(SearchStartV3.BUSY, controller.startSelected())
+        fixture.runtime.recovery = OwnerBusyRecovery.READY
+        val state = controller.state.value
+        val good = AcceptedSubscriptionReceiptV1(1, "1", "2")
+        val current = ResultRevision("1", "2")
+        assertEquals(SearchStartV3.REJECTED, recoverOwnerBusyForSelection(fixture.composition.controller, state, null, current, true))
+        assertEquals(SearchStartV3.REJECTED, recoverOwnerBusyForSelection(fixture.composition.controller, state, good.copy(requestGeneration = 2), current, true))
+        assertEquals(SearchStartV3.REJECTED, recoverOwnerBusyForSelection(fixture.composition.controller, state, good, ResultRevision("1", "3"), true))
+        assertEquals(SearchStartV3.REJECTED, recoverOwnerBusyForSelection(fixture.composition.controller, state, good, current, false))
+        assertEquals(0, fixture.runtime.recoveryCalls)
+        assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+        assertEquals(SearchStartV3.ACCEPTED, recoverOwnerBusyForSelection(fixture.composition.controller, state, good, current, true))
+        assertEquals(1, fixture.runtime.recoveryCalls)
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+        assertTrue(controller.select(setOf("b")))
+        assertEquals(1, fixture.runtime.starts)
+    }
+
+    @Test
+    fun explicitOwnerRecoveryAllowsNewSelectionWithoutStartingSearch(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        var selectionRevision = 1
+        val controller = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { ResultRevision("1", (++selectionRevision).toString()) })
+        controller.load("synthetic")
+        val snapshot = Snapshot(listOf(record("a", true), record("b", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+        assertTrue(controller.select(setOf("a")))
+        fixture.runtime.result = SearchStartV3.BUSY
+        fixture.runtime.noOwnerBusy = true
+        assertEquals(SearchStartV3.BUSY, controller.startSelected())
+        assertFalse(controller.canSelect())
+        fixture.runtime.recovery = OwnerBusyRecovery.READY
+        assertEquals(SearchStartV3.ACCEPTED, fixture.composition.controller.retryOwnerBusy())
+        assertTrue(controller.canSelect())
+        assertTrue(controller.select(setOf("b")))
+        assertEquals(setOf("b"), controller.state.value.selectedIds)
+        assertEquals(1, fixture.runtime.starts)
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+    }
+
+    @Test
+    fun ownerAvailabilityRequiresConfirmedNonblockingRelease(): Unit {
+        val fixture = Fixture()
+        assertFalse(fixture.composition.ownerAvailable { null })
+        var closed = false
+        assertTrue(fixture.composition.ownerAvailable { AutoCloseable { closed = true } })
+        assertTrue(closed)
+        assertFalse(fixture.composition.ownerAvailable { AutoCloseable { throw IOException("synthetic_close") } })
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+    }
+
+    @Test
+    fun noOwnerBusyRequiresInputCloseAndFreshOwnerBeforeRetry(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val controller = SubscriptionController(port, fixture.composition, { ResultRevision("1", "1") }, { ResultRevision("1", "2") })
+        controller.load("synthetic")
+        val snapshot = Snapshot(listOf(record("a", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+        assertTrue(controller.select(setOf("a")))
+        fixture.runtime.result = SearchStartV3.BUSY
+        fixture.runtime.noOwnerBusy = true
+        assertEquals(SearchStartV3.BUSY, controller.startSelected())
+        assertTrue(snapshot.selectedInput.closed)
+        assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+        assertTrue(fixture.composition.controller.state.value.ownerBusyRetry)
+        fixture.runtime.recovery = OwnerBusyRecovery.BUSY
+        assertEquals(SearchStartV3.BUSY, fixture.composition.controller.retryOwnerBusy())
+        assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+        fixture.runtime.recovery = OwnerBusyRecovery.READY
+        assertEquals(SearchStartV3.ACCEPTED, fixture.composition.controller.retryOwnerBusy())
+        assertEquals(MarkerState.CLEAR, fixture.marker.value)
+        snapshot.selectedInput = FakeInput()
+        fixture.runtime.result = SearchStartV3.ACCEPTED
+        assertEquals(SearchStartV3.ACCEPTED, controller.startSelected())
+    }
+
+    @Test
+    fun noOwnerBusyUnknownCloseOrOwnerNeverClearsMarker(): Unit {
+        for (failure in listOf("input_close", "owner_unknown", "unproven")) {
+            val fixture = Fixture()
+            val port = FakeSubscriptionPort()
+            val controller = SubscriptionController(port, fixture.composition, { ResultRevision("1", "1") }, { ResultRevision("1", "2") })
+            controller.load("synthetic")
+            val snapshot = Snapshot(listOf(record("a", true)))
+            port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, snapshot)
+            assertTrue(controller.select(setOf("a")))
+            if (failure == "input_close") snapshot.selectedInput.closeFailures = 1
+            fixture.runtime.result = SearchStartV3.BUSY
+            fixture.runtime.noOwnerBusy = failure != "unproven"
+            assertEquals(SearchStartV3.BUSY, controller.startSelected())
+            if (failure == "owner_unknown") {
+                fixture.runtime.recovery = OwnerBusyRecovery.UNKNOWN
+                assertEquals(SearchStartV3.UNKNOWN, fixture.composition.controller.retryOwnerBusy())
+            }
+            assertFalse(fixture.composition.controller.state.value.ownerBusyRetry)
+            assertEquals(MarkerState.ACTIVE, fixture.marker.value)
+            assertFalse(controller.canSelect())
+        }
+    }
+
     @Test
     fun selectionOwnerBusyKeepsSelectionAndAllowsRetryAfterRelease(): Unit {
         val fixture = Fixture()
@@ -1169,11 +1286,16 @@ class SubscriptionControllerTest {
         override fun cancel(generation: Long): Unit { cancellations.add(generation) }
     }
 
-    private class FakeSearchPort : SearchSessionPortV4 {
+    private class FakeSearchPort : SearchSessionPortV4, NoOwnerBusyRecoveryPort {
         var snapshot: SearchSnapshotV1? = null
         var starts = 0
         var result = SearchStartV3.ACCEPTED
         var throwOnStart = false
+        var noOwnerBusy = false
+        var recovery = OwnerBusyRecovery.UNKNOWN
+        var recoveryCalls = 0
+        override fun isNoOwnerBusy(sessionGeneration: Long): Boolean = noOwnerBusy
+        override fun verifyOwnerReleased(sessionGeneration: Long): OwnerBusyRecovery { recoveryCalls++; return recovery }
         var onStart: (SearchSessionObserverV3) -> Unit = {}
         val cancellations = mutableListOf<Pair<Long, Long>>()
         override fun acceptTerminal(terminal: SearchTerminalV3): Boolean = true

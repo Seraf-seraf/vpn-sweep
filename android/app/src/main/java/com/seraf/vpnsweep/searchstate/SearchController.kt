@@ -66,7 +66,15 @@ internal data class SearchUiState(
     val failure: SearchFailureV1? = null,
     val resultCommitted: Boolean = false,
     val startRejection: SearchStartRejection? = null,
+    val ownerBusyPending: Boolean = false,
+    val ownerBusyRetry: Boolean = false,
 )
+
+internal enum class OwnerBusyRecovery { READY, BUSY, UNKNOWN }
+internal interface NoOwnerBusyRecoveryPort {
+    fun isNoOwnerBusy(sessionGeneration: Long): Boolean
+    fun verifyOwnerReleased(sessionGeneration: Long): OwnerBusyRecovery
+}
 
 internal sealed interface SearchStartPreparation {
     class Denied(val result: SearchStartV3) : SearchStartPreparation
@@ -98,6 +106,8 @@ internal class SearchController(
         var resultInFlight = false
         var committed = false
         var unknown = false
+        var ownerBusy = false
+        var inputClosed = false
         var terminal: SearchTerminalV3? = null
         var finalization: Finalization? = null
         lateinit var observer: SearchSessionObserverV3
@@ -125,7 +135,7 @@ internal class SearchController(
     private fun publish(next: SearchUiState): Unit {
         val previous = mutableState.value
         mutableState.value = next
-        if (previous.phase != next.phase) phaseListener(next)
+        if (previous.phase != next.phase || previous.ownerBusyPending != next.ownerBusyPending) phaseListener(next)
     }
 
     @Synchronized
@@ -276,7 +286,14 @@ internal class SearchController(
             }
             if (outcome != SearchStartV3.ACCEPTED) {
                 if (previousPhase == null) {
-                    store.cancel(session.token)
+                    val cancelled = store.cancel(session.token)
+                    if (outcome == SearchStartV3.BUSY && cancelled &&
+                        (port as? NoOwnerBusyRecoveryPort)?.isNoOwnerBusy(session.generation) == true
+                    ) {
+                        session.ownerBusy = true
+                        publish(SearchUiState(phase = SearchPhase.INTERRUPTED, ownerBusyPending = true))
+                        return outcome
+                    }
                     interrupt(session)
                     return outcome
                 }
@@ -300,6 +317,38 @@ internal class SearchController(
         finalization?.let { completeFinalization(session, it) }
         if (command != null) sendControl(command.first, command.second, command.third)
         return outcome
+    }
+
+    @Synchronized
+    fun confirmOwnerBusyInputClosed(closed: Boolean): Unit {
+        val session = active ?: return
+        if (!session.ownerBusy || session.unknown) return
+        if (!closed) {
+            interrupt(session)
+            return
+        }
+        session.inputClosed = true
+        publish(mutableState.value.copy(ownerBusyRetry = true))
+    }
+
+    @Synchronized
+    fun retryOwnerBusy(): SearchStartV3 {
+        val session = active ?: return SearchStartV3.UNKNOWN
+        if (!session.ownerBusy || !session.inputClosed || session.unknown) return SearchStartV3.UNKNOWN
+        val recovery = try {
+            (port as? NoOwnerBusyRecoveryPort)?.verifyOwnerReleased(session.generation) ?: OwnerBusyRecovery.UNKNOWN
+        } catch (_: Exception) { OwnerBusyRecovery.UNKNOWN } catch (_: LinkageError) { OwnerBusyRecovery.UNKNOWN }
+        when (recovery) {
+            OwnerBusyRecovery.BUSY -> return SearchStartV3.BUSY
+            OwnerBusyRecovery.UNKNOWN -> { interrupt(session); return SearchStartV3.UNKNOWN }
+            OwnerBusyRecovery.READY -> Unit
+        }
+        val cleared = try { marker.markClear() && marker.read() == MarkerState.CLEAR } catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!cleared) { interrupt(session); return SearchStartV3.UNKNOWN }
+        active = null
+        admissionBlocked = false
+        publish(SearchUiState(phase = SearchPhase.IDLE))
+        return SearchStartV3.ACCEPTED
     }
 
     private fun observerFor(session: Session): SearchSessionObserverV3 = object : SearchSessionObserverV3 {

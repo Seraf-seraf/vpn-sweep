@@ -99,6 +99,11 @@ internal class ResultActivationComposition private constructor(
         }
     }
 
+    fun ownerAvailable(acquire: () -> AutoCloseable?): Boolean {
+        val owner = try { acquire() } catch (_: Exception) { null } catch (_: LinkageError) { null } ?: return false
+        return try { owner.close(); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
+    }
+
     companion object {
         fun create(
             context: Context,

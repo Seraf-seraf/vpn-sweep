@@ -41,6 +41,7 @@ class MainActivity : ComponentActivity() {
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
             var selectionError by remember { mutableStateOf("") }
+            var selectionProbe by remember { mutableStateOf(0) }
             fun addEvent(event: ScreenEvent) {
                 graph.addEvent(event)
             }
@@ -93,6 +94,7 @@ class MainActivity : ComponentActivity() {
                     onServers = {
                         operationMessage = ""
                         selectionError = ""
+                        selectionProbe++
                         serversOpen = true
                     },
                     permissionMessage = permissionMessage,
@@ -140,8 +142,18 @@ class MainActivity : ComponentActivity() {
                             ServerChoice(record.id, record.title, record.subtitle, record.supported)
                         },
                         selectedIds = subscriptionState.selectedIds,
-                        canConfirm = graph.subscriptions.canSelect(),
+                        canConfirm = remember(subscriptionState, searchState, selectionProbe) { graph.selectionAvailable() },
                         errorMessage = selectionError,
+                        onRefreshAvailability = {
+                            if (graph.searchState.value.ownerBusyRetry) {
+                                when (graph.retryOwnerBusyForSelection()) {
+                                    SearchStartV3.BUSY -> addEvent(ScreenEvent.SEARCH_BUSY)
+                                    SearchStartV3.REJECTED -> addEvent(ScreenEvent.SEARCH_REJECTED)
+                                    SearchStartV3.ACCEPTED, SearchStartV3.UNKNOWN -> Unit
+                                }
+                            }
+                            selectionProbe++
+                        },
                         onDismiss = { serversOpen = false },
                         onConfirm = { ids ->
                             if (graph.select(ids)) {
@@ -151,6 +163,7 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 addEvent(ScreenEvent.SELECTION_FAILED)
                                 selectionError = "Не удалось сохранить выбор серверов"
+                                selectionProbe++
                                 operationMessage = "Не удалось сохранить выбор серверов"
                             }
                         },
