@@ -28,7 +28,7 @@ internal class SupervisedStartupRecovery(
             val marker = backend.readRawMarker()
             if (marker == MarkerState.UNKNOWN) return@synchronized false
             if (marker == MarkerState.CLEAR) {
-                if (initialIntent !is RecoveryIntentState.Armed || !markActive() ||
+                if ((initialIntent !is RecoveryIntentState.Armed && initialIntent != RecoveryIntentState.Done) || !markActive() ||
                     backend.readRawMarker() != MarkerState.ACTIVE
                 ) return@synchronized false
             }

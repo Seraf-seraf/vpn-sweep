@@ -14,13 +14,19 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal enum class SupervisorStartResult { STARTED, RETRYING, UNKNOWN }
 
+internal interface SupervisorAttemptPort {
+    val identity: Any
+    fun start(): SupervisorStartResult
+    fun connectionTimedOut(): Unit
+}
+
 internal class SearchSupervisorTermination(
     context: Context,
     executor: Executor,
     confirmed: (SupervisorDeathProof) -> Unit,
     retry: () -> Unit,
     failed: () -> Unit,
-) {
+) : SupervisorAttemptPort {
     private val app = requireNotNull(context.applicationContext)
     private val started = AtomicBoolean()
     private val attempt: SupervisorBindingAttempt = SupervisorBindingAttempt(
@@ -35,7 +41,7 @@ internal class SearchSupervisorTermination(
         retry = retry,
         failed = failed,
     )
-    val identity: Any get() = attempt.identity
+    override val identity: Any get() = attempt.identity
     private val connection: ServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?): Unit =
             attempt.connected(if (name != ComponentName(app, SearchSupervisorService::class.java) || service is Binder) null else service)
@@ -44,7 +50,7 @@ internal class SearchSupervisorTermination(
         override fun onNullBinding(name: ComponentName?): Unit = attempt.connected(null)
     }
 
-    fun start(): SupervisorStartResult {
+    override fun start(): SupervisorStartResult {
         if (!started.compareAndSet(false, true) || !samePrivateSearchProcess()) return SupervisorStartResult.UNKNOWN
         val bound = try {
             app.bindService(Intent(app, SearchSupervisorService::class.java), connection, Context.BIND_AUTO_CREATE)
@@ -53,7 +59,7 @@ internal class SearchSupervisorTermination(
         return if (bound) SupervisorStartResult.STARTED else SupervisorStartResult.RETRYING
     }
 
-    fun connectionTimedOut(): Unit = attempt.connectionTimedOut()
+    override fun connectionTimedOut(): Unit = attempt.connectionTimedOut()
 
     private fun samePrivateSearchProcess(): Boolean = try {
         val flags = PackageManager.ComponentInfoFlags.of(0)

@@ -110,6 +110,41 @@ class SupervisedStartupRecoveryTest {
         assertFalse(recoveryRequiredAtStartup(confirmedRestart, RecoveryIntentState.Done, confirmedRestart::readForRecovery))
     }
 
+    @Test fun transientStartupSyncFailureOnDoneClearStartsFreshSupervision(): Unit {
+        val markerDirectory = File(temporary.root, "marker")
+        var failMarkerSync = false
+        val raw = PrivateSessionMarker(markerDirectory) {
+            if (failMarkerSync && it == markerDirectory) throw IOException("synthetic")
+        }
+        assertTrue(raw.markClear())
+        val intent = RecoveryIntentStore(File(temporary.root, "fence")) { }
+        assertTrue(intent.create(RecoveryStamp("11111111-1111-4111-8111-111111111111")))
+        assertTrue(intent.finish())
+        failMarkerSync = true
+        assertTrue(recoveryRequiredAtStartup(raw, intent.read(), raw::readForRecovery))
+        failMarkerSync = false
+        val backend = object : UpgradeRecoveryBackend {
+            override var recoveryBlocked = true
+            override var quarantined = false
+            override fun readIntent(): RecoveryIntentState = intent.read()
+            override fun writeIntent(stamp: RecoveryStamp): Boolean = false
+            override fun finishIntent(): Boolean = false
+            override fun readStamp(): RecoveryStamp? = null
+            override fun readRawMarker(): MarkerState = raw.readForRecovery()
+            override fun clearRawMarker(): Boolean = raw.markClear()
+            override fun acquireOwner(): RecoveryOwner? = null
+            override fun reconcile(): Boolean = true
+        }
+        val recovery = SupervisedStartupRecovery(backend, raw::markActive, intent::prepareSupervisorRecovery,
+            intent::finishSupervisorRecovery,
+            { SupervisorOwner.Acquired(object : RecoveryOwner { override fun close(): Unit = Unit }) })
+        assertTrue(recovery.prepare())
+        assertEquals(MarkerState.ACTIVE, raw.readForRecovery())
+        assertEquals(RecoveryIntentState.SupervisedPending, intent.read())
+        assertEquals(SupervisorRecoveryResult.RECOVERED, recovery.complete(proof(recovery)))
+        assertEquals(MarkerState.CLEAR, raw.readForRecovery())
+    }
+
     private fun proof(recovery: SupervisedStartupRecovery): SupervisorDeathProof {
         val identity = Any()
         assertTrue(recovery.expectSupervisor(identity))

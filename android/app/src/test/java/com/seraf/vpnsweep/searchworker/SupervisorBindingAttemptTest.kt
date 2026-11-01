@@ -1,5 +1,9 @@
 package com.seraf.vpnsweep.searchworker
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -91,7 +95,7 @@ class SupervisorBindingAttemptTest {
         attempt.connected(Any())
         attempt.connected(Any())
         tasks.removeFirst()()
-        death!!.invoke()
+        assertNull(death)
         assertEquals(0, confirmations)
         assertEquals(1, retries)
     }
@@ -109,5 +113,49 @@ class SupervisorBindingAttemptTest {
         assertEquals(0, retries)
         assertEquals(0, confirmations)
         assertEquals(1, failures)
+    }
+
+    @Test fun duplicateDuringLinkOrUnbindCannotProveOldAttempt(): Unit {
+        for (stage in listOf("link", "unbind")) for (unbindSucceeds in listOf(false, true)) {
+            val tasks = ArrayDeque<() -> Unit>()
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val retries = AtomicInteger()
+            val failures = AtomicInteger()
+            val confirmations = AtomicInteger()
+            val unbinds = AtomicInteger()
+            val death = AtomicReference<() -> Unit>()
+            val attempt = SupervisorBindingAttempt(
+                dispatch = { tasks.addLast(it); true },
+                link = { _, died ->
+                    death.set(died)
+                    if (stage == "link") { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+                    true
+                },
+                unbind = {
+                    unbinds.incrementAndGet()
+                    if (stage == "unbind") { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+                    unbindSucceeds
+                },
+                confirmed = { confirmations.incrementAndGet() },
+                retry = { retries.incrementAndGet() }, failed = { failures.incrementAndGet() },
+            )
+            attempt.bindReturned(true)
+            attempt.connected(Any())
+            val worker = Thread { tasks.removeFirst()() }
+            worker.start()
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                attempt.connected(Any())
+                death.get()?.invoke()
+            } finally { release.countDown(); worker.join(5_000) }
+            assertFalse(worker.isAlive)
+            death.get()?.invoke()
+            attempt.connected(Any())
+            assertEquals(1, unbinds.get())
+            assertEquals(0, confirmations.get())
+            assertEquals(if (unbindSucceeds) 1 else 0, retries.get())
+            assertEquals(if (unbindSucceeds) 0 else 1, failures.get())
+        }
     }
 }

@@ -81,7 +81,10 @@ internal class SupervisorBindingAttempt(
 
     private fun linkAndUnbind(): Unit {
         val candidate = synchronized(lock) { remote } ?: return evidence.reject()
-        if (!evidence.beginLink()) return
+        if (!evidence.beginLink()) {
+            synchronized(lock) { finished = true }
+            return unbindAndRetry()
+        }
         val linked = try { link(candidate, evidence::binderDied) } catch (_: Exception) { false } catch (_: LinkageError) { false }
         evidence.linkResult(linked)
         val released = try { unbind() } catch (_: Exception) { false } catch (_: LinkageError) { false }
