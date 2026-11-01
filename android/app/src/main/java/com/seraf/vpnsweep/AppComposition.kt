@@ -47,6 +47,7 @@ import com.seraf.vpnsweep.searchworker.SearchOwnerLeaseControl
 import com.seraf.vpnsweep.searchworker.SearchOwnerLock
 import com.seraf.vpnsweep.searchworker.SearchSessionProducer
 import com.seraf.vpnsweep.searchworker.SearchSupervisorTermination
+import com.seraf.vpnsweep.searchworker.SearchWorkerLocalDrain
 import com.seraf.vpnsweep.searchworker.SearchNetworkPolicyUnavailable
 import com.seraf.vpnsweep.searchworker.WorkerOperationFailure
 import com.seraf.vpnsweep.searchworker.WorkerServiceObservation
@@ -249,6 +250,9 @@ internal class AppComposition(context: Context) {
     )
     private val supervisorExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "search-supervisor").apply { isDaemon = true }
+    }
+    private val searchResourceReaper = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "search-resource-reaper").apply { isDaemon = true }
     }
     private val supervisedRecovery = SupervisedStartupRecovery(
         recoveryBackend,
@@ -786,6 +790,7 @@ internal class AppComposition(context: Context) {
             ))
             val owner = network.owner
             val limits = workerTransportLimits
+            val localDrain = SearchWorkerLocalDrain(snapshot.sessionGeneration)
             val adapter = SearchEngineWorkerAdapter(
                 snapshot.sessionGeneration,
                 network.network,
@@ -798,6 +803,7 @@ internal class AppComposition(context: Context) {
                         owner,
                         identity,
                         network.network,
+                        localDrain,
                         limits.frameBytes,
                         limits.replyBytes,
                         reportRetirementFailure = { reason ->
@@ -852,6 +858,10 @@ internal class AppComposition(context: Context) {
                     synchronized(this@AppComposition.lock) {
                         emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, event, ::addEvent)
                     }
+                },
+                localDrain = localDrain,
+                scheduleOpenCleanup = { action ->
+                    try { searchResourceReaper.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
                 },
             )
             stage = ScreenEvent.SEARCH_INIT_SESSION_FAILED
