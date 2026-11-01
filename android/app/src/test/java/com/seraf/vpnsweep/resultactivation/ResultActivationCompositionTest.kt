@@ -45,6 +45,78 @@ import org.junit.Test
 
 class ResultActivationCompositionTest {
     @Test
+    fun sourceRevisionFencesAnInFlightOldResultWithoutClearingActiveMarker(): Unit {
+        val f = Fixture()
+        assertTrue(f.composition.withSourceMutation { ResultRevision("1", "2") })
+        val start = f.composition.activation.reserveSearch(1, 2, Input()) as SearchStartPreparation.Reserved
+        assertEquals(SearchStartV3.ACCEPTED, start.dispatch())
+        val prepared = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        f.storage.afterPrepare = { prepared.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+        var result: SearchResultReceiptV3? = null
+        val worker = thread { result = f.port.offer(Input("old-result".toByteArray())) }
+        try {
+            assertTrue(prepared.await(5, TimeUnit.SECONDS))
+            assertTrue(f.composition.withIndependentSource({ ResultRevision("3", "4") }, {}, { error("unexpected initialization") }))
+            assertEquals(ResultRevision("3", "4"), f.composition.currentRevision())
+            assertEquals(MarkerState.ACTIVE, f.marker.state)
+            release.countDown()
+            worker.join(5_000)
+            assertFalse(worker.isAlive)
+            assertEquals(SearchResultReceiptV3.CANCELLED_CLOSED, result)
+            assertNull(f.storage.readManifest())
+            assertNull(f.completionReceipts.read())
+            f.port.stopped()
+            assertEquals(MarkerState.CLEAR, f.marker.state)
+        } finally { release.countDown() }
+    }
+
+    @Test
+    fun selectionRevisionFencesAnInFlightOldResultAndAllowsNextSearchAfterTerminal(): Unit {
+        val f = Fixture()
+        assertTrue(f.composition.withSourceMutation { ResultRevision("1", "2") })
+        val start = f.composition.activation.reserveSearch(1, 2, Input()) as SearchStartPreparation.Reserved
+        assertEquals(SearchStartV3.ACCEPTED, start.dispatch())
+        val prepared = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        f.storage.afterPrepare = { prepared.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+        var result: SearchResultReceiptV3? = null
+        val worker = thread { result = f.port.offer(Input("old-result".toByteArray())) }
+        try {
+            assertTrue(prepared.await(5, TimeUnit.SECONDS))
+            assertTrue(f.composition.withIndependentSelection(ResultRevision("1", "2"), { ResultRevision("1", "3") }, {}))
+            assertEquals(ResultRevision("1", "3"), f.composition.currentRevision())
+            assertEquals(MarkerState.ACTIVE, f.marker.state)
+            assertFalse(f.composition.activation.ready())
+            release.countDown()
+            worker.join(5_000)
+            assertFalse(worker.isAlive)
+            assertEquals(SearchResultReceiptV3.CANCELLED_CLOSED, result)
+            assertNull(f.storage.readManifest())
+            assertNull(f.completionReceipts.read())
+            f.port.stopped()
+            assertEquals(MarkerState.CLEAR, f.marker.state)
+            val next = f.composition.activation.reserveSearch(1, 3, Input()) as SearchStartPreparation.Reserved
+            assertEquals(SearchStartV3.ACCEPTED, next.dispatch())
+        } finally { release.countDown() }
+    }
+
+    @Test
+    fun ambiguousSelectionPointerWriteRemainsClosedUntilRestart(): Unit {
+        for (afterRename in listOf(false, true)) {
+            val f = Fixture()
+            assertTrue(f.composition.withSourceMutation { ResultRevision("1", "2") })
+            f.revisionStorage.failBeforeWrite = !afterRename
+            f.revisionStorage.failAfterWrite = afterRename
+            assertFalse(f.composition.withIndependentSelection(ResultRevision("1", "2"), { ResultRevision("1", "3") }, {}))
+            assertNull(f.composition.currentRevision())
+            assertFalse(f.composition.activation.ready())
+            f.revisionStorage.failBeforeWrite = false
+            f.revisionStorage.failAfterWrite = false
+            assertEquals(if (afterRename) ResultRevision("1", "3") else ResultRevision("1", "2"), f.recovered().currentRevision())
+        }
+    }
+    @Test
     fun upgradeRevisionReplayKeepsOldReceiptAndResultUnavailable(): Unit {
         val f = Fixture()
         f.publishResult()
@@ -719,6 +791,7 @@ class ResultActivationCompositionTest {
         private var nextGeneration = 0L
 
         var failManifestRead = false
+        var afterPrepare: () -> Unit = {}
         override fun safeForUpgrade(candidate: ResultRevision?): Boolean = !failManifestRead &&
             (candidate == null || manifest?.revision != candidate)
         override fun hasVerifiedManifestForUpgrade(): Boolean = !failManifestRead && manifest != null
@@ -729,6 +802,7 @@ class ResultActivationCompositionTest {
         override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String {
             val id = "00000000-0000-0000-0000-${(nextGeneration++).toString().padStart(12, '0')}"
             results[id] = Stored(revision, sha256, input.readBytes())
+            afterPrepare()
             return id
         }
         override fun readGeneration(generation: String): StoredResult? {

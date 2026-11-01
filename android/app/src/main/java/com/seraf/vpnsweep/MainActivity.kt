@@ -24,6 +24,8 @@ import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionFailureV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchui.ScreenEvent
 import com.seraf.vpnsweep.searchui.ScreenInformation
+import com.seraf.vpnsweep.searchui.dispatchSearchButton
+import com.seraf.vpnsweep.searchui.searchButtonCancels
 import com.seraf.vpnsweep.searchui.searchOutcomeEvent
 import com.seraf.vpnsweep.searchui.subscriptionOutcomeEvent
 
@@ -42,12 +44,7 @@ class MainActivity : ComponentActivity() {
                 graph.addEvent(event)
             }
             val busy = vpnState.phase in setOf(VpnPhase.CONNECTING, VpnPhase.RUNNING, VpnPhase.STOPPING)
-            val searchRunning = searchState.phase in setOf(
-                SearchPhase.RUNNING,
-                SearchPhase.PAUSING,
-                SearchPhase.PAUSED,
-                SearchPhase.CANCELLING,
-            )
+            val searchRunning = searchButtonCancels(searchState.phase)
             val selected = graph.canStartVpn()
             val permission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 if (result.resultCode == RESULT_OK) {
@@ -87,17 +84,14 @@ class MainActivity : ComponentActivity() {
                     onServers = {
                         serversOpen = true
                     },
-                    sourceEnabled = !busy && !searchRunning && subscriptionState.phase != SubscriptionPhase.LOADING,
+                    sourceEnabled = !busy && subscriptionState.phase != SubscriptionPhase.LOADING,
                     searchEnabled = searchRunning || graph.searchEnabled(),
                     searchRunning = searchRunning,
                     searchMessage = "",
                     information = ScreenInformation(events = events.toList(), startRejection = searchState.startRejection?.safeCode),
                     serverSummary = committedServerSummary(subscriptionState),
                     onSearch = {
-                        if (searchRunning) {
-                            graph.cancelSearch()
-                        } else {
-                            val outcome = graph.startSearch()
+                        dispatchSearchButton(searchState.phase, graph::cancelSearch, graph::startSearch) { outcome ->
                             searchOutcomeEvent(outcome, graph.searchState.value)?.let(::addEvent)
                         }
                     },

@@ -24,6 +24,7 @@ internal interface ResultStorage {
 }
 
 internal enum class Publication { SUCCESS, CANCELLED, INVALID, FAILED, INDETERMINATE }
+internal enum class RevisionCommit { COMMITTED, REJECTED, UNKNOWN }
 
 internal class DurabilityUnknownException(cause: IOException) : IOException(cause)
 internal class PreparationCleanupUnknownException(cause: IOException) : IOException(cause)
@@ -44,6 +45,21 @@ internal class ResultStore(private val storage: ResultStorage) {
         if (active !== token || uncertain) return false
         active = null
         return true
+    }
+
+    @Synchronized
+    fun withRevisionCommit(token: PublicationToken?, commit: () -> RevisionCommit, invalidate: () -> Unit): Boolean {
+        var invalidateToken = true
+        try {
+            val result = commit()
+            invalidateToken = result != RevisionCommit.REJECTED
+            return result == RevisionCommit.COMMITTED
+        } finally {
+            if (invalidateToken) {
+                if (token != null && active === token) active = null
+                invalidate()
+            }
+        }
     }
 
     fun publish(token: PublicationToken, input: InputStream, expectedSha256: String): Publication {

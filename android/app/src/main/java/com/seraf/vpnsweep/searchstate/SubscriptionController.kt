@@ -26,6 +26,7 @@ internal class SubscriptionUiState(
     val failure: SubscriptionFailureV1? = null,
     val requestActive: Boolean = false,
     val generation: Long = 0,
+    val installedGeneration: Long = 0,
 )
 
 internal class SubscriptionController(
@@ -36,6 +37,10 @@ internal class SubscriptionController(
     private val commitSelection: (Set<String>) -> ResultRevision,
     private val onPhase: (SubscriptionPhase) -> Unit = {},
     private val selectionMutation: ((Set<String>) -> Boolean)? = null,
+    private val independentSelection: ((List<SubscriptionRecordV1>, Set<String>) -> Boolean)? = null,
+    private val verifyIndependentSelection: ((Set<String>) -> Boolean)? = null,
+    private val independentProfiles: ((ResultRevision, Set<String>) -> PrivateInputV1?)? = null,
+    private val independentSource: ((SubscriptionSnapshotV1, Long) -> Boolean)? = null,
 ) : SubscriptionObserverV1 {
     private class Request(
         val generation: Long,
@@ -46,6 +51,7 @@ internal class SubscriptionController(
     private val mutableState = MutableStateFlow(SubscriptionUiState())
     val state: StateFlow<SubscriptionUiState> = mutableState.asStateFlow()
     private var nextGeneration = 0L
+    private var installedGeneration = 0L
     private var request: Request? = null
     private var installed: SubscriptionSnapshotV1? = null
     private var installedRecords: List<SubscriptionRecordV1> = emptyList()
@@ -66,7 +72,7 @@ internal class SubscriptionController(
         val restored = try {
             synchronized(composition.controller) {
                 if (installed != null || request != null || pendingClose.isNotEmpty() || uncertainSearchInput != null) return@synchronized false
-                if (requestGeneration <= 0 || requestGeneration < nextGeneration) return@synchronized false
+                if (requestGeneration <= 0 || (independentSource == null && requestGeneration < nextGeneration)) return@synchronized false
                 if (composition.currentRevision() != revision) return@synchronized false
                 val records = snapshot.records.toList()
                 if (!validRecords(records)) return@synchronized false
@@ -74,10 +80,12 @@ internal class SubscriptionController(
                 for (record in records) if (record.supported) supported.add(record.id)
                 val selection = selectedIds.toSet()
                 if (supported.isEmpty() || !supported.containsAll(selection)) return@synchronized false
+                if (installedRecords.isNotEmpty() && (!sameRecords(installedRecords, records) || this.selectedIds != selection)) return@synchronized false
                 installed = snapshot
                 installedRecords = records
                 this.selectedIds = selection
-                nextGeneration = requestGeneration
+                nextGeneration = maxOf(nextGeneration, requestGeneration)
+                installedGeneration = requestGeneration
                 publish(visibleState(SubscriptionPhase.READY))
                 true
             }
@@ -92,11 +100,48 @@ internal class SubscriptionController(
         return restored
     }
 
+    @Synchronized
+    fun restoreDisplay(records: List<SubscriptionRecordV1>, selected: Set<String>, revision: ResultRevision, requestGeneration: Long): Boolean {
+        if (installed != null || installedRecords.isNotEmpty() || request != null || requestGeneration <= 0 ||
+            composition.currentRevision() != revision || !validRecords(records) ||
+            !records.filter { it.supported }.map { it.id }.toSet().containsAll(selected)
+        ) return false
+        installedRecords = records.toList()
+        selectedIds = selected.toSet()
+        nextGeneration = requestGeneration
+        installedGeneration = requestGeneration
+        publish(visibleState(SubscriptionPhase.READY))
+        return true
+    }
+
+    @Synchronized
+    fun replaceValidated(snapshot: SubscriptionSnapshotV1, selected: Set<String>, revision: ResultRevision, requestGeneration: Long): Boolean {
+        if (request != null || pendingClose.isNotEmpty() || uncertainSearchInput != null ||
+            composition.currentRevision() != revision || requestGeneration != installedGeneration || selected != selectedIds ||
+            !sameRecords(snapshot.records, installedRecords)
+        ) return false
+        val previous = installed
+        if (previous != null && !closeResource(previous)) return false
+        installed = snapshot
+        return true
+    }
+
+    @Synchronized
+    fun restoreReissued(snapshot: SubscriptionSnapshotV1, selected: Set<String>, revision: ResultRevision, requestGeneration: Long): Boolean {
+        if (installed == null) return restore(snapshot, selected, revision, requestGeneration)
+        val restored = try { replaceValidated(snapshot, selected, revision, requestGeneration) }
+        catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!restored) closeResource(snapshot)
+        return restored
+    }
+
     fun load(input: String): SubscriptionStartV1 = loadWithReceipt(input).status
 
     fun loadWithReceipt(input: String): SubscriptionLoadResult {
         val current = synchronized(this) {
-            if (request != null || pendingClose.isNotEmpty() || uncertainSearchInput != null) return SubscriptionLoadResult(SubscriptionStartV1.BUSY)
+            if (request != null || pendingClose.isNotEmpty() || (uncertainSearchInput != null && independentSource == null)) {
+                return SubscriptionLoadResult(SubscriptionStartV1.BUSY)
+            }
             if (nextGeneration == Long.MAX_VALUE) return SubscriptionLoadResult(SubscriptionStartV1.REJECTED)
             Request(++nextGeneration).also {
                 request = it
@@ -175,7 +220,7 @@ internal class SubscriptionController(
         }
         if (!hasSupported) {
             if (!closeResource(snapshot)) return
-            if (composition.activation.withSourceMutation { true }) {
+            if (independentSource != null || composition.activation.withSourceMutation { true }) {
                 publish(visibleState(SubscriptionPhase.NO_SUPPORTED))
             } else {
                 publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
@@ -183,7 +228,7 @@ internal class SubscriptionController(
             return
         }
         val committed = try {
-            composition.withSourceMutation { commitSource(snapshot) }
+            independentSource?.invoke(snapshot, generation) ?: composition.withSourceMutation { commitSource(snapshot) }
         } catch (failure: Throwable) {
             if (failure !is Exception) {
                 closeResource(snapshot)
@@ -200,12 +245,13 @@ internal class SubscriptionController(
         installed = snapshot
         installedRecords = records
         selectedIds = emptySet()
+        installedGeneration = generation
         if (previous != null) closeResource(previous)
         if (pendingClose.isNotEmpty()) {
             publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.INTERNAL))
             return
         }
-        publish(SubscriptionUiState(phase = SubscriptionPhase.READY, records = records, generation = nextGeneration))
+        publish(visibleState(SubscriptionPhase.READY))
     }
 
     @Synchronized
@@ -225,9 +271,8 @@ internal class SubscriptionController(
     }
 
     @Synchronized
-    fun canSelect(): Boolean = installed != null && request == null && pendingClose.isEmpty() &&
-        uncertainSearchInput == null &&
-        composition.activation.withSourceMutation { true }
+    fun canSelect(): Boolean = (installed != null || (independentSelection != null && installedRecords.isNotEmpty())) && request == null &&
+        (independentSelection != null || (pendingClose.isEmpty() && uncertainSearchInput == null && composition.activation.withSourceMutation { true }))
 
     @Synchronized
     fun select(ids: Set<String>): Boolean {
@@ -235,10 +280,14 @@ internal class SubscriptionController(
         val supported = installedRecords.filter { it.supported }.map { it.id }.toSet()
         if (!supported.containsAll(ids)) return false
         val copy = ids.toSet()
-        if (copy == selectedIds) return composition.activation.withSourceMutation { true }
+        if (copy == selectedIds) {
+            if (independentSelection == null) return composition.activation.withSourceMutation { true }
+            return try { verifyIndependentSelection?.invoke(copy) == true }
+            catch (_: Exception) { false } catch (_: LinkageError) { false }
+        }
         var failed = false
         val committed = try {
-            selectionMutation?.invoke(copy) ?: composition.withSourceMutation { commitSelection(copy) }
+            independentSelection?.invoke(installedRecords, copy) ?: selectionMutation?.invoke(copy) ?: composition.withSourceMutation { commitSelection(copy) }
         } catch (failure: Throwable) {
             if (failure !is Exception) throw failure
             failed = true
@@ -257,7 +306,7 @@ internal class SubscriptionController(
         composition.controller.clearStartRejection()
         val prepared = synchronized(this) {
             if (pendingClose.isNotEmpty() || uncertainSearchInput != null) return SearchStartV3.BUSY
-            if (installed == null) return rejectStart(SearchStartReason.SNAPSHOT_NOT_READY)
+            if (independentProfiles == null && installed == null) return rejectStart(SearchStartReason.SNAPSHOT_NOT_READY)
             if (selectedIds.isEmpty()) return rejectStart(SearchStartReason.SELECTION_EMPTY)
             synchronized(composition.controller) {
                 val revisions = try { composition.currentRevision() } catch (_: Exception) { null }
@@ -267,8 +316,10 @@ internal class SubscriptionController(
                     sourceRevision.toString() != revisions.source || selectionRevision.toString() != revisions.selection) {
                     return rejectStart(SearchStartReason.REVISION_INVALID)
                 }
+                if (independentProfiles != null && !composition.activation.canPrepareSearchInput()) return SearchStartV3.BUSY
                 val profiles = try {
-                    installed?.selectedProfiles(selectedIds)
+                    if (independentProfiles != null) independentProfiles.invoke(revisions, selectedIds)
+                    else installed?.selectedProfiles(selectedIds)
                 } catch (_: SubscriptionProfilesTooLargeException) {
                     publish(visibleState(SubscriptionPhase.FAILED, SubscriptionFailureV1.LIMIT_EXCEEDED), notifyPhase = false)
                     return rejectStart(SearchStartReason.PROFILE_TOO_LARGE)
@@ -310,7 +361,8 @@ internal class SubscriptionController(
     }
 
     private fun visibleState(phase: SubscriptionPhase, failure: SubscriptionFailureV1? = null): SubscriptionUiState =
-        SubscriptionUiState(phase, installedRecords, selectedIds, failure, requestActive = request != null, generation = nextGeneration)
+        SubscriptionUiState(phase, installedRecords, selectedIds, failure, requestActive = request != null,
+            generation = nextGeneration, installedGeneration = installedGeneration)
 
     private fun validRecords(records: List<SubscriptionRecordV1>): Boolean {
         val ids = HashSet<String>()
@@ -318,6 +370,13 @@ internal class SubscriptionController(
             it.id.isNotEmpty() && ids.add(it.id) && (it.supported == (it.reason == null))
         }
     }
+
+    private fun sameRecords(first: List<SubscriptionRecordV1>, second: List<SubscriptionRecordV1>): Boolean =
+        first.size == second.size && first.indices.all { index ->
+            val a = first[index]
+            val b = second[index]
+            a.id == b.id && a.title == b.title && a.subtitle == b.subtitle && a.supported == b.supported && a.reason == b.reason
+        }
 
     @Synchronized
     fun retryCleanup(): Boolean {

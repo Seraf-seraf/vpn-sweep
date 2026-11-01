@@ -2,6 +2,10 @@ package com.seraf.vpnsweep.searchstate
 
 import com.seraf.vpnsweep.searchprotocol.*
 import com.seraf.vpnsweep.searchstorage.*
+import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.dispatchSearchButton
+import com.seraf.vpnsweep.searchui.searchButtonCancels
+import com.seraf.vpnsweep.searchui.searchOutcomeEvent
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.IOException
@@ -13,6 +17,51 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class SearchControllerTest {
+    @Test
+    fun cancellingButtonSendsRetryAndKeepsBackendExclusion(): Unit {
+        var runningCancels = 0
+        dispatchSearchButton(SearchPhase.RUNNING, { runningCancels++ }, { error("unexpected start") }) { error("unexpected result") }
+        assertEquals(1, runningCancels)
+        val runtime = FakeSession()
+        val marker = FakeMarker()
+        val controller = SearchController(runtime, ResultStore(FakeStorage()), marker)
+        var starts = 0
+        runtime.onStart = { starts++ }
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input("profiles"), true))
+        val oldObserver = checkNotNull(runtime.observer)
+        controller.cancel()
+        assertEquals(SearchPhase.CANCELLING, controller.state.value.phase)
+
+        var cancelCalls = 0
+        var attempts = 0
+        val events = mutableListOf<ScreenEvent>()
+        val pendingInput = Input("next profiles")
+        dispatchSearchButton(controller.state.value.phase, { cancelCalls++; controller.cancel() }, {
+            attempts++
+            controller.start(1, 3, pendingInput, true)
+        }) { outcome -> searchOutcomeEvent(outcome, controller.state.value)?.let(events::add) }
+        pendingInput.close()
+        assertEquals(false, searchButtonCancels(SearchPhase.CANCELLING))
+        assertEquals(0, cancelCalls)
+        assertEquals(1, attempts)
+        assertEquals(listOf(ScreenEvent.SEARCH_BUSY), events)
+        assertEquals(1, starts)
+        assertEquals(MarkerState.ACTIVE, marker.state)
+
+        runtime.cancelled(1, SearchResourceStateV2.RELEASED)
+        assertEquals(MarkerState.CLEAR, marker.state)
+        dispatchSearchButton(controller.state.value.phase, { cancelCalls++ }, {
+            attempts++
+            controller.start(1, 3, Input("next profiles"), true)
+        }) { outcome -> searchOutcomeEvent(outcome, controller.state.value)?.let(events::add) }
+        assertEquals(2, attempts)
+        assertEquals(2, starts)
+        assertEquals(SearchPhase.RUNNING, controller.state.value.phase)
+        oldObserver.onTerminal(SearchTerminalV3.Cancelled(1, 1, SearchResourceStateV2.RELEASED, SearchResultFenceV3.CONFIRMED))
+        assertEquals(SearchPhase.RUNNING, controller.state.value.phase)
+        assertEquals(MarkerState.ACTIVE, marker.state)
+    }
+
     @Test
     fun cancelWaitsForTerminalAndIgnoresLateResult(): Unit {
         val runtime = FakeSession()

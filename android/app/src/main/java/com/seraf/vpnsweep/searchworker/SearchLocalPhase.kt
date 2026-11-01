@@ -15,6 +15,7 @@ import java.io.IOException
 import java.io.InputStream
 
 internal data class LocalOpenedResult(val digest: String, val input: PrivateInputV1)
+internal enum class RetirementClaim { NONE, PENDING, CONFIRMED }
 
 internal sealed interface LocalPhaseOutcome {
     data object NotStarted : LocalPhaseOutcome
@@ -41,11 +42,16 @@ internal class SearchLocalPhase internal constructor(
     private val retireWorker: () -> SearchResourceStateV2,
     private val releaseLease: () -> SearchResourceStateV2,
     private val recoveryPending: () -> Boolean = { false },
+    private val beginFailedRunRecovery: () -> Boolean = { false },
+    private val beforeWorkerRetiredPublication: () -> Unit = {},
+    private val afterWorkerRetired: () -> Unit = {},
 ) {
+    private enum class Retirement { NOT_STARTED, RETIRING, RETIRING_CANCELLED, RETIRED, RETIRED_CANCELLED }
     private val lock = Any()
     private var started = false
     private var revoked = false
     private var resultOpening = false
+    private var retirement = Retirement.NOT_STARTED
     private val fence = ResultHandoffFence(sessionGeneration, phaseEpoch, object : SearchSessionObserverV3 {
         override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = observer.onProgress(phaseEpoch, progress)
         override fun onTerminal(terminal: SearchTerminalV3): Unit = observer.onTerminal(terminal)
@@ -59,7 +65,14 @@ internal class SearchLocalPhase internal constructor(
     // Only fences future result delivery; the owner schedules Go cancellation
     // separately, so a blocked Go callback cannot hold the death thread.
     fun revoke(): Unit {
-        synchronized(lock) { revoked = true }
+        synchronized(lock) {
+            revoked = true
+            retirement = when (retirement) {
+                Retirement.RETIRING -> Retirement.RETIRING_CANCELLED
+                Retirement.RETIRED -> Retirement.RETIRED_CANCELLED
+                else -> retirement
+            }
+        }
         fence.cancel()
     }
 
@@ -71,6 +84,35 @@ internal class SearchLocalPhase internal constructor(
         }
     }
 
+    fun retainCancelledRetirement(): RetirementClaim = synchronized(lock) {
+        val claim = when (retirement) {
+            Retirement.NOT_STARTED -> RetirementClaim.NONE
+            Retirement.RETIRING, Retirement.RETIRING_CANCELLED -> {
+                retirement = Retirement.RETIRING_CANCELLED
+                RetirementClaim.PENDING
+            }
+            Retirement.RETIRED, Retirement.RETIRED_CANCELLED -> {
+                retirement = Retirement.RETIRED_CANCELLED
+                RetirementClaim.CONFIRMED
+            }
+        }
+        if (claim != RetirementClaim.NONE) {
+            revoked = true
+            fence.cancel()
+        }
+        claim
+    }
+
+    fun hasRetainedRetirement(): Boolean = synchronized(lock) {
+        retirement == Retirement.RETIRING_CANCELLED || retirement == Retirement.RETIRED_CANCELLED
+    }
+
+    fun hasConfirmedRetirement(): Boolean = synchronized(lock) {
+        retirement == Retirement.RETIRED || retirement == Retirement.RETIRED_CANCELLED
+    }
+
+    fun hasConfirmedRetainedRetirement(): Boolean = synchronized(lock) { retirement == Retirement.RETIRED_CANCELLED }
+
     fun execute(): LocalPhaseOutcome {
         synchronized(lock) {
             if (started || revoked) return LocalPhaseOutcome.NotStarted
@@ -80,10 +122,12 @@ internal class SearchLocalPhase internal constructor(
             runSession()
         } catch (failure: Throwable) {
             rethrowFatal(failure)
+            try { beginFailedRunRecovery() } catch (_: Exception) { } catch (_: LinkageError) { }
             if (recoveryPending()) return LocalPhaseOutcome.Recovering
             fence.quarantine()
             return LocalPhaseOutcome.Unknown
         }
+        if (status == "interrupted") try { beginFailedRunRecovery() } catch (_: Exception) { } catch (_: LinkageError) { }
         if (recoveryPending()) return LocalPhaseOutcome.Recovering
         when (status) {
             "paused_budget" -> return LocalPhaseOutcome.Paused
@@ -91,6 +135,7 @@ internal class SearchLocalPhase internal constructor(
             "success" -> Unit
             else -> return LocalPhaseOutcome.Stopped
         }
+        synchronized(lock) { retirement = if (revoked) Retirement.RETIRING_CANCELLED else Retirement.RETIRING }
         val resources = try {
             retireWorker()
         } catch (failure: Throwable) {
@@ -105,6 +150,20 @@ internal class SearchLocalPhase internal constructor(
             closeAfterUnknown()
             return LocalPhaseOutcome.Unknown
         }
+        beforeWorkerRetiredPublication()
+        val recorded = synchronized(lock) {
+            when (retirement) {
+                Retirement.RETIRING -> { retirement = Retirement.RETIRED; true }
+                Retirement.RETIRING_CANCELLED -> { retirement = Retirement.RETIRED_CANCELLED; true }
+                else -> false
+            }
+        }
+        if (!recorded) {
+            fence.quarantine()
+            closeAfterUnknown()
+            return LocalPhaseOutcome.Unknown
+        }
+        afterWorkerRetired()
         val localOpen = synchronized(lock) {
             if (revoked) null else {
                 resultOpening = true

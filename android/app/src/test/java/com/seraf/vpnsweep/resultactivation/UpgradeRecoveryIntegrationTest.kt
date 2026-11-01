@@ -7,6 +7,7 @@ import com.seraf.vpnsweep.SupervisedRecoveryCoordinator
 import com.seraf.vpnsweep.SupervisedRecoveryStatus
 import com.seraf.vpnsweep.SearchReceiptState
 import com.seraf.vpnsweep.finishSupervisedRecovery
+import com.seraf.vpnsweep.prepareVerifiedSelection
 import com.seraf.vpnsweep.reconcileRecoveredSubscription
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchSessionObserverV3
@@ -26,6 +27,7 @@ import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionSnapshotV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionPortV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionObserverV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
+import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionFailureV1
 import com.seraf.vpnsweep.subscriptionruntime.SubscriptionSnapshotFiles
 import com.seraf.vpnsweep.subscriptionruntime.SubscriptionStorage
 import com.seraf.vpnsweep.vpn.VpnRunRegistry
@@ -39,6 +41,44 @@ import org.junit.rules.TemporaryFolder
 
 class UpgradeRecoveryIntegrationTest {
     @get:Rule val temporary = TemporaryFolder()
+
+    @Test fun failedRefreshUsesVerifiedInstalledGenerationForNextSearch(): Unit {
+        val root = temporary.newFolder()
+        val revisions = Revisions()
+        val snapshots = SubscriptionStorage(File(root, "snapshots"), SnapshotFiles()) { revisions.value }
+        revisions.value = snapshots.commitSource(Snapshot(), 7)
+        revisions.value = snapshots.commitSelection(setOf(SERVER_ID))
+        val revision = checkNotNull(revisions.value)
+        val raw = RawMarker().apply { markClear() }
+        val port = RecordingPort()
+        val composition = composition(PrivateResultStorage(File(root, "results")) { }, revisions, raw,
+            MemorySearchCompletionReceiptStorage(), port)
+        val receipts = SearchReceiptState()
+        var observer: SubscriptionObserverV1? = null
+        val source = object : SubscriptionPortV1 {
+            override fun start(generation: Long, input: String, callback: SubscriptionObserverV1): SubscriptionStartV1 {
+                observer = callback
+                return SubscriptionStartV1.ACCEPTED
+            }
+            override fun cancel(generation: Long): Unit = Unit
+        }
+        lateinit var subscriptions: SubscriptionController
+        subscriptions = SubscriptionController(source, composition, { error("unexpected source") }, { error("unexpected selection") },
+            independentProfiles = { current, ids ->
+                prepareVerifiedSelection(current, ids, snapshots, subscriptions, { true }, {}, {}) { accepted ->
+                    receipts.acceptVerified(accepted, composition.currentRevision(), subscriptions.state.value.installedGeneration)
+                }
+            })
+        assertTrue(subscriptions.restore(Snapshot(), setOf(SERVER_ID), revision, 7))
+        assertEquals(SubscriptionStartV1.ACCEPTED, subscriptions.load("synthetic"))
+        observer!!.onFailure(8, SubscriptionFailureV1.NETWORK)
+        assertEquals(8L, subscriptions.state.value.generation)
+        assertEquals(7L, subscriptions.state.value.installedGeneration)
+        assertEquals(SearchStartV3.ACCEPTED, subscriptions.startSelected())
+        assertEquals(AcceptedSubscriptionReceiptV1(7, revision.source, revision.selection), receipts.accepted)
+        assertEquals(revision.source.toLong(), port.snapshot!!.sourceRevision)
+        assertEquals(revision.selection.toLong(), port.snapshot!!.selectionRevision)
+    }
 
     @Test fun productionCoordinatorWaitsForBindingProofAndRestoresSelection(): Unit {
         val root = temporary.newFolder()
@@ -63,7 +103,7 @@ class UpgradeRecoveryIntegrationTest {
             restoredCompleted = stale
         }
         val subscriptions = SubscriptionController(object : SubscriptionPortV1 {
-            override fun start(generation: Long, input: String, observer: SubscriptionObserverV1): SubscriptionStartV1 = SubscriptionStartV1.REJECTED
+            override fun start(generation: Long, input: String, observer: SubscriptionObserverV1): SubscriptionStartV1 = SubscriptionStartV1.ACCEPTED
             override fun cancel(generation: Long): Unit = Unit
         }, composition, { error("unexpected source") }, { error("unexpected selection") })
         backend.reconcileAction = { reconcileRecoveredSubscription(composition, snapshots, subscriptions, Any(), receiptState) }
@@ -108,8 +148,17 @@ class UpgradeRecoveryIntegrationTest {
         assertTrue(mode.blocked())
         assertEquals(before, revisions.value)
         assertFalse(subscriptions.canSelect())
+        assertEquals(SubscriptionStartV1.ACCEPTED, subscriptions.load("synthetic"))
         death!!.invoke()
         runNow()
+        assertTrue(mode.blocked())
+        assertEquals(MarkerState.ACTIVE, raw.read())
+        assertEquals(before, revisions.value)
+        assertTrue(subscriptions.state.value.requestActive)
+        subscriptions.cancel()
+        val retry = queue.indexOfFirst { it.first == 1_000L }
+        assertTrue(retry >= 0)
+        queue.removeAt(retry).second()
         assertFalse(mode.blocked())
         assertEquals(listOf(SupervisedRecoveryStatus.PENDING, SupervisedRecoveryStatus.COMPLETE), events)
         assertNotEquals(before, revisions.value)

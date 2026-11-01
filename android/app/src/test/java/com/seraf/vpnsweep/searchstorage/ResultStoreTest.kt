@@ -17,6 +17,33 @@ class ResultStoreTest {
     private val nextRevision = ResultRevision("source-2", "selection-2")
 
     @Test
+    fun selectionCommitFencesResultAlreadyPreparing(): Unit {
+        for (outcome in listOf(RevisionCommit.COMMITTED, RevisionCommit.REJECTED, RevisionCommit.UNKNOWN)) {
+            val storage = FakeStorage()
+            val store = ResultStore(storage)
+            val token = checkNotNull(store.begin(firstRevision))
+            val prepared = CountDownLatch(1)
+            val proceed = CountDownLatch(1)
+            storage.afterPrepare = { prepared.countDown(); check(proceed.await(5, TimeUnit.SECONDS)) }
+            val bytes = "result".toByteArray()
+            var publication: Publication? = null
+            val worker = thread { publication = store.publish(token, bytes.inputStream(), digest(bytes.inputStream())) }
+            try {
+                assertTrue(prepared.await(5, TimeUnit.SECONDS))
+                var invalidated = false
+                assertEquals(outcome == RevisionCommit.COMMITTED, store.withRevisionCommit(token, { outcome }) { invalidated = true })
+                assertEquals(outcome != RevisionCommit.REJECTED, invalidated)
+                proceed.countDown()
+                worker.join(5_000)
+                assertFalse(worker.isAlive)
+                assertEquals(if (outcome == RevisionCommit.REJECTED) Publication.SUCCESS else Publication.CANCELLED, publication)
+                if (outcome == RevisionCommit.REJECTED) assertEquals(firstRevision, storage.manifest?.revision)
+                else assertNull(storage.manifest)
+            } finally { proceed.countDown() }
+        }
+    }
+
+    @Test
     fun cancellationBeforePublicationKeepsPreviousGeneration(): Unit {
         val storage = FakeStorage()
         val store = ResultStore(storage)

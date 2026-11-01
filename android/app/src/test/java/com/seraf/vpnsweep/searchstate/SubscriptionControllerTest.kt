@@ -26,6 +26,108 @@ import org.junit.Test
 
 class SubscriptionControllerTest {
     @Test
+    fun importingNextSubscriptionDoesNotMutateActiveSearch(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        var sourceWrites = 0
+        val writeSource: (SubscriptionSnapshotV1) -> ResultRevision = {
+            sourceWrites++
+            if (sourceWrites == 1) ResultRevision("1", "1") else ResultRevision("3", "1")
+        }
+        val generations = mutableListOf<Long>()
+        val controller = SubscriptionController(port, fixture.composition, writeSource, {
+            if (fixture.composition.currentRevision()?.source == "1") ResultRevision("1", "2") else ResultRevision("3", "2")
+        }, independentSource = { snapshot, generation ->
+            fixture.composition.withIndependentSource({ generations.add(generation); writeSource(snapshot) }, {}, {
+                fixture.composition.withSourceMutation { generations.add(generation); writeSource(snapshot) }
+            })
+        })
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        val first = Snapshot(listOf(record("first", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, first)
+        assertTrue(controller.select(setOf("first")))
+        assertEquals(SearchStartV3.ACCEPTED, controller.startSelected())
+        val active = checkNotNull(fixture.runtime.snapshot)
+        assertEquals(1L, active.sourceRevision)
+        assertEquals(2L, active.selectionRevision)
+        assertEquals(MarkerState.ACTIVE, fixture.marker.read())
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        val next = Snapshot(listOf(record("next", true)))
+        port.observer!!.onParsed(2, SubscriptionBatchStatusV1.HAS_SUPPORTED, next)
+        assertEquals(SubscriptionPhase.READY, controller.state.value.phase)
+        assertEquals(listOf("next"), controller.state.value.records.map { it.id })
+        assertEquals(listOf(1L, 2L), generations)
+        assertEquals(ResultRevision("3", "1"), fixture.composition.currentRevision())
+        assertEquals(MarkerState.ACTIVE, fixture.marker.read())
+        assertSame(active, fixture.runtime.snapshot)
+        assertFalse(active.profiles === next.selectedInput)
+        assertEquals(1, fixture.runtime.starts)
+    }
+
+    @Test
+    fun failedAndStaleRefreshPreserveInstalledSelectionGeneration(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val writeSource: (SubscriptionSnapshotV1) -> ResultRevision = { ResultRevision("1", "1") }
+        val controller = SubscriptionController(port, fixture.composition, writeSource, { ResultRevision("1", "2") },
+            independentSource = { snapshot, _ ->
+                fixture.composition.withIndependentSource({ writeSource(snapshot) }, {}, {
+                    fixture.composition.withSourceMutation { writeSource(snapshot) }
+                })
+            })
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        val first = Snapshot(listOf(record("first", true)))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, first)
+        assertTrue(controller.select(setOf("first")))
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        port.observer!!.onFailure(2, SubscriptionFailureV1.NETWORK)
+        assertEquals(SubscriptionPhase.FAILED, controller.state.value.phase)
+        assertEquals(1L, controller.state.value.installedGeneration)
+        assertEquals(setOf("first"), controller.state.value.selectedIds)
+        assertEquals(ResultRevision("1", "2"), fixture.composition.currentRevision())
+
+        assertEquals(SubscriptionStartV1.ACCEPTED, controller.load("synthetic"))
+        val stale = Snapshot(listOf(record("stale", true)))
+        port.observer!!.onParsed(2, SubscriptionBatchStatusV1.HAS_SUPPORTED, stale)
+        assertTrue(stale.closed)
+        assertTrue(controller.state.value.requestActive)
+        controller.cancel()
+        assertEquals(1L, controller.state.value.installedGeneration)
+        assertEquals(setOf("first"), controller.state.value.selectedIds)
+        assertEquals(SearchStartV3.ACCEPTED, controller.startSelected())
+        assertEquals(1L, fixture.runtime.snapshot!!.sourceRevision)
+        assertEquals(2L, fixture.runtime.snapshot!!.selectionRevision)
+    }
+
+    @Test
+    fun independentImportRejectsUnreadableCurrentRevisionBeforePreparingSource(): Unit {
+        val fixture = Fixture()
+        var prepared = false
+        fixture.revisions.onRead = { throw IOException("synthetic") }
+        assertFalse(fixture.composition.withIndependentSource({ prepared = true; ResultRevision("3", "1") }, {}, { error("unexpected initialization") }))
+        assertFalse(prepared)
+        assertEquals(0, fixture.revisions.writes)
+        assertEquals(MarkerState.CLEAR, fixture.marker.read())
+    }
+
+    @Test
+    fun missingRevisionWithExistingResultDoesNotInitializeNewSource(): Unit {
+        val fixture = Fixture()
+        fixture.storage.manifest = ResultManifest("old", ResultRevision("1", "2"), "synthetic")
+        var prepared = false
+        var initialized = false
+        assertFalse(fixture.composition.withIndependentSource({ prepared = true; ResultRevision("3", "1") }, {}, {
+            initialized = true
+            true
+        }))
+        assertFalse(prepared)
+        assertFalse(initialized)
+        assertEquals(0, fixture.revisions.writes)
+        assertNotNull(fixture.storage.manifest)
+    }
+
+    @Test
     fun ownerBusyRecoversAutomaticallyAfterProofWithoutStartingAnotherJob(): Unit {
         val fixture = Fixture()
         val port = FakeSubscriptionPort()
@@ -1521,6 +1623,7 @@ class SubscriptionControllerTest {
 
     private class FakeStorage : ResultStorage {
         var manifest: ResultManifest? = null
+        override fun safeForUpgrade(candidate: ResultRevision?): Boolean = manifest == null
         override fun prepare(revision: ResultRevision, sha256: String, input: InputStream): String = error("unused")
         override fun readGeneration(generation: String): StoredResult? = null
         override fun readManifest(): ResultManifest? = manifest

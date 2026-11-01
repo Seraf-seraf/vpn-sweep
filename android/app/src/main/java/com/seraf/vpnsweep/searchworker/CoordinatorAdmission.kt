@@ -40,7 +40,7 @@ internal interface CoordinatorRemote {
 }
 
 // CONFIRMED describes lease admission only; it does not enable worker START.
-internal enum class CoordinatorState { NEW, ADMITTING, CONFIRMED, STOPPING, WORKER_RETIRED, QUARANTINED }
+internal enum class CoordinatorState { NEW, ADMITTING, CONFIRMED, REMOTE_PENDING, DEATH_PENDING, STOPPING, WORKER_RETIRED, QUARANTINED }
 
 internal class CoordinatorRetirementProof internal constructor()
 
@@ -49,6 +49,7 @@ internal class CoordinatorAdmission(
     private val identity: WorkerIdentityV1,
     private val network: SearchNetworkV1,
     private val owner: RoundOwner,
+    private val onConfirmedDeath: () -> Boolean = { false },
 ) {
     private val lock = Any()
     private var state = CoordinatorState.NEW
@@ -56,6 +57,9 @@ internal class CoordinatorAdmission(
     private var inFlight = false
     private var duplicateClosed = true
     private var deathSeen = false
+    private var deathLinked = false
+    private var deathBeforeLink = false
+    private val linkFinished = CountDownLatch(1)
     private var unbindRequested = false
     private var unbindConfirmed = false
     private val retirementFinished = CountDownLatch(1)
@@ -66,8 +70,28 @@ internal class CoordinatorAdmission(
     private var supervisorAttempt: Any? = null
     private var supervisorDeathSeen = false
     private var supervisedDuplicateClosed = false
+    private var supervisedRemoteDeathRequired = false
 
     fun state(): CoordinatorState = synchronized(lock) { state }
+
+    fun hasLinkedRemote(candidate: CoordinatorRemote): Boolean = synchronized(lock) {
+        remote === candidate && deathLinked && state != CoordinatorState.QUARANTINED && state != CoordinatorState.WORKER_RETIRED
+    }
+
+    fun awaitLinkedRemote(candidate: CoordinatorRemote): Boolean {
+        val wait = synchronized(lock) {
+            !deathLinked && ((remote === candidate && state == CoordinatorState.ADMITTING) || (remote == null && state == CoordinatorState.NEW))
+        }
+        if (wait) {
+            var interrupted = Thread.interrupted()
+            try {
+                while (true) {
+                    try { linkFinished.await(); break } catch (_: InterruptedException) { interrupted = true }
+                }
+            } finally { if (interrupted) Thread.currentThread().interrupt() }
+        }
+        return hasLinkedRemote(candidate)
+    }
 
     fun awaitRetirement(remainingNanos: Long): Boolean {
         if (remainingNanos <= 0) return false
@@ -98,7 +122,7 @@ internal class CoordinatorAdmission(
 
     fun observeTransfer(duplicate: PreparedWorkerLeaseDuplicate): WorkerTransferObservation = synchronized(lock) {
         when {
-            state == CoordinatorState.STOPPING -> WorkerTransferObservation.Fenced
+            state == CoordinatorState.STOPPING || state == CoordinatorState.REMOTE_PENDING || state == CoordinatorState.DEATH_PENDING -> WorkerTransferObservation.Fenced
             state != CoordinatorState.ADMITTING -> WorkerTransferObservation.Unknown
             else -> duplicate.beginTransfer()?.let { WorkerTransferObservation.Claimed(it) } ?: WorkerTransferObservation.Unknown
         }
@@ -106,8 +130,10 @@ internal class CoordinatorAdmission(
 
     fun beginSupervisorStop(attempt: Any): Boolean {
         synchronized(lock) {
-            if (state != CoordinatorState.NEW && state != CoordinatorState.ADMITTING && state != CoordinatorState.CONFIRMED) return false
+            if (state != CoordinatorState.NEW && state != CoordinatorState.ADMITTING && state != CoordinatorState.CONFIRMED &&
+                state != CoordinatorState.REMOTE_PENDING && state != CoordinatorState.DEATH_PENDING) return false
             if (!lease.sealForRecovery()) return false
+            supervisedRemoteDeathRequired = deathLinked
             state = CoordinatorState.STOPPING
             supervisedStop = true
             supervisorAttempt = attempt
@@ -177,9 +203,24 @@ internal class CoordinatorAdmission(
         try {
             if (!anchorCurrent()) return false
             if (!current()) return reject()
-            if (!worker.linkDeath { workerDied(worker) }) return reject()
+            var linked = false
+            try { linked = worker.linkDeath { workerDied(worker) } }
+            finally {
+                val recover = synchronized(lock) {
+                    deathLinked = linked
+                    if (linked && deathBeforeLink && state == CoordinatorState.ADMITTING) {
+                        deathSeen = true
+                        state = CoordinatorState.DEATH_PENDING
+                        true
+                    } else false
+                }
+                linkFinished.countDown()
+                if (recover) requestRecovery()
+            }
+            if (!linked) return reject()
             if (!admitting()) return false
-            if (!worker.isAlive() || !current()) return reject()
+            if (!worker.isAlive()) return remoteUnavailable(worker)
+            if (!current()) return reject()
             val duplicate = when (val observed = lease.observeDuplicate()) {
                 is WorkerDuplicateObservation.Available -> observed.value
                 WorkerDuplicateObservation.Fenced -> return abortFenced(supervisorOnly = true)
@@ -191,7 +232,8 @@ internal class CoordinatorAdmission(
             val admitted = try {
                 if (!admitting()) return false
                 if (!anchorCurrent()) return false
-                if (!worker.isAlive() || !current()) return reject()
+                if (!worker.isAlive()) return remoteUnavailable(worker)
+                if (!current()) return reject()
                 worker.observeAdmission(identity, network, duplicate)
             } finally {
                 try {
@@ -208,12 +250,14 @@ internal class CoordinatorAdmission(
             }
             if (!admitting()) return false
             if (!anchorCurrent()) return false
-            if (!worker.isAlive() || !current()) return reject()
+            if (!worker.isAlive()) return remoteUnavailable(worker)
+            if (!current()) return reject()
             val confirmed = worker.confirm(identity, network)
             if (!confirmed && !normalStop()) return reject()
             if (!admitting()) return false
             if (!anchorCurrent()) return false
-            if (!worker.isAlive() || !current()) return reject()
+            if (!worker.isAlive()) return remoteUnavailable(worker)
+            if (!current()) return reject()
             return synchronized(lock) {
                 if (state == CoordinatorState.ADMITTING) {
                     state = CoordinatorState.CONFIRMED
@@ -222,11 +266,14 @@ internal class CoordinatorAdmission(
                     false
                 }
             }
+        } catch (_: WorkerRemoteDeliveryFailure) {
+            return remoteUnavailable(worker)
         } catch (_: Exception) {
             return reject()
         } catch (_: LinkageError) {
             return reject()
         } finally {
+            linkFinished.countDown()
             synchronized(lock) {
                 inFlight = false
                 retireIfSafe()
@@ -254,19 +301,46 @@ internal class CoordinatorAdmission(
     fun disconnected(): Unit = quarantine()
 
     private fun workerDied(worker: CoordinatorRemote): Unit {
+        var recover = false
         synchronized(lock) {
             if (remote !== worker || state == CoordinatorState.WORKER_RETIRED) return
-            if (state == CoordinatorState.STOPPING) {
-                deathSeen = true
-                retireIfSafe()
-            } else {
-                state = CoordinatorState.QUARANTINED
-                lease.quarantine()
-                retirementFinished.countDown()
+            when (state) {
+                CoordinatorState.STOPPING -> { deathSeen = true; retireIfSafe() }
+                CoordinatorState.CONFIRMED -> { deathSeen = true; state = CoordinatorState.DEATH_PENDING; recover = true }
+                CoordinatorState.ADMITTING -> {
+                    if (!deathLinked) { deathBeforeLink = true; return }
+                    deathSeen = true; state = CoordinatorState.DEATH_PENDING; recover = true
+                }
+                CoordinatorState.REMOTE_PENDING -> { deathSeen = true; state = CoordinatorState.DEATH_PENDING }
+                CoordinatorState.DEATH_PENDING -> return
+                else -> {
+                    state = CoordinatorState.QUARANTINED
+                    lease.quarantine()
+                    retirementFinished.countDown()
+                }
             }
         }
         deliverRetirement()
-        requestUnbind()
+        if (recover) requestRecovery() else if (state() == CoordinatorState.STOPPING) requestUnbind()
+    }
+
+    private fun remoteUnavailable(worker: CoordinatorRemote): Boolean {
+        val outcome = synchronized(lock) {
+            if (remote !== worker || !deathLinked) -1 else when (state) {
+                CoordinatorState.ADMITTING -> { state = CoordinatorState.REMOTE_PENDING; 1 }
+                CoordinatorState.REMOTE_PENDING, CoordinatorState.DEATH_PENDING -> 0
+                CoordinatorState.STOPPING -> if (supervisedStop) 0 else -1
+                else -> -1
+            }
+        }
+        if (outcome < 0) return reject()
+        if (outcome > 0) requestRecovery()
+        return false
+    }
+
+    private fun requestRecovery(): Unit {
+        val started = try { onConfirmedDeath() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!started) quarantine()
     }
 
     private fun admitting(): Boolean = synchronized(lock) { state == CoordinatorState.ADMITTING }
@@ -290,10 +364,13 @@ internal class CoordinatorAdmission(
         WorkerAnchorObservation.UNKNOWN -> reject()
     }
 
-    private fun normalStop(): Boolean = synchronized(lock) { !supervisedStop && state != CoordinatorState.ADMITTING }
+    private fun normalStop(): Boolean = synchronized(lock) { !supervisedStop && state == CoordinatorState.STOPPING }
 
     private fun abortFenced(supervisorOnly: Boolean): Boolean {
-        val expected = synchronized(lock) { state == CoordinatorState.STOPPING && (!supervisorOnly || supervisedStop) }
+        val expected = synchronized(lock) {
+            state == CoordinatorState.STOPPING && (!supervisorOnly || supervisedStop) ||
+                deathLinked && (state == CoordinatorState.REMOTE_PENDING || state == CoordinatorState.DEATH_PENDING)
+        }
         if (!expected) quarantine()
         return false
     }
@@ -303,6 +380,7 @@ internal class CoordinatorAdmission(
             if (state == CoordinatorState.WORKER_RETIRED) return
             state = CoordinatorState.QUARANTINED
             lease.quarantine()
+            linkFinished.countDown()
             retirementFinished.countDown()
         }
         deliverRetirement()
@@ -356,7 +434,7 @@ internal class CoordinatorAdmission(
     private fun retireIfSafe(): Unit {
         if (state != CoordinatorState.STOPPING || !unbindConfirmed || inFlight || !duplicateClosed) return
         if (supervisedStop) {
-            if (!supervisorDeathSeen || !supervisedDuplicateClosed) return
+            if (!supervisorDeathSeen || !supervisedDuplicateClosed || (supervisedRemoteDeathRequired && !deathSeen)) return
         } else if (!deathSeen) return
         try {
             lease.workerDeathConfirmed()

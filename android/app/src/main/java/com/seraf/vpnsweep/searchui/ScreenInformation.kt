@@ -66,11 +66,26 @@ internal fun searchEvent(state: SearchUiState): ScreenEvent? =
     if (state.phase == SearchPhase.INTERRUPTED && state.cleanupPending) ScreenEvent.SEARCH_CLEANUP_PENDING
     else searchEvent(state.phase)
 
+internal fun searchButtonCancels(phase: SearchPhase): Boolean = phase in setOf(
+    SearchPhase.RUNNING,
+    SearchPhase.PAUSING,
+    SearchPhase.PAUSED,
+)
+
+internal fun dispatchSearchButton(
+    phase: SearchPhase,
+    cancel: () -> Unit,
+    start: () -> SearchStartV3,
+    report: (SearchStartV3) -> Unit,
+): Unit {
+    if (searchButtonCancels(phase)) cancel() else report(start())
+}
+
 internal fun searchOutcomeEvent(outcome: SearchStartV3, state: SearchUiState): ScreenEvent? = when (outcome) {
     SearchStartV3.ACCEPTED -> null
     SearchStartV3.BUSY -> ScreenEvent.SEARCH_BUSY
-    SearchStartV3.REJECTED -> if (state.startRejection == null && state.phase != SearchPhase.INTERRUPTED) ScreenEvent.SEARCH_REJECTED else null
-    SearchStartV3.UNKNOWN -> if (state.phase != SearchPhase.INTERRUPTED) ScreenEvent.SEARCH_UNKNOWN else null
+    SearchStartV3.REJECTED -> if (state.startRejection == null) ScreenEvent.SEARCH_REJECTED else null
+    SearchStartV3.UNKNOWN -> ScreenEvent.SEARCH_UNKNOWN
 }
 
 internal fun subscriptionOutcomeEvent(outcome: SubscriptionStartV1, phase: SubscriptionPhase): ScreenEvent? = when (outcome) {

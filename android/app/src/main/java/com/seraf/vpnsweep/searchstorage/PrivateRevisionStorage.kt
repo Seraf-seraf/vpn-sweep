@@ -11,17 +11,35 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 
-internal class PrivateRevisionStorage(context: Context) : RevisionStorage {
-    private val root = File(context.noBackupFilesDir, "search-revisions")
+internal class PrivateRevisionStorage(
+    private val root: File,
+    private val syncDirectory: (File) -> Unit,
+) : RevisionStorage {
+    constructor(context: Context) : this(File(context.noBackupFilesDir, "search-revisions"), ::syncRevisionDirectory)
+
     private val current = File(root, "current")
 
     override fun read(): ResultRevision? {
-        if (!root.exists()) return null
-        sync(root)
-        if (!current.exists()) return null
+        val rootAttributes = attributes(root)
+        if (rootAttributes == null) {
+            syncDirectory(root.parentFile ?: throw IOException("revision_storage"))
+            if (attributes(root) != null) throw IOException("revision_changed")
+            return null
+        }
+        if (!rootAttributes.isDirectory) throw IOException("revision_storage")
+        syncDirectory(root)
+        val currentAttributes = attributes(current)
+        if (currentAttributes == null) {
+            if (attributes(current) != null) throw IOException("revision_changed")
+            return null
+        }
+        if (!currentAttributes.isRegularFile) throw IOException("revision_invalid")
         return DataInputStream(FileInputStream(current)).use { data ->
             if (data.readInt() != VERSION) throw IOException("revision_version")
             val source = data.readUTF()
@@ -31,9 +49,15 @@ internal class PrivateRevisionStorage(context: Context) : RevisionStorage {
         }
     }
 
+    private fun attributes(file: File): BasicFileAttributes? = try {
+        Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+    } catch (_: NoSuchFileException) {
+        null
+    }
+
     override fun write(revision: ResultRevision): Unit {
         if (!root.isDirectory && !root.mkdirs() && !root.isDirectory) throw IOException("revision_storage")
-        sync(root.parentFile ?: throw IOException("revision_storage"))
+        syncDirectory(root.parentFile ?: throw IOException("revision_storage"))
         val temporary = File(root, "revision-${UUID.randomUUID()}")
         try {
             FileOutputStream(temporary).use { output ->
@@ -45,24 +69,25 @@ internal class PrivateRevisionStorage(context: Context) : RevisionStorage {
                 output.fd.sync()
             }
             Files.move(temporary.toPath(), current.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-            sync(root)
+            syncDirectory(root)
         } finally {
             temporary.delete()
         }
     }
 
-    private fun sync(directory: File): Unit {
+}
+
+private fun syncRevisionDirectory(directory: File): Unit {
+    try {
+        val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY or OsConstants.O_CLOEXEC, 0)
         try {
-            val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY or OsConstants.O_CLOEXEC, 0)
-            try {
-                if (!OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) throw IOException("directory_invalid")
-                Os.fsync(fd)
-            } finally {
-                Os.close(fd)
-            }
-        } catch (failure: ErrnoException) {
-            throw IOException("revision_sync", failure)
+            if (!OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) throw IOException("directory_invalid")
+            Os.fsync(fd)
+        } finally {
+            Os.close(fd)
         }
+    } catch (failure: ErrnoException) {
+        throw IOException("revision_sync", failure)
     }
 }
 

@@ -68,6 +68,27 @@ internal class SearchMobilePhaseProgress(
         return synchronized(lock) { sealed && !revoked && inFlight == 0 && !retiring }
     }
 
+    fun sealAndDrainForRecovery(): Boolean {
+        val completions = synchronized(lock) {
+            if (revoked) return false
+            sealed = true
+            resumable = false
+            closing = true
+            drained to retirementDone
+        }
+        var interrupted = Thread.interrupted()
+        try {
+            for (completion in listOf(completions.first, completions.second)) {
+                while (true) {
+                    try { completion.await(); break } catch (_: InterruptedException) { interrupted = true }
+                }
+            }
+            return synchronized(lock) { sealed && !revoked && inFlight == 0 && !retiring }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
+        }
+    }
+
     fun beginRetirement(deadline: Long): Boolean {
         val completion = synchronized(lock) {
             if (revoked || closing || retiring) return false
@@ -118,6 +139,8 @@ internal class SearchMobilePhaseSession internal constructor(
     private val paused: (Long) -> SearchResourceStateV2,
     private val quarantineOwner: () -> Unit,
     private val owner: SearchOwnerLeaseControl? = null,
+    private val connectedCancelRecovery: () -> Boolean = { false },
+    private val failedRunRecovery: () -> Boolean = connectedCancelRecovery,
 ) : SearchPhaseSession {
     override val releaseOwner: SearchOwnerLeaseControl? get() = owner
 
@@ -158,6 +181,10 @@ internal class SearchMobilePhaseSession internal constructor(
         progress.operation { if (closed.get()) false else cancel(epoch) }
     } catch (_: SearchPhaseUnavailable) { false }
 
+    override fun beginConnectedCancelRecovery(): Boolean = if (closed.get()) false else connectedCancelRecovery()
+
+    override fun beginFailedRunRecovery(): Boolean = if (closed.get()) false else failedRunRecovery()
+
     override fun openVerifiedResult(): LocalOpenedResult {
         ensureAvailable()
         val result = progress.operation(whileSealed = true) {
@@ -187,6 +214,24 @@ internal class SearchMobilePhaseSession internal constructor(
         }
     }
 
+    override fun closeForRecovery(): Unit {
+        var interrupted = Thread.interrupted()
+        try {
+            closed.set(true)
+            if (!progress.sealAndDrainForRecovery()) throw IOException("search_session_cleanup_unknown")
+            if (Thread.interrupted()) interrupted = true
+            closeOnce.closeUninterruptibly()
+            if (progress.isRevoked()) throw IOException("search_session_cleanup_unknown")
+            closeComplete.set(true)
+        } catch (failure: Exception) {
+            try { quarantine() } catch (_: Exception) { }
+            throw failure
+        } finally {
+            if (Thread.interrupted()) interrupted = true
+            if (interrupted) Thread.currentThread().interrupt()
+        }
+    }
+
     override fun pauseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 =
         retire(deadlineElapsedMillis, resumable = true)
 
@@ -200,6 +245,22 @@ internal class SearchMobilePhaseSession internal constructor(
         ) return SearchResourceStateV2.RELEASED
         quarantine()
         return SearchResourceStateV2.QUARANTINED
+    }
+
+    override fun releaseForRecovery(): SearchResourceStateV2 {
+        var interrupted = Thread.interrupted()
+        try {
+            val lease = owner
+            if (lease != null && closeComplete.get() && progress.sealAndDrainForRecovery()) {
+                if (Thread.interrupted()) interrupted = true
+                if (lease.releaseUntil(Long.MAX_VALUE) && !progress.isRevoked()) return SearchResourceStateV2.RELEASED
+            }
+            quarantine()
+            return SearchResourceStateV2.QUARANTINED
+        } finally {
+            if (Thread.interrupted()) interrupted = true
+            if (interrupted) Thread.currentThread().interrupt()
+        }
     }
 
     override fun quarantine(): Unit {

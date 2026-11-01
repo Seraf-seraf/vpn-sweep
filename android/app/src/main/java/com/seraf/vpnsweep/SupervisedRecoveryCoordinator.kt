@@ -20,6 +20,7 @@ internal fun finishSupervisedRecovery(
     proof: SupervisorDeathProof,
 ): SupervisorRecoveryResult {
     val result = subscriptions.withRecovery {
+        if (subscriptions.state.value.requestActive) return@withRecovery SupervisorRecoveryResult.BUSY
         synchronized(controller) {
             val outcome = recovery.complete(proof)
             if (outcome == SupervisorRecoveryResult.RECOVERED && !controller.completeUpgradeRecovery()) {

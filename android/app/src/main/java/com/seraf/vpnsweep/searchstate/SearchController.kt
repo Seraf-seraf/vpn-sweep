@@ -18,6 +18,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchTerminalV3
 import com.seraf.vpnsweep.searchstorage.Publication
 import com.seraf.vpnsweep.searchstorage.PublicationToken
 import com.seraf.vpnsweep.searchstorage.ResultRevision
+import com.seraf.vpnsweep.searchstorage.RevisionCommit
 import com.seraf.vpnsweep.searchstorage.ResultStore
 import java.io.IOException
 import java.io.InputStream
@@ -106,6 +107,7 @@ internal class SearchController(
         var resultSeen = false
         var resultInFlight = false
         var committed = false
+        var selectionSuperseded = false
         var unknown = false
         var ownerBusy = false
         var inputClosed = false
@@ -241,6 +243,18 @@ internal class SearchController(
         return mutation()
     }
 
+    @Synchronized
+    fun commitSelectionRevision(commit: () -> RevisionCommit): Boolean {
+        val session = active
+        return store.withRevisionCommit(session?.token, commit) {
+            if (session != null) {
+                session.selectionSuperseded = true
+                session.committed = false
+                publish(mutableState.value.copy(resultCommitted = false))
+            }
+        }
+    }
+
     fun pause(): Unit {
         val command = synchronized(this) {
             val session = active ?: return
@@ -278,7 +292,7 @@ internal class SearchController(
     fun cancel(): Unit {
         val command = synchronized(this) {
             val session = active ?: return
-            if (session.unknown || session.terminal != null || !store.cancel(session.token)) return
+            if (session.unknown || session.terminal != null || (!session.selectionSuperseded && !store.cancel(session.token))) return
             publish(mutableState.value.copy(phase = SearchPhase.CANCELLING))
             if (session.dispatching) {
                 session.pendingControl = Control.CANCEL
@@ -399,7 +413,7 @@ internal class SearchController(
                 session.resultInFlight = true
                 if (session.dispatching) session.callbackDuringDispatch = true
                 when {
-                    mutableState.value.phase == SearchPhase.CANCELLING -> Publication.CANCELLED
+                    mutableState.value.phase == SearchPhase.CANCELLING || session.selectionSuperseded -> Publication.CANCELLED
                     session.token.revision != ResultRevision(offer.sourceRevision.toString(), offer.selectionRevision.toString()) -> Publication.FAILED
                     else -> Publication.SUCCESS
                 }
@@ -432,6 +446,7 @@ internal class SearchController(
             }
             session.resultInFlight = false
             if (publication == Publication.FAILED && mutableState.value.phase == SearchPhase.CANCELLING) publication = Publication.CANCELLED
+            if (session.selectionSuperseded && publication == Publication.SUCCESS) publication = Publication.CANCELLED
             if (publication == Publication.SUCCESS) session.committed = true else store.cancel(session.token)
             if (closeFailed || publication == Publication.INDETERMINATE) {
                 interruptCurrentOr(session)
@@ -508,7 +523,7 @@ internal class SearchController(
         }
         if (session.unknown || session.resultInFlight || pendingDeliveries != 0 || pendingResultClose.isNotEmpty() ||
             fence != SearchResultFenceV3.CONFIRMED || terminal.resources != SearchResourceStateV2.RELEASED ||
-            (terminal is SearchTerminalV3.Complete && !session.committed)) {
+            (terminal is SearchTerminalV3.Complete && !session.committed && !session.selectionSuperseded)) {
             interrupt(session, terminal.resources == SearchResourceStateV2.QUARANTINED)
             return null
         }
@@ -516,19 +531,19 @@ internal class SearchController(
     }
 
     private fun completeFinalization(session: Session, finalization: Finalization): Unit {
-        val accepted = try {
-            (port as? SearchSessionPortV4)?.acceptTerminal(finalization.terminal) == true
-        } catch (_: Exception) {
-            false
-        } catch (_: LinkageError) {
-            false
-        }
         synchronized(this) {
             if (active !== session || session.finalization !== finalization) return
+            val accepted = try {
+                (port as? SearchSessionPortV4)?.acceptTerminal(finalization.terminal) == true
+            } catch (_: Exception) {
+                false
+            } catch (_: LinkageError) {
+                false
+            }
             val terminal = finalization.terminal
             if (!accepted || session.unknown || session.terminal !== terminal ||
                 session.phase != terminal.phaseEpoch || session.resultInFlight || pendingDeliveries != 0 ||
-                pendingResultClose.isNotEmpty() || (terminal is SearchTerminalV3.Complete && !session.committed)
+                pendingResultClose.isNotEmpty() || (terminal is SearchTerminalV3.Complete && !session.committed && !session.selectionSuperseded)
             ) {
                 interrupt(session)
                 return
@@ -539,7 +554,7 @@ internal class SearchController(
                 interrupt(session)
                 return
             }
-            val committed = if (terminal is SearchTerminalV3.Complete) {
+            val committed = if (terminal is SearchTerminalV3.Complete && !session.selectionSuperseded) {
                 try {
                     (port as? SearchTerminalCommitterV1)?.commitTerminal(terminal) != false
                 } catch (_: Exception) {
@@ -556,7 +571,7 @@ internal class SearchController(
             admissionBlocked = false
             publish(SearchUiState(
                 phase = when {
-                    session.committed -> SearchPhase.COMPLETE
+                    session.committed && !session.selectionSuperseded -> SearchPhase.COMPLETE
                     terminal is SearchTerminalV3.Cancelled -> SearchPhase.CANCELLED
                     else -> SearchPhase.FAILED
                 },

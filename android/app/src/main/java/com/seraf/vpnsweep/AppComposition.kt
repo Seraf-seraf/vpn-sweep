@@ -238,7 +238,23 @@ internal class AppComposition(context: Context) {
         commitSource = ::commitSource,
         commitSelection = ::commitSelection,
         onPhase = { phase -> subscriptionEvent(phase)?.let(::addEvent) },
-        selectionMutation = { ids -> activation.withOwnedSourceMutation(::acquireOwner) { commitSelection(ids) } },
+        independentSelection = { records, ids ->
+            val expected = activation.currentRevision()
+            if (expected == null) false else activation.withIndependentSelection(expected,
+                { storage.prepareSelection(expected, records, ids) }, { synchronized(lock) { receipts.invalidateForSelection() } })
+        },
+        verifyIndependentSelection = { ids ->
+            val revision = activation.currentRevision()
+            revision != null && storage.isCurrentSelection(revision, ids)
+        },
+        independentProfiles = ::prepareIndependentProfiles,
+        independentSource = { snapshot, generation ->
+            activation.withIndependentSource(
+                { storage.commitSource(snapshot, generation) },
+                { synchronized(lock) { receipts.invalidateForSelection() } },
+                { activation.withSourceMutation { commitSource(snapshot) } },
+            )
+        },
     )
     val searchState = activation.controller.state
     private val ownerBusyExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
@@ -254,6 +270,9 @@ internal class AppComposition(context: Context) {
     }
     private val searchResourceReaper = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "search-resource-reaper").apply { isDaemon = true }
+    }
+    private val searchRecoveryStarter = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "search-recovery-start").apply { isDaemon = true }
     }
     private val supervisedRecovery = SupervisedStartupRecovery(
         recoveryBackend,
@@ -293,21 +312,17 @@ internal class AppComposition(context: Context) {
             if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state)?.let(::addEvent)
         }
         if (!recoveryMode.blocked()) restoreSubscription()
-        else supervisedCoordinator.start()
+        else {
+            restoreDisplaySubscription()
+            supervisedCoordinator.start()
+        }
     }
 
-    fun loadSubscription(input: String): SubscriptionLoadResult =
-        if (recoveryMode.blocked() || upgradeRecovery.blocked()) SubscriptionLoadResult(SubscriptionStartV1.BUSY)
-        else subscriptions.loadWithReceipt(input)
+    fun loadSubscription(input: String): SubscriptionLoadResult = subscriptions.loadWithReceipt(input)
 
-    fun select(ids: Set<String>): Boolean = !recoveryMode.blocked() && subscriptions.select(ids)
+    fun select(ids: Set<String>): Boolean = subscriptions.select(ids)
 
-    fun selectionAvailable(): Boolean = !recoveryMode.blocked() && selectionAvailableUnchecked()
-
-    private fun selectionAvailableUnchecked(): Boolean {
-        if (!subscriptions.canSelect()) return false
-        return activation.ownerAvailable(::acquireOwner)
-    }
+    fun selectionAvailable(): Boolean = subscriptions.canSelect()
 
     fun subscriptionState(): StateFlow<SubscriptionUiState> = subscriptions.state
 
@@ -321,8 +336,8 @@ internal class AppComposition(context: Context) {
         val searched = synchronized(lock) { completedSearch } ?: return false
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return false
         val state = subscriptions.state.value
-        return workerTransportLimits.isProven && state.phase == SubscriptionPhase.READY && state.selectedIds.isNotEmpty() &&
-            state.generation == imported.requestGeneration &&
+        return workerTransportLimits.isProven && state.selectedIds.isNotEmpty() &&
+            state.installedGeneration == imported.requestGeneration &&
             revision.source == imported.sourceRevision && revision.selection == imported.selectionRevision &&
             searched.requestGeneration == imported.requestGeneration &&
             searched.sourceRevision.toString() == revision.source &&
@@ -331,40 +346,25 @@ internal class AppComposition(context: Context) {
             AppVpnRegistry.instance.available()
     }
 
-    fun searchEnabled(): Boolean = !recoveryMode.blocked() && searchEnabledUnchecked()
-
-    private fun searchEnabledUnchecked(): Boolean = synchronized(activation.controller) {
-        if (upgradeRecovery.blocked()) return false
+    fun searchEnabled(): Boolean {
         val state = subscriptions.state.value
-        val receipt = synchronized(lock) { acceptedSnapshot }
-        val revision = try { activation.currentRevision() } catch (_: Exception) { null }
-        return state.phase == SubscriptionPhase.READY && state.selectedIds.isNotEmpty() &&
-            receipt != null && revision == ResultRevision(receipt.sourceRevision, receipt.selectionRevision) &&
-            state.generation == receipt.requestGeneration && workerTransportLimits.isProven &&
-            (searchState.value.ownerBusyRetry || searchState.value.phase in setOf(SearchPhase.IDLE, SearchPhase.COMPLETE, SearchPhase.CANCELLED, SearchPhase.FAILED))
+        return state.installedGeneration > 0 && state.selectedIds.isNotEmpty()
     }
 
-    fun startSearch(): SearchStartV3 = if (recoveryMode.blocked()) SearchStartV3.BUSY else startSearchUnchecked()
+    fun startSearch(): SearchStartV3 = if (recoveryMode.blocked()) SearchStartV3.BUSY else subscriptions.withRecovery { startSearchUnchecked() }
 
     private fun startSearchUnchecked(): SearchStartV3 = synchronized(activation.controller) {
         if (upgradeRecovery.blocked()) return SearchStartV3.BUSY
         activation.controller.clearStartRejection()
         val before = subscriptions.state.value
-        val receipt = synchronized(lock) { acceptedSnapshot }
-            ?: return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.ACCEPTED_RECEIPT_MISSING)
-        val revision = try { activation.currentRevision() } catch (_: Exception) { null }
+        try { activation.currentRevision() } catch (_: Exception) { null }
             ?: return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.CURRENT_REVISION_UNAVAILABLE)
-        if (before.phase != SubscriptionPhase.READY) {
-            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.SUBSCRIPTION_NOT_READY)
-        }
+        if (before.requestActive) return SearchStartV3.BUSY
         if (before.selectedIds.isEmpty()) {
             return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.SELECTION_EMPTY)
         }
-        if (before.generation != receipt.requestGeneration) {
+        if (before.installedGeneration <= 0) {
             return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.GENERATION_MISMATCH)
-        }
-        if (revision != ResultRevision(receipt.sourceRevision, receipt.selectionRevision)) {
-            return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.REVISION_MISMATCH)
         }
         if (!workerTransportLimits.isProven) {
             return rejectSearchStart(SearchStartStage.PREFLIGHT, SearchStartReason.TRANSPORT_LIMITS_UNPROVEN)
@@ -388,17 +388,8 @@ internal class AppComposition(context: Context) {
     private fun prepareVpnStartUnchecked(): VpnStartTicketV1? = synchronized(activation.controller) {
         if (upgradeRecovery.blocked()) return null
         if (!workerTransportLimits.isProven) return null
-        val imported = synchronized(lock) { acceptedSnapshot } ?: return null
-        val searched = synchronized(lock) { completedSearch } ?: return null
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return null
-        val identity = VpnStartIdentityV1.fromCommittedSearch(
-            imported,
-            searched,
-            revision,
-            searchComplete = hasCleanCompletion(searched),
-            resultCommitted = hasCleanCompletion(searched),
-            vpnLeaseIdentity = UUID.randomUUID().toString(),
-        ) ?: return null
+        val identity = synchronized(lock) { receipts.vpnIdentity(revision, UUID.randomUUID().toString(), ::hasCleanCompletion) } ?: return null
         if (!activation.activation.ready() || !AppVpnRegistry.instance.available()) return null
         return startGate.issue(identity)
     }
@@ -409,23 +400,14 @@ internal class AppComposition(context: Context) {
     private fun consumeVpnStartUnchecked(token: String?, reserveRun: () -> VpnRun?): VpnStartAdmissionV1? =
         synchronized(activation.controller) {
             if (upgradeRecovery.blocked()) return@synchronized null
-            val imported = synchronized(lock) { acceptedSnapshot }
-            val searched = synchronized(lock) { completedSearch }
             val revision = try { activation.currentRevision() } catch (_: Exception) { null }
             val pendingIdentity = startGate.pendingIdentity(token)
-            val identity = if (imported != null && searched != null && revision != null && pendingIdentity != null) {
-                VpnStartIdentityV1.fromCommittedSearch(
-                    imported,
-                    searched,
-                    revision,
-                    searchComplete = hasCleanCompletion(searched),
-                    resultCommitted = hasCleanCompletion(searched),
-                    vpnLeaseIdentity = pendingIdentity.vpnLeaseIdentity,
-                )
+            val identity = if (revision != null && pendingIdentity != null) {
+                synchronized(lock) { receipts.vpnIdentity(revision, pendingIdentity.vpnLeaseIdentity, ::hasCleanCompletion) }
             } else null
             val state = subscriptions.state.value
-            if (!workerTransportLimits.isProven || identity == null || state.phase != SubscriptionPhase.READY || state.selectedIds.isEmpty() ||
-                state.generation != imported?.requestGeneration || startGate.consume(token, identity) == null
+            if (!workerTransportLimits.isProven || identity == null || state.selectedIds.isEmpty() ||
+                state.installedGeneration != identity.requestGeneration || startGate.consume(token, identity) == null
             ) {
                 if (token != null) startGate.cancel(token)
                 return@synchronized null
@@ -490,17 +472,8 @@ internal class AppComposition(context: Context) {
     ) { currentVpnIdentitySnapshot(identity) }
 
     private fun currentVpnIdentitySnapshot(identity: VpnStartIdentityV1): VpnStartIdentityV1? {
-        val imported = synchronized(lock) { acceptedSnapshot } ?: return null
-        val searched = synchronized(lock) { completedSearch } ?: return null
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return null
-        return VpnStartIdentityV1.fromCommittedSearch(
-            imported,
-            searched,
-            revision,
-            searchComplete = hasCleanCompletion(searched),
-            resultCommitted = hasCleanCompletion(searched),
-            vpnLeaseIdentity = identity.vpnLeaseIdentity,
-        )
+        return synchronized(lock) { receipts.vpnIdentity(revision, identity.vpnLeaseIdentity, ::hasCleanCompletion) }
     }
 
     private fun hasCleanCompletion(searched: SearchLeaseReceiptV1): Boolean {
@@ -529,18 +502,7 @@ internal class AppComposition(context: Context) {
         }
     }
 
-    private fun commitSelection(ids: Set<String>): ResultRevision {
-        val revision = storage.commitSelection(ids)
-        synchronized(lock) {
-            acceptedSnapshot = acceptedSnapshot?.let { current ->
-                current.copy(sourceRevision = revision.source, selectionRevision = revision.selection)
-            }
-            completedSearch = null
-            restoredCompletedSearch = null
-            activeSearch = null
-        }
-        return revision
-    }
+    private fun commitSelection(ids: Set<String>): ResultRevision = storage.commitSelection(ids)
 
     private fun acquireOwner(): SearchOwnerLease? = when (val result = SearchOwnerLock.acquire(app)) {
         is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> result.lease
@@ -553,6 +515,7 @@ internal class AppComposition(context: Context) {
     private fun restoreSubscription(): Unit {
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return
         val recovered: RecoveredSubscription = storage.recover(revision) ?: return
+        storage.cacheDisplay(recovered)
         val receipt = AcceptedSubscriptionReceiptV1.fromCommittedSnapshot(
             recovered.requestGeneration,
             recovered.snapshot,
@@ -578,18 +541,37 @@ internal class AppComposition(context: Context) {
         }
     }
 
+    private fun restoreDisplaySubscription(): Unit {
+        val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return
+        val restored = restoreBlockedSubscription(revision, storage, subscriptions) {
+            subscriptionSnapshotEnvironmentSafe(android.system.Os::getenv)
+        } ?: return
+        synchronized(lock) {
+            acceptedSnapshot = restored.accepted
+            activeSearch = null
+            completedSearch = null
+            restoredCompletedSearch = null
+        }
+    }
+
+    private fun prepareIndependentProfiles(revision: ResultRevision, ids: Set<String>): PrivateInputV1? {
+        val owner = acquireOwner() ?: return null
+        return prepareVerifiedSelection(revision, ids, storage, subscriptions,
+            owner::mayLoadMobile, owner::close, owner::quarantine) { accepted ->
+            val current = activation.currentRevision()
+            val installedGeneration = subscriptions.state.value.installedGeneration
+            synchronized(lock) { receipts.acceptVerified(accepted, current, installedGeneration) }
+        }
+    }
+
     private inner class GenerationSubscriptionPort(
         private val delegate: SubscriptionPortV1,
         private val onGeneration: (Long) -> Unit,
     ) : SubscriptionPortV1 {
         override fun start(generation: Long, input: String, observer: SubscriptionObserverV1): SubscriptionStartV1 {
-            if (recoveryMode.blocked() || upgradeRecovery.blocked()) return SubscriptionStartV1.BUSY
-            return startSubscriptionIfSafe(activation.controller) {
-                if (recoveryMode.blocked() || upgradeRecovery.blocked()) SubscriptionStartV1.BUSY else {
-                    onGeneration(generation)
-                    delegate.start(generation, input, observer)
-                }
-            }
+            if (!subscriptionSnapshotEnvironmentSafe(android.system.Os::getenv)) return SubscriptionStartV1.REJECTED
+            onGeneration(generation)
+            return delegate.start(generation, input, observer)
         }
 
         override fun cancel(generation: Long): Unit = delegate.cancel(generation)
@@ -713,33 +695,8 @@ internal class AppComposition(context: Context) {
 
         override fun cancel(sessionGeneration: Long, phaseEpoch: Long): Unit = producer.cancel(sessionGeneration, phaseEpoch)
 
-        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean {
-            val receipt = synchronized(lock) { identities[terminal.sessionGeneration] } ?: return false
-            if (!producer.acceptTerminal(terminal)) return false
-            if (terminal is SearchTerminalV3.Complete) {
-                if (terminal.resources != SearchResourceStateV2.RELEASED ||
-                    terminal.resultFence != SearchResultFenceV3.CONFIRMED
-                ) return false
-                val accepted = synchronized(this@AppComposition.lock) {
-                    if (activeSearch != receipt) return false
-                    acceptedSnapshot
-                } ?: return false
-                if (!activation.prepareCleanComplete(accepted, receipt)) return false
-            }
-            synchronized(lock) {
-                if (identities[terminal.sessionGeneration] != receipt) return false
-                synchronized(this@AppComposition.lock) {
-                    if (activeSearch != receipt) return false
-                    if (terminal !is SearchTerminalV3.Complete) {
-                        identities.remove(terminal.sessionGeneration)
-                        activeSearch = null
-                        completedSearch = null
-                        restoredCompletedSearch = null
-                    }
-                }
-            }
-            return true
-        }
+        override fun acceptTerminal(terminal: SearchTerminalV3): Boolean =
+            acceptSearchTerminal(terminal, lock, identities, this@AppComposition.lock, receipts, producer::acceptTerminal, activation)
 
         override fun commitTerminal(terminal: SearchTerminalV3): Boolean {
             if (terminal !is SearchTerminalV3.Complete ||
@@ -798,7 +755,8 @@ internal class AppComposition(context: Context) {
                 network.network,
                 cleanupMillis,
                 limits.replyBytes,
-                createRound = { identity ->
+                createRound = round@ { identity ->
+                    val recoveryIntent = producer.recoveryIntent(snapshot.sessionGeneration) ?: return@round null
                     createSearchWorkerRound(
                         app,
                         lease,
@@ -806,8 +764,13 @@ internal class AppComposition(context: Context) {
                         identity,
                         network.network,
                         localDrain,
+                        recoveryIntent,
+                        producer::recoveryStartFailed,
                         { action ->
                             try { searchResourceReaper.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
+                        },
+                        { action ->
+                            try { searchRecoveryStarter.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
                         },
                         { worker, drain ->
                             startPreconnectRecovery(
@@ -821,6 +784,7 @@ internal class AppComposition(context: Context) {
                                 },
                                 { confirmed, retry, failed -> SearchSupervisorTermination(app, supervisorExecutor, confirmed, retry, failed) },
                                 producer,
+                                recoveryIntent,
                             )
                         },
                         limits.frameBytes,
@@ -909,6 +873,7 @@ internal class AppComposition(context: Context) {
                     lease.quarantine()
                 },
                 owner = lease,
+                connectedCancelRecovery = adapter::beginConnectedCancelRecovery,
             )
             } catch (failure: Throwable) {
                 if (failure !is SearchNetworkPolicyUnavailable) {

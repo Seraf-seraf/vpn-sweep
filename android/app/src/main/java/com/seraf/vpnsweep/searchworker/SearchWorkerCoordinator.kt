@@ -17,18 +17,83 @@ import java.util.concurrent.TimeUnit
 
 internal sealed interface WorkerConfirmationWait {
     class Confirmed(val binder: IBinder) : WorkerConfirmationWait
+    class DeathPending(val binder: IBinder) : WorkerConfirmationWait
+    class NotAlive(val binder: IBinder) : WorkerConfirmationWait
     data object Deadline : WorkerConfirmationWait
     data object SupervisedStop : WorkerConfirmationWait
     data object Unknown : WorkerConfirmationWait
 }
 
+internal sealed interface WorkerBinderObservation {
+    class Confirmed(val binder: IBinder) : WorkerBinderObservation
+    class DeathPending(val binder: IBinder) : WorkerBinderObservation
+    class NotAlive(val binder: IBinder) : WorkerBinderObservation
+    data object Unknown : WorkerBinderObservation
+}
+
+internal enum class WorkerBinderValidation { VALID, NOT_ALIVE, UNKNOWN }
+
+internal fun workerConfirmation(observation: WorkerBinderObservation): WorkerConfirmationWait = when (observation) {
+    is WorkerBinderObservation.Confirmed -> WorkerConfirmationWait.Confirmed(observation.binder)
+    is WorkerBinderObservation.DeathPending -> WorkerConfirmationWait.DeathPending(observation.binder)
+    is WorkerBinderObservation.NotAlive -> WorkerConfirmationWait.NotAlive(observation.binder)
+    WorkerBinderObservation.Unknown -> WorkerConfirmationWait.Unknown
+}
+
+internal fun observeAdmittedWorker(
+    binder: IBinder,
+    state: () -> CoordinatorState?,
+    validate: () -> WorkerBinderValidation,
+): WorkerBinderObservation {
+    fun observed(): WorkerBinderObservation = when (state()) {
+        CoordinatorState.CONFIRMED -> WorkerBinderObservation.Confirmed(binder)
+        CoordinatorState.DEATH_PENDING -> WorkerBinderObservation.DeathPending(binder)
+        else -> WorkerBinderObservation.Unknown
+    }
+    val first = observed()
+    if (first !is WorkerBinderObservation.Confirmed) return first
+    return when (try { validate() } catch (_: Exception) { WorkerBinderValidation.UNKNOWN } catch (_: LinkageError) { WorkerBinderValidation.UNKNOWN }) {
+        WorkerBinderValidation.VALID -> observed()
+        WorkerBinderValidation.NOT_ALIVE -> when (val latest = observed()) {
+            is WorkerBinderObservation.Confirmed -> WorkerBinderObservation.NotAlive(binder)
+            else -> latest
+        }
+        WorkerBinderValidation.UNKNOWN -> WorkerBinderObservation.Unknown
+    }
+}
+
 internal interface WorkerCoordinatorPort : PreconnectWorkerStop {
+    fun registerConnectedRecovery(recover: () -> Boolean): Boolean = false
     fun bind(): Boolean
     fun awaitConfirmation(deadlineElapsedMillis: Long): WorkerConfirmationWait
     fun confirmedBinder(): IBinder?
+    fun observeBinder(): WorkerBinderObservation = confirmedBinder()?.let(WorkerBinderObservation::Confirmed)
+        ?: WorkerBinderObservation.Unknown
     fun awaitRetired(deadlineElapsedMillis: Long): Boolean
     fun quarantine(): Unit
     fun stop(): Unit
+}
+
+internal fun supervisorStopAllowed(
+    stopped: Boolean,
+    supervised: Boolean,
+    bound: Boolean,
+    ownsReservation: Boolean,
+    connected: Boolean,
+    handshakeStarted: Boolean,
+    hasAdmittedBinder: Boolean,
+    state: CoordinatorState,
+): Boolean {
+    if (stopped || supervised || !bound || !ownsReservation) return false
+    return !(connected || handshakeStarted) ||
+        (connected && handshakeStarted && hasAdmittedBinder &&
+            (state == CoordinatorState.ADMITTING || state == CoordinatorState.CONFIRMED ||
+                state == CoordinatorState.REMOTE_PENDING || state == CoordinatorState.DEATH_PENDING))
+}
+
+internal fun recoverConnectedDisconnect(recover: () -> Boolean, fail: () -> Unit): Unit {
+    val started = try { recover() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+    if (!started) fail()
 }
 
 internal class SearchWorkerCoordinator(
@@ -47,6 +112,8 @@ internal class SearchWorkerCoordinator(
     private var passedToAdmission = false
     private val handshakeFinished = CountDownLatch(1)
     private var admittedBinder: IBinder? = null
+    private var handshakeRemote: AndroidRemote? = null
+    private var connectedRecovery: (() -> Boolean)? = null
     private val admissionLease = object : CoordinatorLease {
         override fun duplicate(): SearchLeaseDuplicateV1? = when (val observed = observeDuplicate()) {
             is WorkerDuplicateObservation.Available -> observed.value
@@ -65,7 +132,7 @@ internal class SearchWorkerCoordinator(
         override fun workerDeathConfirmed(): Unit = lease.workerDeathConfirmed()
         override fun quarantine(): Unit = lease.quarantine()
     }
-    private val admission = CoordinatorAdmission(admissionLease, identity, network, owner)
+    private val admission = CoordinatorAdmission(admissionLease, identity, network, owner, ::requestConnectedRecovery)
     private var workerPid = -1
     private val currentCheck = OwnerCurrentCheck(
         Process.myUid(), Process.myPid(), identity, network,
@@ -205,6 +272,15 @@ internal class SearchWorkerCoordinator(
 
     fun state(): CoordinatorState = admission.state()
 
+    override fun registerConnectedRecovery(recover: () -> Boolean): Boolean = synchronized(lock) {
+        if (bindCalled || connectedRecovery != null) false else { connectedRecovery = recover; true }
+    }
+
+    private fun requestConnectedRecovery(): Boolean {
+        val recover = synchronized(lock) { connectedRecovery } ?: return false
+        return try { recover() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+    }
+
     override fun awaitConfirmation(deadlineElapsedMillis: Long): WorkerConfirmationWait {
         val now = SystemClock.elapsedRealtime()
         if (now < 0) return WorkerConfirmationWait.Unknown
@@ -218,21 +294,41 @@ internal class SearchWorkerCoordinator(
         }
         if (!signalled) return WorkerConfirmationWait.Deadline
         if (synchronized(lock) { stopped && supervisedStop }) return WorkerConfirmationWait.SupervisedStop
-        return confirmedBinder()?.let(WorkerConfirmationWait::Confirmed) ?: WorkerConfirmationWait.Unknown
+        return workerConfirmation(observeBinder())
     }
 
-    override fun confirmedBinder(): IBinder? {
-        val candidate = synchronized(lock) { if (stopped) null else admittedBinder } ?: return null
-        val valid = try {
-            admission.state() == CoordinatorState.CONFIRMED && lease.anchorHeldForWorker() && candidate.isBinderAlive &&
-                owner.verifyOnCallback(network) && candidate.isBinderAlive && lease.anchorHeldForWorker() &&
-                admission.state() == CoordinatorState.CONFIRMED
-        } catch (_: Exception) {
-            false
-        } catch (_: LinkageError) {
-            false
+    override fun confirmedBinder(): IBinder? = (observeBinder() as? WorkerBinderObservation.Confirmed)?.binder
+
+    override fun observeBinder(): WorkerBinderObservation {
+        val candidate = synchronized(lock) {
+            if (stopped) return WorkerBinderObservation.Unknown
+            val admitted = admittedBinder
+            if (admitted == null) {
+                val pending = pendingBinder
+                val remote = handshakeRemote
+                if (pending != null && remote != null && remote.matches(pending) && admission.hasLinkedRemote(remote)) {
+                    when (admission.state()) {
+                        CoordinatorState.DEATH_PENDING -> return WorkerBinderObservation.DeathPending(pending)
+                        CoordinatorState.REMOTE_PENDING -> return WorkerBinderObservation.NotAlive(pending)
+                        else -> Unit
+                    }
+                }
+                return WorkerBinderObservation.Unknown
+            }
+            admitted
         }
-        return if (valid) synchronized(lock) { if (!stopped && admittedBinder === candidate) candidate else null } else null
+        return observeAdmittedWorker(candidate, {
+            synchronized(lock) { if (!stopped && admittedBinder === candidate) admission.state() else null }
+        }) {
+            when {
+                !lease.anchorHeldForWorker() -> WorkerBinderValidation.UNKNOWN
+                !candidate.isBinderAlive -> WorkerBinderValidation.NOT_ALIVE
+                !owner.verifyOnCallback(network) -> WorkerBinderValidation.UNKNOWN
+                !candidate.isBinderAlive -> WorkerBinderValidation.NOT_ALIVE
+                !lease.anchorHeldForWorker() -> WorkerBinderValidation.UNKNOWN
+                else -> WorkerBinderValidation.VALID
+            }
+        }
     }
 
     override fun awaitRetired(deadlineElapsedMillis: Long): Boolean {
@@ -246,8 +342,15 @@ internal class SearchWorkerCoordinator(
     override fun ownsRetirement(proof: CoordinatorRetirementProof): Boolean = admission.ownsRetirement(proof, identity)
 
     override fun beginSupervisorStop(attempt: Any, unbound: (Boolean) -> Unit): Boolean {
+        val candidate = synchronized(lock) {
+            if (!stopped && connected && handshakeStarted && pendingBinder != null && admittedBinder == null) handshakeRemote else null
+        }
+        if (candidate != null && !admission.awaitLinkedRemote(candidate)) return false
         val duplicate = synchronized(lock) {
-            if (stopped || supervisedStop || bindResult != true || !reservationOwned || connected || handshakeStarted) return false
+            val tracked = admittedBinder != null && admittedBinder === pendingBinder ||
+                (handshakeRemote?.let { it.matches(pendingBinder) && admission.hasLinkedRemote(it) } == true)
+            if (!supervisorStopAllowed(stopped, supervisedStop, bindResult == true, reservationOwned,
+                    connected, handshakeStarted, tracked, admission.state())) return false
             val value = prepared ?: return false
             supervisedStop = true
             stopLocked()
@@ -302,16 +405,17 @@ internal class SearchWorkerCoordinator(
     }
 
     private fun startHandshake(): Unit {
-        val binder = synchronized(lock) {
+        val (binder, remote) = synchronized(lock) {
             if (bindResult != true || stopped || handshakeStarted) return
             val candidate = pendingBinder ?: return
             handshakeStarted = true
-            candidate
+            val remote = AndroidRemote(candidate).also { handshakeRemote = it }
+            candidate to remote
         }
         try {
             Thread({
                 try {
-                    val accepted = admission.connect(AndroidRemote(binder))
+                    val accepted = admission.connect(remote)
                     synchronized(lock) {
                         if (accepted && !stopped && pendingBinder === binder) admittedBinder = binder
                     }
@@ -329,9 +433,7 @@ internal class SearchWorkerCoordinator(
                 val neverBound = synchronized(lock) { supervisedStop && bindResult == false }
                 if (!success && !neverBound) admission.disconnected()
             }
-        } else {
-            failClosed()
-        }
+        } else recoverConnectedDisconnect(::requestConnectedRecovery, ::failClosed)
     }
 
     private fun failClosed(): Unit {
@@ -408,11 +510,13 @@ internal class SearchWorkerCoordinator(
     private inner class AndroidRemote(private val binder: IBinder) : CoordinatorRemote {
         private var recipient: IBinder.DeathRecipient? = null
 
+        fun matches(candidate: IBinder?): Boolean = binder === candidate
+
         override fun linkDeath(onDeath: () -> Unit): Boolean = try {
             val receiver = IBinder.DeathRecipient { onDeath() }
             recipient = receiver
             binder.linkToDeath(receiver, 0)
-            binder.isBinderAlive
+            true
         } catch (_: Exception) {
             false
         }
@@ -450,7 +554,7 @@ internal class SearchWorkerCoordinator(
                 request.writeStrongBinder(ownerBinder)
                 request.writeIdentity(identity, network)
                 request.writeTypedObject(descriptor, 0)
-                if (!binder.transact(SearchWorkerIpcV2.ADMIT, request, response, 0)) return WorkerAdmissionObservation.UNKNOWN
+                if (!workerTransact { binder.transact(SearchWorkerIpcV2.ADMIT, request, response, 0) }) return WorkerAdmissionObservation.UNKNOWN
                 response.readException()
                 if (response.readInt() != SearchWorkerIpcV2.PENDING_CONFIRMATION) return WorkerAdmissionObservation.UNKNOWN
                 val pid = response.readInt()
@@ -487,7 +591,7 @@ internal class SearchWorkerCoordinator(
             return try {
                 data.writeInterfaceToken(SearchWorkerIpcV2.DESCRIPTOR)
                 write(data)
-                if (!binder.transact(code, data, reply, 0)) return false
+                if (!workerTransact { binder.transact(code, data, reply, 0) }) return false
                 reply.readException()
                 val result = reply.readInt()
                 reply.enforceNoDataAvail()

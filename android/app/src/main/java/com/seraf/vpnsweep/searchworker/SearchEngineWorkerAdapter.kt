@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 internal interface DeadlineWorkerPort : SearchWorkerPortV2 {
+    fun beginConnectedCancelRecovery(identity: WorkerIdentityV1): Boolean = false
     fun openUntil(
         identity: WorkerIdentityV1,
         network: SearchNetworkV1,
@@ -78,6 +79,7 @@ internal class SearchEngineWorkerAdapter(
     private val localDrain: SearchWorkerLocalDrain = SearchWorkerLocalDrain(sessionGeneration),
     private val startOpenCloser: (Thread) -> Unit = Thread::start,
     private val scheduleOpenCleanup: (() -> Unit) -> Boolean = { false },
+    private val awaitCleanupCancel: (CountDownLatch, Long) -> Boolean = { latch, nanos -> latch.await(nanos, TimeUnit.NANOSECONDS) },
 ) : SearchEngineWorker {
     private enum class State { OPENING, READY, RETIRING, CLOSING }
     private class Round(val identity: WorkerIdentityV1) {
@@ -86,6 +88,7 @@ internal class SearchEngineWorkerAdapter(
         var dispatched = false
         var cancelled = false
         var cancelling: CountDownLatch? = null
+        var cancelConfirmed: Boolean? = null
         var cleanupStarted: Long? = null
         var cleanupScheduled = false
         var inFlight = false
@@ -102,6 +105,24 @@ internal class SearchEngineWorkerAdapter(
     private var lastGeneration: Long? = null
     private var pendingCancelledGeneration: Long? = null
     private var fatal: Long? = null
+    private var recoveryFenced = false
+
+    fun beginConnectedCancelRecovery(): Boolean = beginConnectedRecovery(null, allowFailure = false, allowCancelled = true)
+
+    private fun beginConnectedRecovery(expected: Round?, allowFailure: Boolean, allowCancelled: Boolean): Boolean {
+        val round = synchronized(lock) {
+            val current = active ?: return false
+            if (expected != null && current !== expected) return false
+            if (recoveryFenced || (current.state != State.READY && (current.state != State.OPENING || !current.dispatched)) || (!allowCancelled && current.cancelled) ||
+                (!allowFailure && fatal != null) || current.client == null) return false
+            recoveryFenced = true
+            current
+        }
+        val started = try { round.client!!.port.beginConnectedCancelRecovery(round.identity) }
+        catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!started) synchronized(lock) { if (active === round) recoveryFenced = false }
+        return started
+    }
 
     override fun open(
         session: Long,
@@ -123,6 +144,7 @@ internal class SearchEngineWorkerAdapter(
         val attemptDeadline = elapsedDeadlineMillis(started, attemptRemainingMillis)
         val startupDeadline = elapsedDeadlineMillis(started, startupRemainingMillis)
         val current = synchronized(lock) {
+            if (recoveryFenced) return Mobile.SearchWorkerCancelled
             fatal?.let { return it }
             if (active != null || lastGeneration?.let { generation <= it } == true) return Mobile.SearchWorkerBusy
             val pending = pendingCancelledGeneration
@@ -196,6 +218,7 @@ internal class SearchEngineWorkerAdapter(
                 try { reportFatalFailure(WorkerFatalV2.CLEANUP_INCOMPLETE) } catch (_: Exception) { } catch (_: LinkageError) { }
                 return failAndCancel(current, Mobile.SearchWorkerCleanupIncomplete)
             }
+            if (synchronized(lock) { recoveryFenced }) return Mobile.SearchWorkerCleanupIncomplete
             if (outcome == null) return failAndCancel(current, Mobile.SearchWorkerDeliveryUnknown)
             val cancelled = synchronized(lock) { current.cancelled }
             if (cancelled && outcome is WorkerOpenV2.Ready) {
@@ -247,6 +270,7 @@ internal class SearchEngineWorkerAdapter(
         }
         val current = synchronized(lock) {
             val value = active
+            if (recoveryFenced && value?.identity?.workerGeneration == generation) return fault(Mobile.SearchWorkerCancelled)
             if (fatal != null || value == null || value.identity.workerGeneration != generation || value.identity.round.toLong() != round + 1 ||
                 value.state != State.READY || value.cancelled || value.inFlight
             ) null else {
@@ -332,6 +356,10 @@ internal class SearchEngineWorkerAdapter(
                 is CallDisposition.Success -> resultEnvelope(disposition.bytes)
                 is CallDisposition.Failure -> {
                     try { reportOperationFailure(WorkerOperationFailure.CALL) } catch (_: Exception) { } catch (_: LinkageError) { }
+                    if (result == ReplyRead.Failed && reply is WorkerReplyV1.Complete &&
+                        beginConnectedRecovery(current, allowFailure = true, allowCancelled = false)) {
+                        return fault(disposition.code)
+                    }
                     fault(failAndCancel(current, disposition.code))
                 }
                 CallDisposition.Cancelled -> {
@@ -361,6 +389,7 @@ internal class SearchEngineWorkerAdapter(
         val started = nowNanos()
         val current = synchronized(lock) {
             val value = active
+            if (recoveryFenced && value?.identity?.workerGeneration == generation) return Mobile.SearchWorkerCleanupIncomplete
             if (value == null || value.identity.workerGeneration != generation || value.state != State.READY) null else {
                 recordCleanupStart(value, started)
                 if (cleanupMillis == this.cleanupMillis && !value.inFlight && fatal == null) value.state = State.CLOSING
@@ -399,6 +428,7 @@ internal class SearchEngineWorkerAdapter(
             recordCleanupStart(value, started)
             value.openingWake?.countDown()
             value.callWake?.countDown()
+            if (recoveryFenced) return
             if (!value.dispatched || value.state == State.CLOSING || value.state == State.RETIRING || value.cancelling != null) return
             value.cancelling = CountDownLatch(1)
             value
@@ -452,6 +482,7 @@ internal class SearchEngineWorkerAdapter(
         val start = cleanupStart(round)
         val deadline = elapsedDeadlineMillis(start, cleanupMillis)
         if (deadline == null || remainingCleanupNanos(start) <= 0) {
+            synchronized(lock) { round.cancelConfirmed = false }
             reportCancelFailure()
             failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
@@ -461,14 +492,21 @@ internal class SearchEngineWorkerAdapter(
             Thread({
                 try {
                     round.client!!.port.cancelUntil(round.identity, deadline)
+                    synchronized(lock) { round.cancelConfirmed = true }
+                } catch (_: ConnectedCancelRecoveryPending) {
+                    synchronized(lock) { recoveryFenced = true; round.cancelConfirmed = false }
+                    reportCancelFailure()
                 } catch (_: InterruptedException) {
+                    synchronized(lock) { round.cancelConfirmed = false }
                     Thread.currentThread().interrupt()
                     reportCancelFailure()
                     failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } catch (_: Exception) {
+                    synchronized(lock) { round.cancelConfirmed = false }
                     reportCancelFailure()
                     failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } catch (_: LinkageError) {
+                    synchronized(lock) { round.cancelConfirmed = false }
                     reportCancelFailure()
                     failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
                 } finally {
@@ -476,10 +514,12 @@ internal class SearchEngineWorkerAdapter(
                 }
             }, "search-round-cancel").apply { isDaemon = true }.start()
         } catch (_: Exception) {
+            synchronized(lock) { round.cancelConfirmed = false }
             reportCancelFailure()
             failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
         } catch (_: LinkageError) {
+            synchronized(lock) { round.cancelConfirmed = false }
             reportCancelFailure()
             failAndCancel(round, Mobile.SearchWorkerDeliveryUnknown)
             done.countDown()
@@ -724,9 +764,20 @@ internal class SearchEngineWorkerAdapter(
             }
         }
         if (!schedule) return
-        val deadline = elapsedDeadlineMillis(cleanupStart(round), cleanupMillis) ?: return
+        val started = cleanupStart(round)
+        val deadline = elapsedDeadlineMillis(started, cleanupMillis) ?: return
         try {
             Thread({
+                val pending = synchronized(lock) { round.cancelling }
+                val cancelled = if (pending == null) true else try {
+                    val remaining = remainingCleanupNanos(started)
+                    remaining > 0 && awaitCleanupCancel(pending, remaining) && remainingCleanupNanos(started) > 0 &&
+                        synchronized(lock) { round.cancelConfirmed == true }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
+                } catch (_: Exception) { false } catch (_: LinkageError) { false }
+                if (!cancelled) { reportOperation(WorkerOperationFailure.CLOSE); return@Thread }
                 val closed = try { round.client!!.port.closeUntil(round.identity, deadline) == WorkerCloseV1.CLEAN_AND_DEAD } catch (_: Exception) { false } catch (_: LinkageError) { false }
                 if (!closed) reportOperation(WorkerOperationFailure.CLOSE)
             }, "search-round-quarantine").apply { isDaemon = true }.start()

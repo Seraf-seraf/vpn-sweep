@@ -19,11 +19,36 @@ import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 internal enum class SearchLeaseHandoff { CLAIMED, RETURNED, UNKNOWN }
 internal class SearchNetworkPolicyUnavailable(
     val reason: NetworkPolicyUnavailableReason = NetworkPolicyUnavailableReason.UNCONFIRMED,
 ) : IOException("search_network_policy_unavailable")
+
+internal class PhaseRecoveryIntent(val sessionGeneration: Long, val phaseEpoch: Long) {
+    private val state = AtomicInteger(0)
+
+    fun request(generation: Long): Boolean {
+        if (generation != sessionGeneration) return false
+        while (true) when (state.get()) {
+            0 -> if (state.compareAndSet(0, 1)) return true
+            1 -> return true
+            else -> return false
+        }
+    }
+
+    fun claimRunExit(): Boolean {
+        while (true) when (state.get()) {
+            0 -> if (state.compareAndSet(0, 2)) return false
+            1 -> return true
+            else -> return false
+        }
+    }
+
+    fun requested(): Boolean = state.get() == 1
+    fun close(): Unit { state.set(3) }
+}
 
 // The factory owns one session and the lease/network resources used by it.
 // It must consume profiles synchronously; the producer closes the input.
@@ -36,11 +61,15 @@ internal interface SearchPhaseSession {
     fun preparePhase(epoch: Long): Unit
     fun runPhase(epoch: Long): String
     fun cancelPhase(epoch: Long): Boolean
+    fun beginConnectedCancelRecovery(): Boolean = false
+    fun beginFailedRunRecovery(): Boolean = false
     fun openVerifiedResult(): LocalOpenedResult
     fun closeSession(deadlineElapsedMillis: Long): Unit
+    fun closeForRecovery(): Unit = closeSession(Long.MAX_VALUE)
     fun pauseResources(deadlineElapsedMillis: Long): SearchResourceStateV2
     fun retireResources(deadlineElapsedMillis: Long): SearchResourceStateV2
     fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2
+    fun releaseForRecovery(): SearchResourceStateV2 = releaseResources(Long.MAX_VALUE)
     fun quarantine(): Unit
 }
 
@@ -51,6 +80,14 @@ internal class SearchSessionProducer(
     private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
     private val reportNetworkUnavailable: (Long, NetworkPolicyUnavailableReason) -> Unit = { _, _ -> },
     private val reportRecoveryPending: (Long) -> Boolean = { true },
+    private val beforePhaseOutcomeClaim: () -> Unit = {},
+    private val afterPhaseOutcomeClaim: (Boolean) -> Unit = {},
+    private val afterRecoveryPhaseDone: () -> Unit = {},
+    private val beforeWatchSample: () -> Unit = {},
+    private val onRecoveryWatchRetained: () -> Unit = {},
+    private val beforeWorkerRetiredPublication: () -> Unit = {},
+    private val afterWorkerRetired: () -> Unit = {},
+    private val beforeRetiredCancelWait: () -> Unit = {},
 ) : SearchSessionPortV4 {
     constructor(
         cleanupMillis: Long,
@@ -101,6 +138,9 @@ internal class SearchSessionProducer(
         var recoveryEvidence = false
         var recoveryPhaseDone = false
         var recoveryFinishing = false
+        var recoveryTerminal = false
+        var recoveryIntent: PhaseRecoveryIntent? = null
+        var retirementClosing = false
     }
 
     private val lock = Any()
@@ -174,12 +214,13 @@ internal class SearchSessionProducer(
             ) return false
             val now = try { nowMillis() } catch (_: Exception) { -1L } catch (_: LinkageError) { -1L }
             val deadline = current.deadline
-            if (now < 0 || deadline == null || now >= deadline || !current.lease.acceptRelease()) {
+            if (now < 0 || (!current.recoveryTerminal && (deadline == null || now >= deadline)) || !current.lease.acceptRelease()) {
                 markUnknown(current, notify = false, watch = null)?.let { failed = current to it }
                 false
             } else {
                 current.watch?.done?.countDown()
                 current.watch = null
+                current.recoveryIntent?.close()
                 active = null
                 true
             }
@@ -198,12 +239,29 @@ internal class SearchSessionProducer(
         dispatchUnknown(pending.first, pending.second)
     }
 
+    fun recoveryIntent(generation: Long): PhaseRecoveryIntent? = synchronized(lock) {
+        val current = active
+        if (current == null || current.snapshot.sessionGeneration != generation || current.state != State.RUNNING) null
+        else current.recoveryIntent
+    }
+
+    fun recoveryStartFailed(intent: PhaseRecoveryIntent): Unit {
+        val pending = synchronized(lock) {
+            val current = active ?: return
+            if (current.recoveryIntent !== intent || !intent.requested()) return
+            val actions = markUnknown(current, notify = true, watch = null) ?: return
+            current to actions
+        }
+        dispatchUnknown(pending.first, pending.second)
+    }
+
     fun beginPreconnectRecovery(generation: Long, recovery: PreconnectRecovery): Boolean {
         val selected = synchronized(lock) {
             val current = active ?: return false
+            val intent = current.recoveryIntent ?: return false
             if (current.snapshot.sessionGeneration != generation || current.state != State.RUNNING ||
                 current.session == null || current.phase == null || current.control == Control.PAUSE ||
-                !recovery.belongsTo(generation, current.sessionLease)
+                !recovery.belongsTo(generation, current.sessionLease, intent) || !intent.request(generation)
             ) return false
             val phase = current.phase!!
             if (!phase.fenceForRecovery()) return false
@@ -213,15 +271,22 @@ internal class SearchSessionProducer(
             current.watch?.done?.countDown()
             current.watch = null
             current.deadline = null
-            current to token
+            val cancel = if (current.control == Control.NONE && current.cancellation == null) {
+                Cancellation(current.epoch).also { current.cancellation = it }
+            } else null
+            Triple(current, token, cancel)
         }
-        val fenced = try { reportRecoveryPending(generation) } catch (_: Exception) { false } catch (_: LinkageError) { false }
-        if (!fenced) { unknown(selected.first); return false }
-        val started = try {
-            recovery.start { proof -> recoveryEvidence(selected.first, selected.second, recovery, proof) }
-        } catch (_: Exception) { false } catch (_: LinkageError) { false }
-        if (!started) unknown(selected.first)
-        return started
+        val launched = launch {
+            val fenced = try { reportRecoveryPending(generation) } catch (_: Exception) { false } catch (_: LinkageError) { false }
+            if (!fenced) { unknown(selected.first); return@launch }
+            val started = try {
+                recovery.start { proof -> recoveryEvidence(selected.first, selected.second, recovery, proof) }
+            } catch (_: Exception) { false } catch (_: LinkageError) { false }
+            if (!started) unknown(selected.first)
+            else selected.third?.let { cancel -> selected.first.session?.let { dispatchCancel(selected.first, it, cancel) } }
+        }
+        if (!launched) unknown(selected.first)
+        return launched
     }
 
     private fun recoveryEvidence(current: Active, token: Any, recovery: PreconnectRecovery, proof: PreconnectRecoveryProof?): Unit {
@@ -243,24 +308,34 @@ internal class SearchSessionProducer(
 
     private fun dispatchRecoveryFinish(current: Active): Unit {
         if (!launch {
+            var interrupted = Thread.interrupted()
+            try {
                 val session = synchronized(lock) {
                     if (active !== current || current.state != State.RECOVERING || !current.recoveryFinishing) return@launch
                     current.session
                 } ?: return@launch unknown(current)
-                val resources = cleanup(current) { deadline ->
-                    session.closeSession(deadline)
+                val resources = try {
+                    session.closeForRecovery()
+                    if (Thread.interrupted()) interrupted = true
                     if (!current.lease.completeRecovery()) SearchResourceStateV2.QUARANTINED
-                    else session.releaseResources(deadline)
-                } ?: SearchResourceStateV2.QUARANTINED
+                    else session.releaseForRecovery()
+                } catch (_: Exception) { SearchResourceStateV2.QUARANTINED }
+                catch (_: LinkageError) { SearchResourceStateV2.QUARANTINED }
+                if (Thread.interrupted()) interrupted = true
                 if (resources != SearchResourceStateV2.RELEASED) return@launch unknown(current)
                 val cancelled = synchronized(lock) {
                     if (active !== current || current.state != State.RECOVERING) return@launch
                     current.resources = resources
+                    current.recoveryTerminal = true
                     current.control == Control.CANCEL
                 }
                 val terminal = if (cancelled) SearchTerminalV3.Cancelled(current.snapshot.sessionGeneration, current.epoch, resources, SearchResultFenceV3.CONFIRMED)
                 else SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch, SearchFailureV1.INTERRUPTED, resources, SearchResultFenceV3.CONFIRMED)
                 finish(current, terminal)
+            } finally {
+                if (Thread.interrupted()) interrupted = true
+                if (interrupted) Thread.currentThread().interrupt()
+            }
             }) unknown(current)
     }
 
@@ -433,18 +508,35 @@ internal class SearchSessionProducer(
             unknown(current)
             return
         }
-        val phase = SearchLocalPhase(
+        val intent = PhaseRecoveryIntent(current.snapshot.sessionGeneration, epoch)
+        lateinit var phase: SearchLocalPhase
+        phase = SearchLocalPhase(
             current.snapshot.sessionGeneration, epoch, current.snapshot.sourceRevision, current.snapshot.selectionRevision,
             current.observer, { session.runPhase(epoch) }, session::openVerifiedResult,
-            { if (cleanup(current) { deadline -> session.closeSession(deadline); true } != true) throw IOException("session_cleanup_unknown") },
-            { cleanup(current) { deadline -> session.retireResources(deadline) } ?: SearchResourceStateV2.QUARANTINED },
-            { (cleanup(current) { deadline -> session.releaseResources(deadline) } ?: SearchResourceStateV2.QUARANTINED)
+            {
+                if (phase.hasConfirmedRetirement()) closeRetiredSession(current, session)
+                else if (cleanup(current) { deadline -> session.closeSession(deadline); true } != true) throw IOException("session_cleanup_unknown")
+            },
+            { retireAfterRun(current, session) },
+            { (if (synchronized(lock) { active === current && current.state != State.UNKNOWN }) session.releaseForRecovery()
+                else SearchResourceStateV2.QUARANTINED)
                 .also { result -> synchronized(lock) { current.resources = result } } },
-            { synchronized(lock) { active === current && current.epoch == epoch && current.state == State.RECOVERING } },
+            {
+                beforePhaseOutcomeClaim()
+                val recovering = intent.claimRunExit()
+                afterPhaseOutcomeClaim(recovering)
+                recovering
+            },
+            { synchronized(lock) {
+                if (active !== current || current.epoch != epoch || current.state != State.RUNNING || current.control == Control.PAUSE) false
+                else session.beginFailedRunRecovery()
+            } },
+            beforeWorkerRetiredPublication, afterWorkerRetired,
         )
         val cancelBeforeRun = synchronized(lock) {
             if (active !== current || current.epoch != epoch || current.state == State.UNKNOWN) return
             current.phase = phase
+            current.recoveryIntent = intent
             current.state = State.RUNNING
             current.control == Control.CANCEL
         }
@@ -452,10 +544,12 @@ internal class SearchSessionProducer(
         val outcome = phase.execute()
         if (outcome == LocalPhaseOutcome.Recovering) {
             val finish = synchronized(lock) {
-                if (active !== current || current.epoch != epoch || current.state != State.RECOVERING) return
+                if (active !== current || current.epoch != epoch || current.recoveryIntent !== intent || !intent.requested() ||
+                    (current.state != State.RUNNING && current.state != State.RECOVERING)) return
                 current.recoveryPhaseDone = true
-                claimRecoveryFinish(current)
+                current.state == State.RECOVERING && claimRecoveryFinish(current)
             }
+            afterRecoveryPhaseDone()
             if (finish) dispatchRecoveryFinish(current)
             return
         }
@@ -473,12 +567,17 @@ internal class SearchSessionProducer(
             finishWithoutRun(current, cancelled = true)
             return
         }
-        val cancellation = synchronized(lock) {
+        val (cancellation, retainedProof) = synchronized(lock) {
             if (active !== current || current.epoch != epoch || current.state == State.UNKNOWN) return
+            val retained = outcome is LocalPhaseOutcome.Handoff && outcome.localFence == SearchResultFenceV3.CONFIRMED &&
+                phase.hasConfirmedRetainedRetirement()
+            if (retained) {
+                current.recoveryTerminal = true
+            }
             current.state = State.FINISHING
-            current.cancellation
+            current.cancellation to retained
         }
-        if (cancellation != null && !awaitCancel(current, cancellation, requireAccepted = false)) {
+        if (cancellation != null && !retainedProof && !awaitCancel(current, cancellation, requireAccepted = false)) {
             unknown(current)
             return
         }
@@ -505,6 +604,7 @@ internal class SearchSessionProducer(
         var finishPaused: Active? = null
         var failed: Active? = null
         var startWatch: Pair<Active, ControlWatch>? = null
+        var recoverySession: SearchPhaseSession? = null
         synchronized(lock) {
             val current = active ?: return
             if (current.snapshot.sessionGeneration != generation || current.epoch != epoch ||
@@ -526,10 +626,17 @@ internal class SearchSessionProducer(
                     startWatch = current to watch
                 }
                 if (requested == Control.CANCEL) phase = current.phase
+                val retirement = if (requested == Control.CANCEL && current.state == State.RUNNING) {
+                    current.phase?.retainCancelledRetirement() ?: RetirementClaim.NONE
+                } else RetirementClaim.NONE
+                if (requested == Control.CANCEL && current.state == State.RUNNING && retirement != RetirementClaim.CONFIRMED && !current.retirementClosing) {
+                    recoverySession = current.session
+                }
                 if (current.state == State.PAUSED && requested == Control.CANCEL) {
                     current.state = State.FINISHING
                     finishPaused = current
-                } else if (current.prepared && (current.state == State.STARTING || current.state == State.RUNNING) && current.cancellation == null) {
+                } else if (retirement != RetirementClaim.CONFIRMED && !current.retirementClosing && current.prepared &&
+                    (current.state == State.STARTING || current.state == State.RUNNING) && current.cancellation == null) {
                     val owner = current.session
                     if (owner == null) failed = current else {
                         val cancellation = Cancellation(epoch)
@@ -540,6 +647,7 @@ internal class SearchSessionProducer(
             }
         }
         phase?.revoke()
+        try { recoverySession?.beginConnectedCancelRecovery() } catch (_: Exception) { } catch (_: LinkageError) { }
         startWatch?.let { (current, watch) -> dispatchWatch(current, watch) }
         failed?.let { unknown(it) }
         dispatch?.let { (current, session, cancellation) -> dispatchCancel(current, session, cancellation) }
@@ -549,20 +657,46 @@ internal class SearchSessionProducer(
     private fun dispatchWatch(current: Active, watch: ControlWatch): Unit {
         if (!launch {
                 while (true) {
+                    beforeWatchSample()
                     val now = nowMillis()
-                    if (now < 0 || now >= watch.deadline) {
+                    if (now < 0) {
                         unknown(current, watch = watch)
+                        return@launch
+                    }
+                    if (now >= watch.deadline) {
+                        if (retainRecoveryWatch(current, watch)) return@launch
+                        val session = synchronized(lock) {
+                            if (active === current && current.watch === watch && current.control == Control.CANCEL && current.state == State.RUNNING) current.session
+                            else null
+                        }
+                        val recovering = try { session?.beginConnectedCancelRecovery() == true }
+                        catch (_: Exception) { false } catch (_: LinkageError) { false }
+                        if (!recovering) unknown(current, watch = watch)
                         return@launch
                     }
                     val finished = try { watch.done.await(watch.deadline - now, TimeUnit.MILLISECONDS) }
                     catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
-                        unknown(current, watch = watch)
+                        if (!retainRecoveryWatch(current, watch)) unknown(current, watch = watch)
                         return@launch
                     }
                     if (finished) return@launch
                 }
             }) unknown(current, watch = watch)
+    }
+
+    private fun retainRecoveryWatch(current: Active, watch: ControlWatch): Boolean {
+        val retained = synchronized(lock) {
+            if (active === current && current.watch === watch &&
+                (current.recoveryIntent?.requested() == true ||
+                    (current.control == Control.CANCEL && current.phase?.hasRetainedRetirement() == true))) {
+                current.watch = null
+                watch.done.countDown()
+                true
+            } else false
+        }
+        if (retained) onRecoveryWatchRetained()
+        return retained
     }
 
     private fun dispatchCancel(current: Active, session: SearchPhaseSession, cancellation: Cancellation): Unit {
@@ -720,6 +854,7 @@ internal class SearchSessionProducer(
         val deliver = notify && current.state != State.TERMINAL
         blocked = true
         current.state = State.UNKNOWN
+        current.recoveryIntent?.close()
         current.watch?.done?.countDown()
         current.watch = null
         return UnknownActions(current.lease, current.session, current.phase, current.resources, deliver)
@@ -742,8 +877,38 @@ internal class SearchSessionProducer(
         true
     } catch (_: Exception) { false } catch (_: LinkageError) { false }
 
-    private fun <T : Any> cleanup(current: Active, action: (Long) -> T): T? {
-        val now = nowMillis()
+    private fun retireAfterRun(current: Active, session: SearchPhaseSession): SearchResourceStateV2 {
+        if (ensureCleanupDeadline(current, nowMillis()) == null) return SearchResourceStateV2.QUARANTINED
+        return session.retireResources(Long.MAX_VALUE)
+    }
+
+    private fun closeRetiredSession(current: Active, session: SearchPhaseSession): Unit {
+        val cancellation = synchronized(lock) {
+            if (active !== current || current.state != State.RUNNING) throw IOException("session_cleanup_unknown")
+            current.retirementClosing = true
+            current.cancellation
+        }
+        if (cancellation != null) {
+            beforeRetiredCancelWait()
+            if (!awaitRetiredCancellation(cancellation)) throw IOException("session_cancel_unknown")
+        }
+        if (!synchronized(lock) { active === current && current.state == State.RUNNING }) throw IOException("session_cleanup_unknown")
+        session.closeForRecovery()
+    }
+
+    private fun awaitRetiredCancellation(cancellation: Cancellation): Boolean {
+        var interrupted = Thread.interrupted()
+        try {
+            while (true) {
+                try { cancellation.done.await(); break } catch (_: InterruptedException) { interrupted = true }
+            }
+            return cancellation.accepted != null
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun ensureCleanupDeadline(current: Active, now: Long): Long? {
         if (now < 0 || now > Long.MAX_VALUE - cleanupMillis) return null
         var startWatch: ControlWatch? = null
         val deadline = synchronized(lock) {
@@ -755,6 +920,12 @@ internal class SearchSessionProducer(
             selected
         }
         startWatch?.let { dispatchWatch(current, it) }
+        return deadline
+    }
+
+    private fun <T : Any> cleanup(current: Active, action: (Long) -> T): T? {
+        val now = nowMillis()
+        val deadline = ensureCleanupDeadline(current, now) ?: return null
         if (deadline <= now) return null
         val done = CountDownLatch(1)
         val value = java.util.concurrent.atomic.AtomicReference<T?>()

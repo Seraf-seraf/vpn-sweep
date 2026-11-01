@@ -30,9 +30,10 @@ internal fun startPreconnectRecovery(
     schedule: (Long, () -> Unit) -> Boolean,
     newAttempt: ((SupervisorDeathProof) -> Unit, () -> Unit, () -> Unit) -> SupervisorAttemptPort,
     producer: SearchSessionProducer,
+    intent: PhaseRecoveryIntent,
 ): Boolean = producer.beginPreconnectRecovery(
     generation,
-    PreconnectRecovery(generation, custody, drain, worker, schedule, newAttempt),
+    PreconnectRecovery(generation, custody, drain, worker, schedule, newAttempt, intent),
 )
 
 internal class PreconnectRecovery(
@@ -42,6 +43,7 @@ internal class PreconnectRecovery(
     private val worker: PreconnectWorkerStop,
     private val schedule: (Long, () -> Unit) -> Boolean,
     private val newAttempt: ((SupervisorDeathProof) -> Unit, () -> Unit, () -> Unit) -> SupervisorAttemptPort,
+    private val intent: PhaseRecoveryIntent? = null,
 ) {
     private val lock = Any()
     private var started = false
@@ -57,7 +59,8 @@ internal class PreconnectRecovery(
     private var issued: PreconnectRecoveryProof? = null
     private var consumed = false
 
-    fun belongsTo(generation: Long, custody: Any): Boolean = this.generation == generation && this.custody === custody
+    fun belongsTo(generation: Long, custody: Any, intent: PhaseRecoveryIntent): Boolean =
+        this.generation == generation && this.custody === custody && this.intent === intent
 
     fun consume(proof: PreconnectRecoveryProof): Boolean = synchronized(lock) {
         if (!finished || consumed || issued !== proof) false else { consumed = true; true }

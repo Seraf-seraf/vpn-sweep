@@ -77,6 +77,10 @@ internal class ResultActivation(
         }
     }
 
+    fun canPrepareSearchInput(): Boolean = controller.withSourceMutation {
+        !uncertain && !deciding && markerClear() && disconnected()
+    }
+
     // UI readiness is a hint; VPN must use admitVpn under the native lease.
     fun ready(): Boolean {
         var ready = false

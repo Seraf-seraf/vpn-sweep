@@ -21,6 +21,107 @@ class CoordinatorAdmissionTest {
     private val identity = WorkerIdentityV1(41, 2uL, 1, 9)
     private val network = SearchNetworkV1(7, 3)
 
+    @Test fun supervisedStopDuringAdmissionWaitsForOriginalDeathAndTransferDrain(): Unit {
+        for (deathBeforeStop in listOf(false, true)) {
+            val lease = FakeLease()
+            val recovery = CountDownLatch(1)
+            val remote = FakeRemote(lease, blockAdmit = true, delayUnbind = true,
+                onAdmit = { throw WorkerRemoteDeliveryFailure(android.os.DeadObjectException()) })
+            val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true }) { recovery.countDown(); true }
+            val caller = Thread { admission.connect(remote) }
+            caller.start()
+            try {
+                assertTrue(remote.entered.await(2, TimeUnit.SECONDS))
+                assertTrue(admission.hasLinkedRemote(remote))
+                if (deathBeforeStop) {
+                    remote.die()
+                    assertTrue(recovery.await(2, TimeUnit.SECONDS))
+                    assertEquals(CoordinatorState.DEATH_PENDING, admission.state())
+                }
+                val attempt = Any()
+                assertTrue(admission.beginSupervisorStop(attempt))
+                val result = AtomicReference<CoordinatorRetirementProof?>()
+                assertTrue(admission.observeRetirement { result.set(it) })
+                remote.finishUnbind(true)
+                admission.supervisedDuplicateClosed(true)
+                assertTrue(admission.supervisorDied(supervisorProof(attempt)))
+                if (!deathBeforeStop) remote.die()
+                assertNull(result.get())
+                assertEquals(0, lease.deaths.get())
+                remote.release.countDown()
+                caller.join(2_000)
+                assertFalse(caller.isAlive)
+                assertTrue(admission.ownsRetirement(checkNotNull(result.get()), identity))
+                assertEquals(1, lease.duplicateClosed.get())
+                assertEquals(1, lease.deaths.get())
+                assertFalse(lease.quarantined.get())
+            } finally { remote.release.countDown(); caller.join(2_000) }
+        }
+    }
+
+    @Test fun earlyDeathRequiresSuccessfulLinkAndWaitsUninterruptiblyForItsResult(): Unit {
+        for (linkFails in listOf(false, true)) {
+            val lease = FakeLease()
+            val recovery = CountDownLatch(1)
+            val remote = FakeRemote(lease, blockLink = true, delayUnbind = true, failure = if (linkFails) "link" else "")
+            val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true }) { recovery.countDown(); true }
+            val caller = Thread { admission.connect(remote) }
+            val result = AtomicReference<Boolean>()
+            val interrupted = AtomicBoolean()
+            val waiter = Thread { result.set(admission.awaitLinkedRemote(remote)); interrupted.set(Thread.currentThread().isInterrupted) }
+            caller.start()
+            try {
+                assertTrue(remote.linkEntered.await(2, TimeUnit.SECONDS))
+                remote.die()
+                assertEquals(CoordinatorState.ADMITTING, admission.state())
+                waiter.start()
+                waiter.interrupt()
+                remote.linkRelease.countDown()
+                waiter.join(2_000)
+                caller.join(2_000)
+                assertFalse(waiter.isAlive)
+                assertFalse(caller.isAlive)
+                assertTrue(interrupted.get())
+                if (linkFails) {
+                    assertEquals(false, result.get())
+                    assertEquals(CoordinatorState.QUARANTINED, admission.state())
+                    assertEquals(0, lease.deaths.get())
+                } else {
+                    assertEquals(true, result.get())
+                    assertTrue(recovery.await(2, TimeUnit.SECONDS))
+                    val attempt = Any()
+                    assertTrue(admission.beginSupervisorStop(attempt))
+                    remote.finishUnbind(true)
+                    admission.supervisedDuplicateClosed(true)
+                    assertTrue(admission.supervisorDied(supervisorProof(attempt)))
+                    assertEquals(CoordinatorState.WORKER_RETIRED, admission.state())
+                    assertEquals(1, lease.deaths.get())
+                }
+            } finally { remote.linkRelease.countDown(); caller.join(2_000); if (waiter.isAlive) waiter.join(2_000) }
+        }
+    }
+
+    @Test
+    fun supervisedConnectedStopRequiresDeathOfTheOriginalAdmittedBinder(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease, delayUnbind = true)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true })
+        assertTrue(admission.connect(remote))
+        val attempt = Any()
+        assertTrue(admission.beginSupervisorStop(attempt))
+        val result = AtomicReference<CoordinatorRetirementProof?>()
+        assertTrue(admission.observeRetirement { result.set(it) })
+        remote.finishUnbind(true)
+        admission.supervisedDuplicateClosed(true)
+        assertTrue(admission.supervisorDied(supervisorProof(attempt)))
+        assertNull(result.get())
+        assertEquals(0, lease.deaths.get())
+        remote.die()
+        assertTrue(admission.ownsRetirement(checkNotNull(result.get()), identity))
+        assertEquals(1, lease.deaths.get())
+        assertFalse(lease.quarantined.get())
+    }
+
     @Test
     fun supervisorStopBeforeConnectionWaitsForUnbindDuplicateCloseAndExactProcessDeath(): Unit {
         for (order in listOf(listOf("unbind", "duplicate", "death"), listOf("death", "unbind", "duplicate"), listOf("duplicate", "death", "unbind"))) {
@@ -100,6 +201,7 @@ class CoordinatorAdmissionTest {
             val checks = AtomicInteger()
             val closes = AtomicInteger()
             val deaths = AtomicInteger()
+            val remoteDeath = AtomicReference<(() -> Unit)?>()
             val lease = object : CoordinatorLease {
                 override fun duplicate(): SearchLeaseDuplicateV1 = object : SearchLeaseDuplicateV1 {
                     override fun close(): Unit { closes.incrementAndGet() }
@@ -116,7 +218,7 @@ class CoordinatorAdmissionTest {
                 override fun quarantine(): Unit = realLease.quarantine()
             }
             val remote = object : CoordinatorRemote {
-                override fun linkDeath(onDeath: () -> Unit): Boolean = true
+                override fun linkDeath(onDeath: () -> Unit): Boolean { remoteDeath.set(onDeath); return true }
                 override fun isAlive(): Boolean = true
                 override fun admit(identity: WorkerIdentityV1, network: SearchNetworkV1, duplicate: SearchLeaseDuplicateV1): Boolean = true
                 override fun confirm(identity: WorkerIdentityV1, network: SearchNetworkV1): Boolean = true
@@ -135,6 +237,7 @@ class CoordinatorAdmissionTest {
                 release.countDown()
                 caller.join(2_000)
                 assertFalse(caller.isAlive)
+                remoteDeath.get()?.invoke()
                 assertEquals(CoordinatorState.WORKER_RETIRED, admission.state())
                 assertEquals(1, deaths.get())
                 assertEquals(if (pauseAt == 1) 0 else 1, closes.get())
@@ -154,6 +257,7 @@ class CoordinatorAdmissionTest {
             val observed = CountDownLatch(1)
             val resume = CountDownLatch(1)
             val deaths = AtomicInteger()
+            val deathCallback = AtomicReference<(() -> Unit)?>()
             fun pause(): Unit { observed.countDown(); check(resume.await(2, TimeUnit.SECONDS)) }
             val lease = object : CoordinatorLease {
                 override fun duplicate(): SearchLeaseDuplicateV1 = object : SearchLeaseDuplicateV1 { override fun close(): Unit = Unit }
@@ -171,7 +275,11 @@ class CoordinatorAdmissionTest {
                 override fun quarantine(): Unit = realLease.quarantine()
             }
             val remote = object : CoordinatorRemote {
-                override fun linkDeath(onDeath: () -> Unit): Boolean { if (failure == "link") { pause(); return false }; return true }
+                override fun linkDeath(onDeath: () -> Unit): Boolean {
+                    deathCallback.set(onDeath)
+                    if (failure == "link") { pause(); return false }
+                    return true
+                }
                 override fun isAlive(): Boolean { if (failure == "alive") { pause(); return false }; return true }
                 override fun admit(identity: WorkerIdentityV1, network: SearchNetworkV1, duplicate: SearchLeaseDuplicateV1): Boolean {
                     if (failure == "admit" || failure == "admit_exception") {
@@ -203,9 +311,18 @@ class CoordinatorAdmissionTest {
                 resume.countDown()
                 caller.join(2_000)
                 assertFalse(caller.isAlive)
-                assertEquals("lost unknown: $failure", CoordinatorState.QUARANTINED, admission.state())
-                assertTrue(processAdmission.isQuarantined())
-                assertEquals(0, deaths.get())
+                if (failure == "alive") {
+                    assertEquals(CoordinatorState.STOPPING, admission.state())
+                    assertFalse(processAdmission.isQuarantined())
+                    assertEquals(0, deaths.get())
+                    checkNotNull(deathCallback.get()).invoke()
+                    assertEquals(CoordinatorState.WORKER_RETIRED, admission.state())
+                    assertEquals(1, deaths.get())
+                } else {
+                    assertEquals("lost unknown: $failure", CoordinatorState.QUARANTINED, admission.state())
+                    assertTrue(processAdmission.isQuarantined())
+                    assertEquals(0, deaths.get())
+                }
             } finally { resume.countDown(); caller.join(2_000) }
         }
     }

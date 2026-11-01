@@ -115,7 +115,7 @@ class ScreenInformationTest {
         assertEquals(ScreenEvent.SUBSCRIPTION_BUSY, subscriptionOutcomeEvent(SubscriptionStartV1.BUSY, SubscriptionPhase.LOADING))
         assertNull(subscriptionOutcomeEvent(SubscriptionStartV1.REJECTED, SubscriptionPhase.FAILED))
         assertEquals(ScreenEvent.SEARCH_BUSY, searchOutcomeEvent(SearchStartV3.BUSY, SearchUiState()))
-        assertNull(searchOutcomeEvent(SearchStartV3.UNKNOWN, SearchUiState(phase = SearchPhase.INTERRUPTED)))
+        assertEquals(ScreenEvent.SEARCH_UNKNOWN, searchOutcomeEvent(SearchStartV3.UNKNOWN, SearchUiState(phase = SearchPhase.INTERRUPTED)))
         val info = ScreenInformation(events = listOf(ScreenEvent.SELECTION_FAILED), startRejection = "preflight:revision_mismatch")
         assertEquals(listOf("Не удалось сохранить выбор серверов", "Подбор не запущен (preflight:revision_mismatch)"), presentInformation(info).events.map { it.message })
         assertEquals(0, presentInformation(ScreenInformation(startRejection = "secret-not-a-code")).events.size)

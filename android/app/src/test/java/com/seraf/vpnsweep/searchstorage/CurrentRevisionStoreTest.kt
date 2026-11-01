@@ -2,14 +2,34 @@ package com.seraf.vpnsweep.searchstorage
 
 import java.io.IOException
 import java.io.InputStream
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
 
 class CurrentRevisionStoreTest {
+    @get:Rule val temporary = TemporaryFolder()
+
+    @Test
+    fun absentRevisionIsDistinctFromInvalidOrUnreadableStorage(): Unit {
+        val parent = temporary.newFolder()
+        val root = File(parent, "revisions")
+        val storage = PrivateRevisionStorage(root) { }
+        assertEquals(CurrentRevision.Absent, CurrentRevisionStore(storage).readCurrent())
+        assertTrue(root.mkdir())
+        assertEquals(CurrentRevision.Absent, CurrentRevisionStore(storage).readCurrent())
+        assertTrue(File(root, "current").mkdir())
+        assertEquals(CurrentRevision.Unknown, CurrentRevisionStore(storage).readCurrent())
+
+        val unreadable = PrivateRevisionStorage(File(parent, "missing")) { throw IOException("synthetic") }
+        assertEquals(CurrentRevision.Unknown, CurrentRevisionStore(unreadable).readCurrent())
+    }
+
     @Test
     fun selectionChangeSurvivesRestartAndDisablesPreviousResult(): Unit {
         val revisionStorage = FakeRevisions()

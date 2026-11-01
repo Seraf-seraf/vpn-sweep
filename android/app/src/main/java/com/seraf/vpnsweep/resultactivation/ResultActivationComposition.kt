@@ -8,12 +8,14 @@ import com.seraf.vpnsweep.searchstate.MarkerState
 import com.seraf.vpnsweep.searchstate.SearchController
 import com.seraf.vpnsweep.searchstate.SessionMarker
 import com.seraf.vpnsweep.searchstorage.CurrentRevisionStore
+import com.seraf.vpnsweep.searchstorage.CurrentRevision
 import com.seraf.vpnsweep.searchstorage.PrivateResultStorage
 import com.seraf.vpnsweep.searchstorage.PrivateRevisionStorage
 import com.seraf.vpnsweep.searchstorage.ResultRevision
 import com.seraf.vpnsweep.searchstorage.ResultStorage
 import com.seraf.vpnsweep.searchstorage.ResultStore
 import com.seraf.vpnsweep.searchstorage.RevisionStorage
+import com.seraf.vpnsweep.searchstorage.RevisionCommit
 import com.seraf.vpnsweep.vpn.VpnRunRegistry
 import java.io.File
 
@@ -112,6 +114,82 @@ internal class ResultActivationComposition private constructor(
             if (!closeAttempted) owner.close()
         }
     }
+
+    fun withIndependentSelection(
+        expected: ResultRevision,
+        prepare: () -> ResultRevision,
+        accepted: (ResultRevision) -> Unit,
+    ): Boolean {
+        val candidate = prepare()
+        return synchronized(controller) {
+            if (!vpnRuns.available() || revisions.load() != expected || candidate.source != expected.source || candidate == expected) {
+                return@synchronized false
+            }
+            val published = storage.readManifest()?.revision
+            if (candidate == published) return@synchronized false
+            controller.commitSelectionRevision {
+                try {
+                    if (!revisions.update(candidate) || revisions.load() != candidate) {
+                        revisions.markUncertain()
+                        RevisionCommit.UNKNOWN
+                    } else {
+                        accepted(candidate)
+                        RevisionCommit.COMMITTED
+                    }
+                } catch (failure: Throwable) {
+                    revisions.markUncertain()
+                    throw failure
+                }
+            }
+        }
+    }
+
+    fun withIndependentSource(
+        prepare: () -> ResultRevision,
+        accepted: (ResultRevision) -> Unit,
+        initialize: () -> Boolean,
+    ): Boolean {
+        val expected = synchronized(controller) { revisions.readCurrent() }
+        if (expected == CurrentRevision.Unknown) return false
+        if (expected == CurrentRevision.Absent) {
+            return synchronized(controller) {
+                if (revisions.readCurrent() != CurrentRevision.Absent || storage.readManifest() != null ||
+                    !storage.safeForUpgrade(null) || !completionReceipts.safeForUpgrade(null) { false }
+                ) false else initialize()
+            }
+        }
+        val candidate = prepare()
+        return synchronized(controller) {
+            if (!vpnRuns.available() || revisions.readCurrent() != expected || !canonicalRevision(candidate)) {
+                return@synchronized false
+            }
+            val previous = (expected as? CurrentRevision.Present)?.revision
+            if (previous != null && (!canonicalRevision(previous) || candidate.source == previous.source)) {
+                return@synchronized false
+            }
+            if (candidate == storage.readManifest()?.revision) return@synchronized false
+            controller.commitSelectionRevision {
+                try {
+                    if (!revisions.update(candidate) || revisions.load() != candidate) {
+                        revisions.markUncertain()
+                        RevisionCommit.UNKNOWN
+                    } else {
+                        accepted(candidate)
+                        RevisionCommit.COMMITTED
+                    }
+                } catch (failure: Throwable) {
+                    revisions.markUncertain()
+                    throw failure
+                }
+            }
+        }
+    }
+
+    private fun canonicalRevision(revision: ResultRevision): Boolean =
+        listOf(revision.source, revision.selection).all { text ->
+            val number = text.toLongOrNull()
+            number != null && number > 0 && number.toString() == text
+        }
 
     fun ownerAvailable(acquire: () -> AutoCloseable?): Boolean {
         val owner = try { acquire() } catch (_: Exception) { null } catch (_: LinkageError) { null } ?: return false
