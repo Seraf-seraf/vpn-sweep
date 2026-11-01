@@ -24,6 +24,8 @@ internal interface CoordinatorRemote {
 // CONFIRMED describes lease admission only; it does not enable worker START.
 internal enum class CoordinatorState { NEW, ADMITTING, CONFIRMED, STOPPING, WORKER_RETIRED, QUARANTINED }
 
+internal class CoordinatorRetirementProof internal constructor()
+
 internal class CoordinatorAdmission(
     private val lease: CoordinatorLease,
     private val identity: WorkerIdentityV1,
@@ -39,6 +41,9 @@ internal class CoordinatorAdmission(
     private var unbindRequested = false
     private var unbindConfirmed = false
     private val retirementFinished = CountDownLatch(1)
+    private var retirementObserved = false
+    private var retirementProof: CoordinatorRetirementProof? = null
+    private var retirementCallback: ((CoordinatorRetirementProof?) -> Unit)? = null
 
     fun state(): CoordinatorState = synchronized(lock) { state }
 
@@ -50,6 +55,23 @@ internal class CoordinatorAdmission(
             Thread.currentThread().interrupt()
             false
         }
+    }
+
+    fun observeRetirement(completed: (CoordinatorRetirementProof?) -> Unit): Boolean {
+        val delivery = synchronized(lock) {
+            if (retirementObserved ||
+                (state != CoordinatorState.STOPPING && state != CoordinatorState.WORKER_RETIRED && state != CoordinatorState.QUARANTINED)
+            ) return false
+            retirementObserved = true
+            retirementCallback = completed
+            takeRetirementDelivery()
+        }
+        delivery?.invoke()
+        return true
+    }
+
+    fun ownsRetirement(proof: CoordinatorRetirementProof, expected: WorkerIdentityV1): Boolean = synchronized(lock) {
+        state == CoordinatorState.WORKER_RETIRED && identity == expected && retirementProof === proof
     }
 
     fun connect(worker: CoordinatorRemote): Boolean {
@@ -106,6 +128,7 @@ internal class CoordinatorAdmission(
                 inFlight = false
                 retireIfSafe()
             }
+            deliverRetirement()
         }
     }
 
@@ -121,6 +144,7 @@ internal class CoordinatorAdmission(
                 else -> return
             }
         }
+        deliverRetirement()
         requestUnbind()
     }
 
@@ -138,6 +162,7 @@ internal class CoordinatorAdmission(
                 retirementFinished.countDown()
             }
         }
+        deliverRetirement()
         requestUnbind()
     }
 
@@ -163,6 +188,7 @@ internal class CoordinatorAdmission(
             lease.quarantine()
             retirementFinished.countDown()
         }
+        deliverRetirement()
         requestUnbind()
     }
 
@@ -183,15 +209,31 @@ internal class CoordinatorAdmission(
         if (!scheduled) unbindCompleted(false)
     }
 
-    private fun unbindCompleted(success: Boolean): Unit = synchronized(lock) {
-        if (success) {
-            unbindConfirmed = true
-            retireIfSafe()
-        } else if (state != CoordinatorState.WORKER_RETIRED) {
-            state = CoordinatorState.QUARANTINED
-            lease.quarantine()
-            retirementFinished.countDown()
+    private fun unbindCompleted(success: Boolean): Unit {
+        synchronized(lock) {
+            if (success) {
+                unbindConfirmed = true
+                retireIfSafe()
+            } else if (state != CoordinatorState.WORKER_RETIRED) {
+                state = CoordinatorState.QUARANTINED
+                lease.quarantine()
+                retirementFinished.countDown()
+            }
         }
+        deliverRetirement()
+    }
+
+    private fun deliverRetirement(): Unit {
+        val delivery = synchronized(lock) { takeRetirementDelivery() }
+        delivery?.invoke()
+    }
+
+    private fun takeRetirementDelivery(): (() -> Unit)? {
+        if (state != CoordinatorState.WORKER_RETIRED && state != CoordinatorState.QUARANTINED) return null
+        val callback = retirementCallback ?: return null
+        retirementCallback = null
+        val proof = if (state == CoordinatorState.WORKER_RETIRED) retirementProof else null
+        return { try { callback(proof) } catch (_: Exception) { } catch (_: LinkageError) { } }
     }
 
     private fun retireIfSafe(): Unit {
@@ -199,6 +241,7 @@ internal class CoordinatorAdmission(
         try {
             lease.workerDeathConfirmed()
             state = CoordinatorState.WORKER_RETIRED
+            retirementProof = CoordinatorRetirementProof()
             retirementFinished.countDown()
         } catch (_: Exception) {
             state = CoordinatorState.QUARANTINED

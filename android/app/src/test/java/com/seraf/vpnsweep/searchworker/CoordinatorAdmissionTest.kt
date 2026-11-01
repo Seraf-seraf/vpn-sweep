@@ -4,11 +4,15 @@ import com.seraf.vpnsweep.searchprotocol.SearchLeaseDuplicateV1
 import com.seraf.vpnsweep.searchprotocol.SearchNetworkV1
 import com.seraf.vpnsweep.searchprotocol.WorkerIdentityV1
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -16,6 +20,121 @@ import org.junit.Test
 class CoordinatorAdmissionTest {
     private val identity = WorkerIdentityV1(41, 2uL, 1, 9)
     private val network = SearchNetworkV1(7, 3)
+
+    @Test
+    fun lateRetirementObserverRequiresTheSameWorkerDeathAndCompletedUnbind(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease, delayUnbind = true)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true })
+        val other = CoordinatorAdmission(FakeLease(), identity, network, RoundOwner { true })
+        assertTrue(admission.connect(remote))
+        assertFalse(admission.observeRetirement { fail("not stopping") })
+        admission.stop()
+        assertFalse(admission.awaitRetirement(1))
+        val delivered = CountDownLatch(1)
+        val observed = AtomicReference<CoordinatorRetirementProof?>()
+        assertTrue(admission.observeRetirement { observed.set(it); delivered.countDown() })
+        assertFalse(admission.observeRetirement { fail("second observer") })
+        remote.die()
+        assertEquals(1L, delivered.count)
+        assertEquals(0, lease.deaths.get())
+        remote.finishUnbind(true)
+        assertTrue(delivered.await(2, TimeUnit.SECONDS))
+        val proof = observed.get()
+        assertNotNull(proof)
+        assertTrue(admission.ownsRetirement(proof!!, identity))
+        assertFalse(other.ownsRetirement(proof, identity))
+        assertFalse(admission.ownsRetirement(proof, identity.copy(workerGeneration = 10)))
+        assertEquals(1, lease.deaths.get())
+    }
+
+    @Test
+    fun lateRetirementObserverDoesNotUpgradeFailedUnbindAfterDeath(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease, delayUnbind = true)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true })
+        assertTrue(admission.connect(remote))
+        admission.stop()
+        val delivered = CountDownLatch(1)
+        val observed = AtomicReference<CoordinatorRetirementProof?>()
+        assertTrue(admission.observeRetirement { observed.set(it); delivered.countDown() })
+        remote.finishUnbind(false)
+        remote.die()
+        assertTrue(delivered.await(2, TimeUnit.SECONDS))
+        assertNull(observed.get())
+        assertEquals(0, lease.deaths.get())
+        assertTrue(lease.quarantined.get())
+    }
+
+    @Test
+    fun observerCanRegisterAfterRetirementAndRunsOutsideAdmissionLock(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true })
+        assertTrue(admission.connect(remote))
+        admission.stop()
+        remote.die()
+        var proof: CoordinatorRetirementProof? = null
+        val otherThreadRead = CountDownLatch(1)
+        assertTrue(admission.observeRetirement {
+            proof = it
+            Thread { admission.state(); otherThreadRead.countDown() }.start()
+            assertTrue(otherThreadRead.await(2, TimeUnit.SECONDS))
+        })
+        assertTrue(otherThreadRead.await(2, TimeUnit.SECONDS))
+        assertNotNull(proof)
+        assertTrue(admission.ownsRetirement(proof!!, identity))
+    }
+
+    @Test
+    fun observerWaitsForAnInFlightAdmissionAndDuplicateClose(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease, blockAdmit = true, delayUnbind = true)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true })
+        val caller = Thread { admission.connect(remote) }
+        caller.start()
+        try {
+            assertTrue(remote.entered.await(2, TimeUnit.SECONDS))
+            admission.stop()
+            val delivered = CountDownLatch(1)
+            val proof = AtomicReference<CoordinatorRetirementProof?>()
+            assertTrue(admission.observeRetirement { proof.set(it); delivered.countDown() })
+            remote.die()
+            remote.finishUnbind(true)
+            assertEquals(1L, delivered.count)
+            assertEquals(0, lease.duplicateClosed.get())
+            remote.release.countDown()
+            assertTrue(delivered.await(2, TimeUnit.SECONDS))
+            assertEquals(1, lease.duplicateClosed.get())
+            assertTrue(admission.ownsRetirement(proof.get()!!, identity))
+        } finally { remote.release.countDown(); caller.join(2_000) }
+    }
+
+    @Test
+    fun concurrentObserverRegistrationAndRetirementDeliverExactlyOnce(): Unit {
+        val lease = FakeLease()
+        val remote = FakeRemote(lease, delayUnbind = true)
+        val admission = CoordinatorAdmission(lease, identity, network, RoundOwner { true })
+        assertTrue(admission.connect(remote))
+        admission.stop()
+        remote.die()
+        val barrier = CyclicBarrier(2)
+        val delivered = CountDownLatch(1)
+        val callbacks = AtomicInteger()
+        val proof = AtomicReference<CoordinatorRetirementProof?>()
+        val registration = Thread {
+            barrier.await()
+            check(admission.observeRetirement { proof.set(it); callbacks.incrementAndGet(); delivered.countDown() })
+        }
+        registration.start()
+        barrier.await()
+        remote.finishUnbind(true)
+        registration.join(2_000)
+        assertFalse(registration.isAlive)
+        assertTrue(delivered.await(2, TimeUnit.SECONDS))
+        assertEquals(1, callbacks.get())
+        assertTrue(admission.ownsRetirement(proof.get()!!, identity))
+    }
 
     @Test
     fun retirementWaitCompletesOnlyAfterUnbindAndWorkerDeath(): Unit {

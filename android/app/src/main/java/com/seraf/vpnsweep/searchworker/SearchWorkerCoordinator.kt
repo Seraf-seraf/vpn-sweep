@@ -20,6 +20,8 @@ internal interface WorkerCoordinatorPort {
     fun awaitConfirmed(deadlineElapsedMillis: Long): IBinder?
     fun confirmedBinder(): IBinder?
     fun awaitRetired(deadlineElapsedMillis: Long): Boolean
+    fun observeRetirement(completed: (CoordinatorRetirementProof?) -> Unit): Boolean
+    fun ownsRetirement(proof: CoordinatorRetirementProof): Boolean
     fun quarantine(): Unit
     fun stop(): Unit
 }
@@ -207,6 +209,10 @@ internal class SearchWorkerCoordinator(
         return now >= 0 && deadlineElapsedMillis > now &&
             admission.awaitRetirement(TimeUnit.MILLISECONDS.toNanos(deadlineElapsedMillis - now))
     }
+
+    override fun observeRetirement(completed: (CoordinatorRetirementProof?) -> Unit): Boolean = admission.observeRetirement(completed)
+
+    override fun ownsRetirement(proof: CoordinatorRetirementProof): Boolean = admission.ownsRetirement(proof, identity)
 
     override fun quarantine(): Unit = failClosed()
 
