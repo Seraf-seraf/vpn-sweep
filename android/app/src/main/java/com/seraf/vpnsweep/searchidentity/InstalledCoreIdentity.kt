@@ -4,6 +4,7 @@ import android.content.Context
 import dalvik.system.BaseDexClassLoader
 import java.io.File
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -15,6 +16,11 @@ private const val CORE_LIBRARY_NAME = "libgojni.so"
 private const val CORE_APK_ENTRY = "lib/arm64-v8a/libgojni.so"
 private const val GO_SEQ_CLASS = "go.Seq"
 private const val READ_BUFFER_BYTES = 64 * 1024
+private const val MAX_CORE_LIBRARY_BYTES = 128L * 1024L * 1024L
+
+internal class SearchCoreIdentityUnavailable : IOException("search_core_identity_unavailable")
+
+internal fun requireCoreIdentity(resolve: () -> String?): String = resolve() ?: throw SearchCoreIdentityUnavailable()
 
 // Call only after acquiring the native owner lease. The class lookup does not initialize go.Seq.
 internal fun installedCoreSha256(context: Context): String? {
@@ -62,7 +68,7 @@ internal fun sha256ResolvedCoreLibrary(resolved: String, packages: List<File>, n
                     }
                 }
                 val entry = selected ?: return null
-                if (entry.isDirectory || entry.method != ZipEntry.STORED || entry.size <= 0) return null
+                if (entry.isDirectory || entry.method != ZipEntry.STORED || entry.size !in 1..MAX_CORE_LIBRARY_BYTES) return null
                 zip.getInputStream(entry).use { digestStream(it, entry.size) }
             }
         } else {
@@ -74,7 +80,7 @@ internal fun sha256ResolvedCoreLibrary(resolved: String, packages: List<File>, n
             ) return null
             FileInputStream(file).use { input ->
                 val size = input.channel.size()
-                if (size <= 0) return null
+                if (size !in 1..MAX_CORE_LIBRARY_BYTES) return null
                 val digest = digestStream(input, size)
                 if (input.channel.size() != size) null else digest
             }

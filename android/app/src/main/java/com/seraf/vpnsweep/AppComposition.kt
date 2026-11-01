@@ -6,6 +6,8 @@ import android.net.ConnectivityManager
 import com.seraf.vpnsweep.core.mobile.Mobile
 import com.seraf.vpnsweep.core.mobile.SearchEngineWorker
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
+import com.seraf.vpnsweep.searchidentity.installedCoreSha256
+import com.seraf.vpnsweep.searchidentity.requireCoreIdentity
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressV1
 import com.seraf.vpnsweep.searchprotocol.SearchResourceStateV2
@@ -54,7 +56,6 @@ import com.seraf.vpnsweep.vpn.VpnRun
 import java.io.File
 import java.io.IOException
 import java.io.FileOutputStream
-import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlinx.coroutines.flow.StateFlow
@@ -634,7 +635,7 @@ internal class AppComposition(context: Context) {
             val profiles = snapshot.profiles.open().use { input -> input.readNBytes(MAX_SEARCH_PROFILES_BYTES + 1) }
             if (profiles.isEmpty() || profiles.size > MAX_SEARCH_PROFILES_BYTES) throw IOException("search_profile_size")
             stage = ScreenEvent.SEARCH_INIT_CORE_IDENTITY_FAILED
-            val digest = coreLibraryDigest(app)
+            val digest = requireCoreIdentity { installedCoreSha256(app) }
             stage = ScreenEvent.SEARCH_INIT_MANIFEST_FAILED
             val manifest = Mobile.buildDefaultSearchManifest(profiles, digest)
             val cleanupMillis = Mobile.searchManifestCleanupMillis(manifest)
@@ -771,21 +772,6 @@ internal class AppComposition(context: Context) {
         }
     }
 
-    private fun coreLibraryDigest(context: Context): String {
-        val library = File(context.applicationInfo.nativeLibraryDir, "libgojni.so")
-        if (!library.isFile || library.length() !in 1..MAX_GOMOBILE_LIBRARY_BYTES) throw IOException("search_core_identity_unavailable")
-        val hash = MessageDigest.getInstance("SHA-256")
-        library.inputStream().use { input ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                if (count > 0) hash.update(buffer, 0, count)
-            }
-        }
-        return hash.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
-    }
-
     private class PrivateSessionMarker(private val directory: File) : SessionMarker {
         private val marker = File(directory, "current")
 
@@ -833,7 +819,6 @@ internal class AppComposition(context: Context) {
     private companion object {
         const val SUBSCRIPTION_TIMEOUT_MS = 30_000L
         const val MAX_SEARCH_PROFILES_BYTES = 8 * 1024 * 1024
-        const val MAX_GOMOBILE_LIBRARY_BYTES = 128L * 1024L * 1024L
         const val DEFAULT_CLEANUP_MILLIS = 10_000L
         const val WORKER_FRAME_HEADER_BYTES = 16
     }

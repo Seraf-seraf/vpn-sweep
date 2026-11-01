@@ -1,6 +1,7 @@
 package com.seraf.vpnsweep.searchworker
 
 import android.os.SystemClock
+import com.seraf.vpnsweep.searchidentity.SearchCoreIdentityUnavailable
 import com.seraf.vpnsweep.searchprotocol.PrivateInputV1
 import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
 import com.seraf.vpnsweep.searchprotocol.SearchPauseReasonV1
@@ -256,6 +257,27 @@ internal class SearchSessionProducer(
         val session = try {
             createSession(snapshot, current.sessionLease) { epoch, progress -> progress(current, epoch, progress) }
         } catch (failure: Throwable) {
+            if (failure is SearchCoreIdentityUnavailable) {
+                val released = cleanup(current) { deadline ->
+                    profiles.close()
+                    if (current.sessionLease.releaseUntil(deadline)) SearchResourceStateV2.RELEASED else SearchResourceStateV2.QUARANTINED
+                }
+                val terminal = synchronized(lock) {
+                    if (released != SearchResourceStateV2.RELEASED || active !== current ||
+                        current.state != State.STARTING || current.control != Control.NONE ||
+                        current.session != null || current.phase != null || current.prepared
+                    ) null else {
+                        current.resources = released
+                        SearchTerminalV3.Stopped(current.snapshot.sessionGeneration, current.epoch, SearchFailureV1.INTERNAL_ERROR,
+                            released, SearchResultFenceV3.CONFIRMED).also {
+                            current.state = State.TERMINAL
+                            current.terminal = it
+                        }
+                    }
+                }
+                if (terminal == null) unknown(current) else emit(current, terminal)
+                return
+            }
             if (failure is SearchNetworkPolicyUnavailable) {
                 try { reportNetworkUnavailable(current.snapshot.sessionGeneration) } catch (_: Exception) { } catch (_: LinkageError) { }
                 val released = cleanup(current) { deadline ->
