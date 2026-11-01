@@ -142,6 +142,21 @@ internal class CoordinatorAdmission(
         return true
     }
 
+    fun beginObservedStop(candidate: CoordinatorRemote): Boolean {
+        synchronized(lock) {
+            if (remote !== candidate || !deathLinked || supervisedStop) return false
+            when (state) {
+                CoordinatorState.CONFIRMED, CoordinatorState.DEATH_PENDING, CoordinatorState.REMOTE_PENDING -> state = CoordinatorState.STOPPING
+                CoordinatorState.STOPPING, CoordinatorState.WORKER_RETIRED -> Unit
+                else -> return false
+            }
+            retireIfSafe()
+        }
+        deliverRetirement()
+        requestUnbind()
+        return true
+    }
+
     fun replaceSupervisorAttempt(attempt: Any): Boolean = synchronized(lock) {
         if (!supervisedStop || state != CoordinatorState.STOPPING || supervisorDeathSeen) false else {
             supervisorAttempt = attempt

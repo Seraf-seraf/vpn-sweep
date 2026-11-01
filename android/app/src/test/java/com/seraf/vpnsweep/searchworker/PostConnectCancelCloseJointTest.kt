@@ -52,6 +52,7 @@ class PostConnectCancelCloseJointTest {
             val waiting = CountDownLatch(1)
             val closeEntered = CountDownLatch(1)
             val closeFailed = CountDownLatch(1)
+            val closeFailures = AtomicInteger()
             val cancelDeadline = AtomicLong()
             val closeDeadline = AtomicLong()
             val owner = FakeOwner()
@@ -100,7 +101,7 @@ class PostConnectCancelCloseJointTest {
                     })
             }
             val adapter = SearchEngineWorkerAdapter(42, network, 5_000, 1024, { WorkerRoundClient(forwarding, duplicate) }, {},
-                System::nanoTime, reportOperationFailure = { if (it == WorkerOperationFailure.CLOSE) closeFailed.countDown() },
+                System::nanoTime, reportOperationFailure = { if (it == WorkerOperationFailure.CLOSE) { closeFailures.incrementAndGet(); closeFailed.countDown() } },
                 localDrain = drain, awaitCleanupCancel = { latch, nanos -> waiting.countDown(); latch.await(nanos, TimeUnit.NANOSECONDS) })
             try {
                 assertEquals(Mobile.SearchWorkerReady, adapter.open(42, 1, 1, 1, byteArrayOf(1), byteArrayOf(2), 10_000, 5_000))
@@ -117,6 +118,8 @@ class PostConnectCancelCloseJointTest {
                     assertTrue(closeFailed.await(3, TimeUnit.SECONDS))
                     assertEquals(1L, closeEntered.count)
                     assertTrue(coordinator.quarantines.get() > 0)
+                    assertEquals(Mobile.SearchWorkerUnavailable, adapter.close(1, 5_000))
+                    assertEquals(1, closeFailures.get())
                 }
             } finally { releaseCancel.countDown() }
         }

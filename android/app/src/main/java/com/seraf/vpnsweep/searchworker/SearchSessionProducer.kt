@@ -139,6 +139,7 @@ internal class SearchSessionProducer(
         var recoveryPhaseDone = false
         var recoveryFinishing = false
         var recoveryTerminal = false
+        var recoveryLeaseTransition = true
         var recoveryIntent: PhaseRecoveryIntent? = null
         var retirementClosing = false
     }
@@ -267,6 +268,7 @@ internal class SearchSessionProducer(
             if (!phase.fenceForRecovery()) return false
             val token = Any()
             current.recoveryToken = token
+            current.recoveryLeaseTransition = recovery.requiresLeaseTransition()
             current.state = State.RECOVERING
             current.watch?.done?.countDown()
             current.watch = null
@@ -317,7 +319,7 @@ internal class SearchSessionProducer(
                 val resources = try {
                     session.closeForRecovery()
                     if (Thread.interrupted()) interrupted = true
-                    if (!current.lease.completeRecovery()) SearchResourceStateV2.QUARANTINED
+                    if (current.recoveryLeaseTransition && !current.lease.completeRecovery()) SearchResourceStateV2.QUARANTINED
                     else session.releaseForRecovery()
                 } catch (_: Exception) { SearchResourceStateV2.QUARANTINED }
                 catch (_: LinkageError) { SearchResourceStateV2.QUARANTINED }

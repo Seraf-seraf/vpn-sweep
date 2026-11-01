@@ -55,6 +55,7 @@ import com.seraf.vpnsweep.searchworker.createSearchWorkerRound
 import com.seraf.vpnsweep.searchworker.openAndroidNetworkOwner
 import com.seraf.vpnsweep.searchworker.requireSearchNetwork
 import com.seraf.vpnsweep.searchworker.startPreconnectRecovery
+import com.seraf.vpnsweep.searchworker.startCloseRecovery
 import com.seraf.vpnsweep.searchstate.SubscriptionController
 import com.seraf.vpnsweep.searchstate.SubscriptionLoadResult
 import com.seraf.vpnsweep.searchstate.SubscriptionPhase
@@ -785,6 +786,15 @@ internal class AppComposition(context: Context) {
                                 { confirmed, retry, failed -> SearchSupervisorTermination(app, supervisorExecutor, confirmed, retry, failed) },
                                 producer,
                                 recoveryIntent,
+                            )
+                        },
+                        { worker, drain ->
+                            startCloseRecovery(
+                                snapshot.sessionGeneration, lease, drain, worker,
+                                { delay, action ->
+                                    try { supervisorExecutor.schedule(action, delay, TimeUnit.MILLISECONDS); true }
+                                    catch (_: Exception) { false } catch (_: LinkageError) { false }
+                                }, producer, recoveryIntent,
                             )
                         },
                         limits.frameBytes,

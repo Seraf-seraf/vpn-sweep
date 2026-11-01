@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 internal interface DeadlineWorkerPort : SearchWorkerPortV2 {
     fun beginConnectedCancelRecovery(identity: WorkerIdentityV1): Boolean = false
+    fun beginCloseRecovery(identity: WorkerIdentityV1): Boolean = false
     fun openUntil(
         identity: WorkerIdentityV1,
         network: SearchNetworkV1,
@@ -80,6 +81,7 @@ internal class SearchEngineWorkerAdapter(
     private val startOpenCloser: (Thread) -> Unit = Thread::start,
     private val scheduleOpenCleanup: (() -> Unit) -> Boolean = { false },
     private val awaitCleanupCancel: (CountDownLatch, Long) -> Boolean = { latch, nanos -> latch.await(nanos, TimeUnit.NANOSECONDS) },
+    private val awaitClose: (CountDownLatch, Long) -> Boolean = { latch, nanos -> latch.await(nanos, TimeUnit.NANOSECONDS) },
 ) : SearchEngineWorker {
     private enum class State { OPENING, READY, RETIRING, CLOSING }
     private class Round(val identity: WorkerIdentityV1) {
@@ -91,6 +93,7 @@ internal class SearchEngineWorkerAdapter(
         var cancelConfirmed: Boolean? = null
         var cleanupStarted: Long? = null
         var cleanupScheduled = false
+        var closeReported = false
         var inFlight = false
         var openingWake: CountDownLatch? = null
         var callWake: CountDownLatch? = null
@@ -397,16 +400,16 @@ internal class SearchEngineWorkerAdapter(
             }
         }
         if (current == null) {
-            reportOperation(WorkerOperationFailure.CLOSE)
+            reportClose(synchronized(lock) { active?.takeIf { it.identity.workerGeneration == generation } })
             return Mobile.SearchWorkerCleanupIncomplete
         }
         if (synchronized(lock) { current.state != State.CLOSING }) {
-            reportOperation(WorkerOperationFailure.CLOSE)
+            reportClose(current)
             return failAndCancel(current, Mobile.SearchWorkerCleanupIncomplete)
         }
         val start = cleanupStart(current)
-        if (!cancelCompleted(current, start) || !cleanClose(current, start)) {
-            try { reportOperationFailure(WorkerOperationFailure.CLOSE) } catch (_: Exception) { } catch (_: LinkageError) { }
+        if (!cancelCompleted(current, start) || !cleanClose(current, start, recoverOnTimeout = true)) {
+            reportClose(current)
             return fail(current, Mobile.SearchWorkerCleanupIncomplete)
         }
         return finish(current, Mobile.SearchWorkerReady)
@@ -715,25 +718,43 @@ internal class SearchEngineWorkerAdapter(
         }
     }
 
-    private fun cleanClose(round: Round, start: Long): Boolean {
+    private fun cleanClose(round: Round, start: Long, recoverOnTimeout: Boolean = false): Boolean {
         val done = CountDownLatch(1)
         val result = AtomicReference<WorkerCloseV1?>()
         val deadline = elapsedDeadlineMillis(start, cleanupMillis) ?: return false
-        if (remainingCleanupNanos(start) <= 0) return false
+        val ticket = if (recoverOnTimeout) localDrain.begin(sessionGeneration) ?: return false else null
+        val dispatch = ticket?.let(::SearchWorkerDispatch)
+        fun recoverExpired(): Unit {
+            if (!recoverOnTimeout) return
+            val elapsed = nowNanos() - start
+            if (elapsed >= 0 && elapsed >= TimeUnit.MILLISECONDS.toNanos(cleanupMillis)) {
+                try { round.client!!.port.beginCloseRecovery(round.identity) } catch (_: Exception) { } catch (_: LinkageError) { }
+            }
+        }
+        if (remainingCleanupNanos(start) <= 0) {
+            dispatch?.cancelBeforeClaim()
+            recoverExpired()
+            return false
+        }
         try {
             Thread({
+                if (dispatch != null && !dispatch.claim()) { done.countDown(); return@Thread }
                 try { result.set(round.client!!.port.closeUntil(round.identity, deadline)) } catch (_: Exception) { } catch (_: LinkageError) { }
-                finally { done.countDown() }
+                finally { done.countDown(); ticket?.closed(true) }
             }, "search-round-close").apply { isDaemon = true }.start()
             val remaining = remainingCleanupNanos(start)
-            return remaining > 0 && done.await(remaining, TimeUnit.NANOSECONDS) && remainingCleanupNanos(start) > 0 &&
+            val complete = remaining > 0 && awaitClose(done, remaining) && remainingCleanupNanos(start) > 0 &&
                 result.get() == WorkerCloseV1.CLEAN_AND_DEAD
+            if (!complete) recoverExpired()
+            return complete
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             return false
         } catch (_: Exception) {
+            dispatch?.cancelBeforeClaim()
             return false
         } catch (_: LinkageError) {
+            dispatch?.cancelBeforeClaim()
             return false
         }
     }
@@ -777,11 +798,18 @@ internal class SearchEngineWorkerAdapter(
                     Thread.currentThread().interrupt()
                     false
                 } catch (_: Exception) { false } catch (_: LinkageError) { false }
-                if (!cancelled) { reportOperation(WorkerOperationFailure.CLOSE); return@Thread }
+                if (!cancelled) { reportClose(round); return@Thread }
                 val closed = try { round.client!!.port.closeUntil(round.identity, deadline) == WorkerCloseV1.CLEAN_AND_DEAD } catch (_: Exception) { false } catch (_: LinkageError) { false }
-                if (!closed) reportOperation(WorkerOperationFailure.CLOSE)
+                if (!closed) reportClose(round)
             }, "search-round-quarantine").apply { isDaemon = true }.start()
         } catch (_: Exception) { } catch (_: LinkageError) { }
+    }
+
+    private fun reportClose(round: Round?): Unit {
+        val report = if (round == null) true else synchronized(lock) {
+            if (round.closeReported) false else { round.closeReported = true; true }
+        }
+        if (report) reportOperation(WorkerOperationFailure.CLOSE)
     }
 
     private fun fail(round: Round, code: Long): Long = synchronized(lock) {

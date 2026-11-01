@@ -2,6 +2,7 @@ package com.seraf.vpnsweep.searchworker
 
 internal interface PreconnectWorkerStop {
     fun beginSupervisorStop(attempt: Any, unbound: (Boolean) -> Unit): Boolean
+    fun beginObservedStop(): Boolean = false
     fun replaceSupervisorAttempt(attempt: Any): Boolean
     fun supervisorDied(proof: SupervisorDeathProof): Boolean
     fun observeRetirement(completed: (CoordinatorRetirementProof?) -> Unit): Boolean
@@ -36,14 +37,28 @@ internal fun startPreconnectRecovery(
     PreconnectRecovery(generation, custody, drain, worker, schedule, newAttempt, intent),
 )
 
+internal fun startCloseRecovery(
+    generation: Long,
+    custody: SearchOwnerLeaseControl,
+    drain: SearchWorkerLocalDrain,
+    worker: PreconnectWorkerStop,
+    schedule: (Long, () -> Unit) -> Boolean,
+    producer: SearchSessionProducer,
+    intent: PhaseRecoveryIntent,
+): Boolean = producer.beginPreconnectRecovery(
+    generation,
+    PreconnectRecovery(generation, custody, drain, worker, schedule, null, intent, observedClose = true),
+)
+
 internal class PreconnectRecovery(
     private val generation: Long,
     private val custody: Any,
     private val drain: SearchWorkerLocalDrain,
     private val worker: PreconnectWorkerStop,
     private val schedule: (Long, () -> Unit) -> Boolean,
-    private val newAttempt: ((SupervisorDeathProof) -> Unit, () -> Unit, () -> Unit) -> SupervisorAttemptPort,
+    private val newAttempt: (((SupervisorDeathProof) -> Unit, () -> Unit, () -> Unit) -> SupervisorAttemptPort)?,
     private val intent: PhaseRecoveryIntent? = null,
+    private val observedClose: Boolean = false,
 ) {
     private val lock = Any()
     private var started = false
@@ -62,14 +77,20 @@ internal class PreconnectRecovery(
     fun belongsTo(generation: Long, custody: Any, intent: PhaseRecoveryIntent): Boolean =
         this.generation == generation && this.custody === custody && this.intent === intent
 
+    fun requiresLeaseTransition(): Boolean = !observedClose
+
     fun consume(proof: PreconnectRecoveryProof): Boolean = synchronized(lock) {
         if (!finished || consumed || issued !== proof) false else { consumed = true; true }
     }
 
     fun start(completed: (PreconnectRecoveryProof?) -> Unit): Boolean {
         synchronized(lock) { if (started) return false; started = true; completion = completed }
-        val first = makeAttempt() ?: return failStart()
-        if (!worker.beginSupervisorStop(first.identity, ::oldUnbound)) return failStart()
+        if (observedClose) {
+            if (!worker.beginObservedStop()) return failStart()
+        } else {
+            val first = makeAttempt() ?: return failStart()
+            if (!worker.beginSupervisorStop(first.identity, ::oldUnbound)) return failStart()
+        }
         if (!worker.observeRetirement { proof ->
                 if (proof == null || !worker.ownsRetirement(proof)) fail()
                 else { synchronized(lock) { workerRetired = true }; enqueue(0, ::advance) }
@@ -91,8 +112,9 @@ internal class PreconnectRecovery(
     private fun makeAttempt(): SupervisorAttemptPort? {
         val selected = Any()
         synchronized(lock) { if (finished) return null; token = selected; attemptStarted = false }
+        val factory = newAttempt ?: return null
         val value = try {
-            newAttempt(
+            factory(
                 { proof -> if (current(selected) && !worker.supervisorDied(proof)) fail() },
                 { if (current(selected)) enqueue(RETRY_MILLIS) { retry(selected) } },
                 { if (current(selected)) fail() },
@@ -116,7 +138,7 @@ internal class PreconnectRecovery(
         synchronized(lock) {
             if (finished || !setup) return
             if (workerRetired && localDrained) done = true
-            else if (oldUnbound && !attemptStarted) {
+            else if (!observedClose && oldUnbound && !attemptStarted) {
                 attemptStarted = true
                 run = attempt
                 selected = token

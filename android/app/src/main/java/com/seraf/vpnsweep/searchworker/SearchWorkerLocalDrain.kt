@@ -1,5 +1,7 @@
 package com.seraf.vpnsweep.searchworker
 
+import java.io.IOException
+
 internal class SearchWorkerLocalDrain(
     private val sessionGeneration: Long,
     private val lock: Any = Any(),
@@ -119,5 +121,20 @@ internal inline fun <T : Any, R> trackedWorkerResource(
         }
     } finally {
         ticket.closed(closed)
+    }
+}
+
+internal inline fun <T> trackedWorkerTransaction(
+    operationTicket: SearchWorkerLocalDrain.Ticket?,
+    action: () -> T,
+    recycle: () -> Boolean,
+): T {
+    val parcelTicket = operationTicket?.retain()
+    if (operationTicket != null && parcelTicket == null) throw IOException("worker_drain_unknown")
+    var recycled = false
+    try {
+        return action()
+    } finally {
+        try { recycled = recycle() } finally { parcelTicket?.closed(recycled) }
     }
 }

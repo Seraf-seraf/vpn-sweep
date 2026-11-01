@@ -91,6 +91,9 @@ internal fun supervisorStopAllowed(
                 state == CoordinatorState.REMOTE_PENDING || state == CoordinatorState.DEATH_PENDING))
 }
 
+internal fun <T : Any> observedWorkerMatches(admitted: T?, pending: T?, remoteMatches: (T) -> Boolean): Boolean =
+    admitted != null && admitted === pending && remoteMatches(admitted)
+
 internal fun recoverConnectedDisconnect(recover: () -> Boolean, fail: () -> Unit): Unit {
     val started = try { recover() } catch (_: Exception) { false } catch (_: LinkageError) { false }
     if (!started) fail()
@@ -340,6 +343,20 @@ internal class SearchWorkerCoordinator(
     override fun observeRetirement(completed: (CoordinatorRetirementProof?) -> Unit): Boolean = admission.observeRetirement(completed)
 
     override fun ownsRetirement(proof: CoordinatorRetirementProof): Boolean = admission.ownsRetirement(proof, identity)
+
+    override fun beginObservedStop(): Boolean {
+        val candidate = synchronized(lock) {
+            val binder = admittedBinder ?: return false
+            val remote = handshakeRemote ?: return false
+            if (supervisedStop || bindResult != true || !reservationOwned || !connected || !handshakeStarted ||
+                !observedWorkerMatches(binder, pendingBinder, remote::matches)
+            ) return false
+            stopLocked()
+            remote
+        }
+        if (!lease.mayLoadMobile()) return false
+        return admission.beginObservedStop(candidate)
+    }
 
     override fun beginSupervisorStop(attempt: Any, unbound: (Boolean) -> Unit): Boolean {
         val candidate = synchronized(lock) {
