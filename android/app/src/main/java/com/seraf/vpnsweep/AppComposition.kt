@@ -33,6 +33,9 @@ import com.seraf.vpnsweep.searchstate.RecoveryStamp
 import com.seraf.vpnsweep.searchstate.SearchRunPathAllocator
 import com.seraf.vpnsweep.searchstate.UpgradeRecovery
 import com.seraf.vpnsweep.searchstate.UpgradeRecoveryBackend
+import com.seraf.vpnsweep.searchstate.SupervisedStartupRecovery
+import com.seraf.vpnsweep.searchstate.SupervisorOwner
+import com.seraf.vpnsweep.searchstate.SupervisorRecoveryResult
 import com.seraf.vpnsweep.searchstate.readKernelBootId
 import com.seraf.vpnsweep.searchstate.recoveryRequiredAtStartup
 import com.seraf.vpnsweep.searchstorage.ResultRevision
@@ -44,6 +47,9 @@ import com.seraf.vpnsweep.searchworker.SearchOwnerLease
 import com.seraf.vpnsweep.searchworker.SearchOwnerLeaseControl
 import com.seraf.vpnsweep.searchworker.SearchOwnerLock
 import com.seraf.vpnsweep.searchworker.SearchSessionProducer
+import com.seraf.vpnsweep.searchworker.SearchSupervisorTermination
+import com.seraf.vpnsweep.searchworker.SupervisorStartResult
+import com.seraf.vpnsweep.searchworker.SupervisorDeathProof
 import com.seraf.vpnsweep.searchworker.SearchNetworkPolicyUnavailable
 import com.seraf.vpnsweep.searchworker.WorkerOperationFailure
 import com.seraf.vpnsweep.searchworker.WorkerServiceObservation
@@ -235,6 +241,28 @@ internal class AppComposition(context: Context) {
         pending = { searchState.value.ownerBusyRetry },
         recover = { activation.controller.retryOwnerBusy() },
     )
+    private val supervisorExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "search-supervisor").apply { isDaemon = true }
+    }
+    private val supervisedRecovery = SupervisedStartupRecovery(
+        recoveryBackend,
+        markActive = rawMarker::markActive,
+        preparePending = intentStore::prepareSupervisorRecovery,
+        finishPending = intentStore::finishSupervisorRecovery,
+        acquire = {
+            when (val acquired = SearchOwnerLock.acquire(app)) {
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Busy -> SupervisorOwner.Busy
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Unavailable -> SupervisorOwner.Unknown
+                is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> {
+                    val lease = acquired.lease
+                    if (!lease.mayLoadMobile()) {
+                        lease.quarantine()
+                        SupervisorOwner.Unknown
+                    } else SupervisorOwner.Acquired(object : RecoveryOwner { override fun close(): Unit = lease.close() })
+                }
+            }
+        },
+    )
 
     init {
         activation.controller.setPhaseListener { state ->
@@ -242,6 +270,48 @@ internal class AppComposition(context: Context) {
             if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state.phase)?.let(::addEvent)
         }
         if (!recoveryMode.blocked()) restoreSubscription()
+        else {
+            addEvent(ScreenEvent.SUPERVISOR_RECOVERY_PENDING)
+            try { supervisorExecutor.execute {
+                if (supervisedRecovery.prepare()) beginSupervisorAttempt()
+                else addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN)
+            } } catch (_: Exception) { addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN) }
+        }
+    }
+
+    private fun beginSupervisorAttempt(): Unit {
+        if (!recoveryMode.blocked()) return
+        val supervisor = SearchSupervisorTermination(
+            app, supervisorExecutor,
+            confirmed = { proof -> try { supervisorExecutor.execute { finishSupervisedRecovery(proof) } } catch (_: Exception) { addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN) } },
+            retry = { try { supervisorExecutor.schedule(::beginSupervisorAttempt, 1, TimeUnit.SECONDS) } catch (_: Exception) { addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN) } },
+            failed = { addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN) },
+        )
+        if (!supervisedRecovery.expectSupervisor(supervisor.identity)) return
+        when (supervisor.start()) {
+            SupervisorStartResult.STARTED -> try { supervisorExecutor.schedule(supervisor::connectionTimedOut, 10, TimeUnit.SECONDS) }
+                catch (_: Exception) { addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN) }
+            SupervisorStartResult.RETRYING -> Unit
+            SupervisorStartResult.UNKNOWN -> addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN)
+        }
+    }
+
+    private fun finishSupervisedRecovery(proof: SupervisorDeathProof): Unit {
+        val result = subscriptions.withRecovery {
+            synchronized(activation.controller) {
+                val outcome = supervisedRecovery.complete(proof)
+                if (outcome == SupervisorRecoveryResult.RECOVERED && !activation.controller.completeUpgradeRecovery()) {
+                    synchronized(recoveryBackend) { recoveryBackend.quarantined = true }
+                    SupervisorRecoveryResult.UNKNOWN
+                } else outcome
+            }
+        }
+        when (result) {
+            SupervisorRecoveryResult.RECOVERED -> { recoveryMode.complete(); addEvent(ScreenEvent.SUPERVISOR_RECOVERY_COMPLETE) }
+            SupervisorRecoveryResult.BUSY -> try { supervisorExecutor.schedule({ finishSupervisedRecovery(proof) }, 1, TimeUnit.SECONDS) }
+                catch (_: Exception) { addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN) }
+            SupervisorRecoveryResult.UNKNOWN -> addEvent(ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN)
+        }
     }
 
     fun loadSubscription(input: String): SubscriptionLoadResult =

@@ -8,6 +8,7 @@ import com.seraf.vpnsweep.searchprotocol.SearchSessionPortV3
 import com.seraf.vpnsweep.searchprotocol.SearchSnapshotV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.searchstate.*
+import com.seraf.vpnsweep.searchworker.SupervisorTerminationEvidence
 import com.seraf.vpnsweep.searchstorage.*
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionRecordV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionSnapshotV1
@@ -22,6 +23,57 @@ import org.junit.rules.TemporaryFolder
 
 class UpgradeRecoveryIntegrationTest {
     @get:Rule val temporary = TemporaryFolder()
+
+    @Test fun supervisedRecoveryReissuesRealSnapshotAndLeavesOldReceiptInactive(): Unit {
+        val root = temporary.newFolder()
+        val revisions = Revisions()
+        val snapshots = SubscriptionStorage(File(root, "snapshots"), SnapshotFiles()) { revisions.value }
+        revisions.value = snapshots.commitSource(Snapshot(), 7)
+        revisions.value = snapshots.commitSelection(setOf(SERVER_ID))
+        val original = checkNotNull(revisions.value)
+        val resultRoot = File(root, "results")
+        val results = PrivateResultStorage(resultRoot) { }
+        val bytes = "synthetic-result".toByteArray()
+        val sha = digest(bytes.inputStream())
+        val generation = results.prepare(original, sha, bytes.inputStream())
+        val manifest = ResultManifest(generation, original, sha)
+        results.publish(manifest)
+        val receipts = PrivateSearchCompletionReceiptStorage(resultRoot, directorySync = {})
+        val receipt = SearchCompletionReceiptV1.cleanComplete(
+            SearchLeaseReceiptV1(7, 1, original.source.toLong(), original.selection.toLong(), LEASE_ID), manifest,
+        )
+        assertTrue(receipts.write(receipt))
+        val intent = RecoveryIntentStore(File(root, "fence")) { }
+        val raw = RawMarker()
+        val backend = Backend(intent, raw, FIRST_BOOT)
+        val composition = composition(results, revisions, RecoveryFencedMarker(raw, backend), receipts)
+        backend.reconcileAction = { composition.reissueForUpgrade(snapshots::reissueCurrent) != null }
+        val recovery = SupervisedStartupRecovery(backend, raw::markActive, intent::prepareSupervisorRecovery,
+            intent::finishSupervisorRecovery, { SupervisorOwner.Acquired(backend.acquireOwner()) })
+        assertTrue(recovery.prepare())
+        val identity = Any()
+        assertTrue(recovery.expectSupervisor(identity))
+        var outcome: SupervisorRecoveryResult? = null
+        val proof = SupervisorTerminationEvidence(identity) { outcome = recovery.complete(it) }
+        assertTrue(proof.beginLink())
+        proof.linkResult(true)
+        proof.unbindResult(true)
+        assertNull(outcome)
+        assertEquals(original, revisions.value)
+        proof.binderDied()
+        assertEquals(SupervisorRecoveryResult.RECOVERED, outcome)
+        assertTrue(backend.ownerClosed)
+        assertEquals(RecoveryIntentState.Done, intent.read())
+        assertEquals(MarkerState.CLEAR, raw.read())
+        val revised = checkNotNull(revisions.value)
+        assertNotEquals(original, revised)
+        val restored = checkNotNull(snapshots.recover(revised))
+        assertEquals(setOf(SERVER_ID), restored.selectedIds)
+        restored.snapshot.close()
+        assertEquals(receipt, receipts.read())
+        assertEquals(manifest, results.readManifest())
+        assertNull(composition.loadCleanComplete(AcceptedSubscriptionReceiptV1(7, revised.source, revised.selection)))
+    }
 
     @Test fun receiptGenerationAndCurrentManifestAreIndependentlyVerified(): Unit {
         for (fault in listOf("healthy", "old-payload", "missing-old-payload", "old-metadata", "previous-payload", "missing-current")) {

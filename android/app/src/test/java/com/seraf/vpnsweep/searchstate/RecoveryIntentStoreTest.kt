@@ -12,6 +12,37 @@ class RecoveryIntentStoreTest {
     @get:Rule val temporary = TemporaryFolder()
     private val stamp = RecoveryStamp("11111111-1111-4111-8111-111111111111")
 
+    @Test fun supervisorFenceReplacesOnlyValidatedLegacyStateAndSurvivesRestart(): Unit {
+        for (initial in listOf("absent", "armed", "done")) {
+            val root = File(temporary.newFolder(), "fence")
+            val store = RecoveryIntentStore(root) { }
+            if (initial != "absent") assertTrue(store.create(stamp))
+            if (initial == "done") assertTrue(store.finish())
+            assertTrue(initial, store.prepareSupervisorRecovery())
+            assertEquals(initial, RecoveryIntentState.SupervisedPending, RecoveryIntentStore(root) { }.read())
+            assertTrue(initial, store.prepareSupervisorRecovery())
+            assertTrue(initial, store.finishSupervisorRecovery())
+            assertEquals(initial, RecoveryIntentState.Done, RecoveryIntentStore(root) { }.read())
+        }
+    }
+
+    @Test fun supervisorFenceNeverReplacesUnknownAndSyncFailureStaysBlocked(): Unit {
+        val corrupt = File(temporary.newFolder(), "fence")
+        assertTrue(corrupt.mkdir())
+        File(corrupt, "intent").writeText("bad")
+        val store = RecoveryIntentStore(corrupt) { }
+        assertFalse(store.prepareSupervisorRecovery())
+        assertEquals(RecoveryIntentState.Unknown, store.read())
+        val root = File(temporary.newFolder(), "fence")
+        var fail = false
+        val interrupted = RecoveryIntentStore(root) { if (fail) throw IOException("synthetic") }
+        assertTrue(interrupted.prepareSupervisorRecovery())
+        fail = true
+        assertFalse(interrupted.finishSupervisorRecovery())
+        assertEquals(RecoveryIntentState.Unknown, RecoveryIntentStore(root) { throw IOException("synthetic") }.read())
+        assertEquals(RecoveryIntentState.Done, RecoveryIntentStore(root) { }.read())
+    }
+
     @Test fun durableCreateAndRemoveRoundTrip(): Unit {
         val root = File(temporary.root, "fence")
         val synced = mutableListOf<File>()
