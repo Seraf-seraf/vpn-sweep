@@ -4,6 +4,7 @@ import com.seraf.vpnsweep.AcceptedSubscriptionReceiptV1
 import com.seraf.vpnsweep.recoverOwnerBusyForSelection
 import com.seraf.vpnsweep.committedServerSummary
 import com.seraf.vpnsweep.SearchReadiness
+import com.seraf.vpnsweep.OwnerBusyAutoRecovery
 import com.seraf.vpnsweep.recheckSearchReadinessFlow
 import com.seraf.vpnsweep.resultactivation.ResultActivationComposition
 import com.seraf.vpnsweep.resultactivation.MemorySearchCompletionReceiptStorage
@@ -24,6 +25,47 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SubscriptionControllerTest {
+    @Test
+    fun ownerBusyRecoversAutomaticallyAfterProofWithoutStartingAnotherJob(): Unit {
+        val fixture = Fixture()
+        val port = FakeSubscriptionPort()
+        val subscription = SubscriptionController(port, fixture.composition,
+            { ResultRevision("1", "1") }, { ResultRevision("1", "2") })
+        val work = ArrayDeque<() -> Unit>()
+        val recovery = OwnerBusyAutoRecovery(
+            schedule = { work.addLast(it); true },
+            pending = { fixture.composition.controller.state.value.ownerBusyRetry },
+            recover = fixture.composition.controller::retryOwnerBusy,
+        )
+        fixture.composition.controller.setPhaseListener { if (it.ownerBusyRetry) recovery.request() }
+        assertEquals(SubscriptionStartV1.ACCEPTED, subscription.load("synthetic"))
+        port.observer!!.onParsed(1, SubscriptionBatchStatusV1.HAS_SUPPORTED, Snapshot(listOf(record("a", true))))
+        assertTrue(subscription.select(setOf("a")))
+        fixture.runtime.result = SearchStartV3.BUSY
+        fixture.runtime.noOwnerBusy = true
+        fixture.runtime.recovery = OwnerBusyRecovery.BUSY
+        assertEquals(SearchStartV3.BUSY, subscription.startSelected())
+        assertEquals(1, work.size)
+        assertEquals(SubscriptionStartV1.ACCEPTED, subscription.load("synthetic refresh"))
+        assertEquals(SubscriptionPhase.LOADING, subscription.state.value.phase)
+        val stale = work.removeFirst()
+        stale()
+        assertEquals(MarkerState.ACTIVE, fixture.marker.read())
+        assertFalse(subscription.canSelect())
+        assertEquals(1, work.size)
+        fixture.runtime.recovery = OwnerBusyRecovery.READY
+        work.removeFirst()()
+        assertEquals(MarkerState.CLEAR, fixture.marker.read())
+        assertFalse(subscription.canSelect())
+        assertEquals(setOf("a"), subscription.state.value.selectedIds)
+        port.observer!!.onFailure(2, SubscriptionFailureV1.TIMEOUT)
+        assertTrue(subscription.canSelect())
+        assertEquals(1, fixture.runtime.starts)
+        stale()
+        assertEquals(MarkerState.CLEAR, fixture.marker.read())
+        assertEquals(1, fixture.runtime.starts)
+    }
+
     @Test
     fun ownerBusyRecheckUsesRealControllerAndKeepsUnknownBlocked(): Unit {
         for (outcome in listOf(OwnerBusyRecovery.READY, OwnerBusyRecovery.UNKNOWN)) {

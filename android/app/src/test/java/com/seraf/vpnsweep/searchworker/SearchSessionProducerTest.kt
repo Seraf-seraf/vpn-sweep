@@ -136,7 +136,7 @@ class SearchSessionProducerTest {
         val events = Collections.synchronizedList(mutableListOf<Long>())
         val producer = SearchSessionProducer(2_000,
             { _, _, _ -> throw SearchNetworkPolicyUnavailable() },
-            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, events::add).withOfferedLease(owner.initialLease)
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, { generation, _ -> events.add(generation) }).withOfferedLease(owner.initialLease)
         val input = Input()
         val observer = Observer()
         assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(input), 1, observer))
@@ -163,7 +163,7 @@ class SearchSessionProducerTest {
         val events = Collections.synchronizedList(mutableListOf<Long>())
         val producer = SearchSessionProducer(2_000,
             { _, _, _ -> throw SearchNetworkPolicyUnavailable() },
-            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, events::add).withOfferedLease(owner.initialLease)
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, { generation, _ -> events.add(generation) }).withOfferedLease(owner.initialLease)
         val observer = Observer()
         assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input(failClose = true)), 1, observer))
         assertTrue(observer.terminal.await(3, TimeUnit.SECONDS))
@@ -182,7 +182,7 @@ class SearchSessionProducerTest {
         val events = Collections.synchronizedList(mutableListOf<Long>())
         val producer = SearchSessionProducer(2_000,
             { _, _, _ -> entered.countDown(); check(finish.await(2, TimeUnit.SECONDS)); throw SearchNetworkPolicyUnavailable() },
-            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, events::add).withOfferedLease(owner.initialLease)
+            { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }, { generation, _ -> events.add(generation) }).withOfferedLease(owner.initialLease)
         val observer = Observer()
         assertEquals(SearchStartV3.ACCEPTED, producer.start(snapshot(Input()), 1, observer))
         try {

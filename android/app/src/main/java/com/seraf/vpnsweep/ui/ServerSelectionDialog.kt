@@ -94,15 +94,12 @@ internal fun ServerSelectionDialogHost(
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit,
     canConfirm: Boolean = true,
-    errorMessage: String = "",
-    onRefreshAvailability: () -> Unit = {},
-    checking: Boolean = false,
 ): Unit {
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm, errorMessage, onRefreshAvailability, checking)
+        ServerSelectionDialogContent(servers, selectedIds, onDismiss, onConfirm, canConfirm)
     }
 }
 
@@ -113,9 +110,6 @@ internal fun ServerSelectionDialogContent(
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit,
     canConfirm: Boolean = true,
-    errorMessage: String = "",
-    onRefreshAvailability: () -> Unit = {},
-    checking: Boolean = false,
 ): Unit {
     val supportedIds = remember(servers) {
         servers.filter { it.supported }.map { it.id }.toSet()
@@ -212,12 +206,8 @@ internal fun ServerSelectionDialogContent(
                     footerLeading = {
                         Column(Modifier.fillMaxWidth()) {
                             ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
-                            if (errorMessage.isNotEmpty()) Text(errorMessage, color = ServerDialogColors.text)
                             if (!canConfirm) {
-                                Text("Изменения сохранятся только после подтверждения. Проверьте доступность или вернитесь к подписке.", color = ServerDialogColors.text)
-                            }
-                            OutlinedButton(onClick = onRefreshAvailability, enabled = !checking) {
-                                Text(if (checking) "Проверка..." else "Проверить возможность подбора")
+                                Text("Изменения пока нельзя сохранить.", color = ServerDialogColors.text)
                             }
                         }
                     },

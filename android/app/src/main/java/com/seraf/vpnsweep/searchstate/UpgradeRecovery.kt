@@ -11,6 +11,7 @@ internal data class RecoveryStamp(val bootId: String) {
 internal sealed interface RecoveryIntentState {
     data object Absent : RecoveryIntentState
     data object Done : RecoveryIntentState
+    data object SupervisedPending : RecoveryIntentState
     data object Unknown : RecoveryIntentState
     data class Armed(val stamp: RecoveryStamp) : RecoveryIntentState
 }
@@ -42,6 +43,7 @@ internal class RecoveryFencedMarker(
             RecoveryIntentState.Absent, RecoveryIntentState.Done -> if (backend.recoveryBlocked) MarkerState.ACTIVE else raw.read()
             RecoveryIntentState.Unknown -> MarkerState.UNKNOWN
             is RecoveryIntentState.Armed -> MarkerState.ACTIVE
+            RecoveryIntentState.SupervisedPending -> MarkerState.ACTIVE
         }
     }
 
@@ -132,6 +134,6 @@ internal fun recoveryRequiredAtStartup(marker: SessionMarker, intent: RecoveryIn
     when (intent) {
         RecoveryIntentState.Absent -> marker.read() != MarkerState.CLEAR
         RecoveryIntentState.Done -> strictMarker() != MarkerState.CLEAR
-        RecoveryIntentState.Unknown, is RecoveryIntentState.Armed -> true
+        RecoveryIntentState.Unknown, RecoveryIntentState.SupervisedPending, is RecoveryIntentState.Armed -> true
     }
 } catch (_: Exception) { true }

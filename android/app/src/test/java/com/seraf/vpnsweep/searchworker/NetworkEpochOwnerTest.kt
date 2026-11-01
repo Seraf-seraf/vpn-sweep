@@ -124,29 +124,145 @@ internal class NetworkEpochOwnerTest {
     fun unknownOrChangedDuringInitialSnapshotNeverAdmits(): Unit {
         val changed = Source()
         changed.onSnapshot = { changed.event(DefaultNetworkEvent.Available(22)) }
-        assertEquals(NetworkOwnerOpen.Unavailable, NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
         assertEquals(1, changed.closes)
         val vpn = Source().apply { snapshot = DefaultNetworkSnapshot(11, false) }
-        assertEquals(NetworkOwnerOpen.Unavailable, NetworkEpochOwner.open(vpn::register, vpn::read, { true }, {}))
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.NON_DIRECT), NetworkEpochOwner.open(vpn::register, vpn::read, { true }, {}))
         assertEquals(1, vpn.closes)
         val blocked = Source()
         val open = NetworkEpochOwner.open({ callback ->
             blocked.register(callback).also { callback(DefaultNetworkEvent.Blocked(11, true)) }
         }, blocked::read, { true }, {})
-        assertEquals(NetworkOwnerOpen.Unavailable, open)
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.BLOCKED), open)
         assertEquals(1, blocked.closes)
         val lost = Source()
         val lostOpen = NetworkEpochOwner.open({ callback ->
             lost.register(callback).also { callback(DefaultNetworkEvent.Lost) }
         }, lost::read, { true }, {})
-        assertEquals(NetworkOwnerOpen.Unavailable, lostOpen)
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), lostOpen)
         assertEquals(1, lost.closes)
         val mismatched = Source()
         val mismatchOpen = NetworkEpochOwner.open({ callback ->
             mismatched.register(callback).also { callback(DefaultNetworkEvent.Available(22)) }
         }, mismatched::read, { true }, {})
-        assertEquals(NetworkOwnerOpen.Unavailable, mismatchOpen)
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), mismatchOpen)
         assertEquals(1, mismatched.closes)
+    }
+
+    @Test
+    fun failedLeaseChecksStayUnknownAfterRegistrationCloses(): Unit {
+        for (check in listOf<() -> Boolean>({ false }, { throw IOException("synthetic") })) {
+            val source = Source()
+            assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(source::register, source::read, check, {}))
+            assertEquals(1, source.closes)
+        }
+        val source = Source()
+        var calls = 0
+        assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(source::register, source::read, { ++calls == 1 }, {}))
+        assertEquals(1, source.closes)
+        val missing = Source().apply { snapshot = null }
+        calls = 0
+        assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(missing::register, missing::read, { ++calls == 1 }, {}))
+        assertEquals(1, missing.closes)
+    }
+
+    @Test
+    fun missingSnapshotAndReadFailureRemainDistinctFromLeaseFailure(): Unit {
+        val missing = Source().apply { snapshot = null }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.UNCONFIRMED),
+            NetworkEpochOwner.open(missing::register, missing::read, { true }, {}))
+        assertEquals(1, missing.closes)
+        val failed = Source()
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CHECK_FAILED),
+            NetworkEpochOwner.open(failed::register, { throw IOException("synthetic") }, { true }, {}))
+        assertEquals(1, failed.closes)
+        val changed = Source()
+        changed.onSnapshot = { changed.event(DefaultNetworkEvent.Available(11)) }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT),
+            NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
+        assertEquals(1, changed.closes)
+    }
+
+    @Test
+    fun sameInitialAvailableCanBeRecapturedOnceWithAStableDirectNetwork(): Unit {
+        val source = Source()
+        source.onSnapshot = { if (source.snapshots == 1) source.event(DefaultNetworkEvent.Available(11)) }
+        var checks = 0
+        val opened = NetworkEpochOwner.open(source::register, source::read, { checks++; true }, {}) as NetworkOwnerOpen.Ready
+        assertEquals(2, source.snapshots)
+        assertEquals(4, checks)
+        assertEquals(11L, opened.network.identity)
+        assertTrue(opened.owner.isCurrent(opened.network))
+        assertTrue(opened.owner.close())
+        assertEquals(1, source.closes)
+    }
+
+    @Test
+    fun initialCaptureNeverRecapturesAnUnsafeOrDifferentEvent(): Unit {
+        val eventSets = listOf(
+            listOf(DefaultNetworkEvent.Available(22)),
+            listOf(DefaultNetworkEvent.Available(11), DefaultNetworkEvent.Available(22), DefaultNetworkEvent.Available(11)),
+            listOf(DefaultNetworkEvent.Available(11), DefaultNetworkEvent.Blocked(11, true)),
+            listOf(DefaultNetworkEvent.Available(11), DefaultNetworkEvent.Capabilities(11, false)),
+            listOf(DefaultNetworkEvent.Available(11), DefaultNetworkEvent.Lost),
+        )
+        for (events in eventSets) {
+            val source = Source()
+            source.onSnapshot = { if (source.snapshots == 1) events.forEach(source::event) }
+            assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT),
+                NetworkEpochOwner.open(source::register, source::read, { true }, {}))
+            assertEquals(1, source.snapshots)
+            assertEquals(1, source.closes)
+        }
+    }
+
+    @Test
+    fun unsafeEventsDuringRegistrationCannotBeHiddenByLaterAvailable(): Unit {
+        for (earlier in listOf(DefaultNetworkEvent.Lost, DefaultNetworkEvent.Blocked(11, true), DefaultNetworkEvent.Capabilities(11, false))) {
+            val source = Source()
+            source.onSnapshot = { source.event(DefaultNetworkEvent.Available(11)) }
+            val opened = NetworkEpochOwner.open({ callback ->
+                source.register(callback).also {
+                    callback(earlier)
+                    callback(DefaultNetworkEvent.Available(11))
+                }
+            }, source::read, { true }, {})
+            assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT), opened)
+            assertEquals(1, source.snapshots)
+            assertEquals(1, source.closes)
+        }
+    }
+
+    @Test
+    fun recaptureRejectsFurtherEventsChangedNetworkAndLostLease(): Unit {
+        val changed = Source()
+        changed.onSnapshot = { changed.event(DefaultNetworkEvent.Available(11)) }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT),
+            NetworkEpochOwner.open(changed::register, changed::read, { true }, {}))
+        assertEquals(2, changed.snapshots)
+        assertEquals(1, changed.closes)
+        val different = Source()
+        different.onSnapshot = {
+            if (different.snapshots == 1) different.event(DefaultNetworkEvent.Available(11))
+            else different.snapshot = DefaultNetworkSnapshot(22, true)
+        }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT),
+            NetworkEpochOwner.open(different::register, different::read, { true }, {}))
+        assertEquals(1, different.closes)
+        val nonDirect = Source()
+        nonDirect.onSnapshot = {
+            if (nonDirect.snapshots == 1) nonDirect.event(DefaultNetworkEvent.Available(11))
+            else nonDirect.snapshot = DefaultNetworkSnapshot(11, false)
+        }
+        assertEquals(NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.NON_DIRECT),
+            NetworkEpochOwner.open(nonDirect::register, nonDirect::read, { true }, {}))
+        assertEquals(1, nonDirect.closes)
+        val lease = Source()
+        lease.onSnapshot = { if (lease.snapshots == 1) lease.event(DefaultNetworkEvent.Available(11)) }
+        var checks = 0
+        assertEquals(NetworkOwnerOpen.Unknown, NetworkEpochOwner.open(lease::register, lease::read, { ++checks < 4 }, {}))
+        assertEquals(2, lease.snapshots)
+        assertEquals(1, lease.closes)
     }
 
     @Test

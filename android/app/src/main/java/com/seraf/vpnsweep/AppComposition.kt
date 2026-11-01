@@ -33,11 +33,12 @@ import com.seraf.vpnsweep.searchstate.RecoveryStamp
 import com.seraf.vpnsweep.searchstate.SearchRunPathAllocator
 import com.seraf.vpnsweep.searchstate.UpgradeRecovery
 import com.seraf.vpnsweep.searchstate.UpgradeRecoveryBackend
-import com.seraf.vpnsweep.searchstate.UpgradeRecoveryResult
+import com.seraf.vpnsweep.searchstate.SupervisedStartupRecovery
+import com.seraf.vpnsweep.searchstate.SupervisorOwner
 import com.seraf.vpnsweep.searchstate.readKernelBootId
 import com.seraf.vpnsweep.searchstate.recoveryRequiredAtStartup
 import com.seraf.vpnsweep.searchstorage.ResultRevision
-import com.seraf.vpnsweep.searchworker.NetworkOwnerOpen
+import com.seraf.vpnsweep.searchworker.NetworkPolicyUnavailableReason
 import com.seraf.vpnsweep.searchworker.SearchEngineWorkerAdapter
 import com.seraf.vpnsweep.searchworker.SearchMobilePhaseProgress
 import com.seraf.vpnsweep.searchworker.SearchMobilePhaseSession
@@ -45,11 +46,15 @@ import com.seraf.vpnsweep.searchworker.SearchOwnerLease
 import com.seraf.vpnsweep.searchworker.SearchOwnerLeaseControl
 import com.seraf.vpnsweep.searchworker.SearchOwnerLock
 import com.seraf.vpnsweep.searchworker.SearchSessionProducer
+import com.seraf.vpnsweep.searchworker.SearchSupervisorTermination
+import com.seraf.vpnsweep.searchworker.SearchWorkerLocalDrain
 import com.seraf.vpnsweep.searchworker.SearchNetworkPolicyUnavailable
 import com.seraf.vpnsweep.searchworker.WorkerOperationFailure
 import com.seraf.vpnsweep.searchworker.WorkerServiceObservation
 import com.seraf.vpnsweep.searchworker.createSearchWorkerRound
 import com.seraf.vpnsweep.searchworker.openAndroidNetworkOwner
+import com.seraf.vpnsweep.searchworker.requireSearchNetwork
+import com.seraf.vpnsweep.searchworker.startPreconnectRecovery
 import com.seraf.vpnsweep.searchstate.SubscriptionController
 import com.seraf.vpnsweep.searchstate.SubscriptionLoadResult
 import com.seraf.vpnsweep.searchstate.SubscriptionPhase
@@ -69,6 +74,7 @@ import java.io.File
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -131,6 +137,19 @@ internal fun emitWorkerDiagnostic(currentGeneration: Long?, generation: Long, ev
     if (currentGeneration == generation) append(event)
 }
 
+internal fun startSubscriptionIfSafe(controller: SearchController, dispatch: () -> SubscriptionStartV1): SubscriptionStartV1 {
+    var result = SubscriptionStartV1.BUSY
+    return if (controller.withSourceMutation { result = dispatch(); true }) result else SubscriptionStartV1.BUSY
+}
+
+internal fun networkPolicyEvent(reason: NetworkPolicyUnavailableReason): ScreenEvent = when (reason) {
+    NetworkPolicyUnavailableReason.UNCONFIRMED -> ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE
+    NetworkPolicyUnavailableReason.CHECK_FAILED -> ScreenEvent.SEARCH_INIT_NETWORK_CHECK_FAILED
+    NetworkPolicyUnavailableReason.CALLBACK_EVENT -> ScreenEvent.SEARCH_INIT_NETWORK_CALLBACK_EVENT
+    NetworkPolicyUnavailableReason.NON_DIRECT -> ScreenEvent.SEARCH_INIT_NETWORK_NON_DIRECT
+    NetworkPolicyUnavailableReason.BLOCKED -> ScreenEvent.SEARCH_INIT_NETWORK_BLOCKED
+}
+
 internal fun workerServiceObservationEvent(observation: WorkerServiceObservation): ScreenEvent = when (observation) {
     WorkerServiceObservation.BUSY -> ScreenEvent.WORKER_SERVICE_BUSY
     WorkerServiceObservation.UNAVAILABLE -> ScreenEvent.WORKER_SERVICE_UNAVAILABLE
@@ -164,10 +183,19 @@ internal class AppComposition(context: Context) {
     }
     private val requests = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "subscription-fetch") }
     private var currentRequestGeneration: Long? = null
-    private var acceptedSnapshot: AcceptedSubscriptionReceiptV1? = null
-    private var activeSearch: SearchLeaseReceiptV1? = null
-    private var completedSearch: SearchLeaseReceiptV1? = null
-    private var restoredCompletedSearch: SearchLeaseReceiptV1? = null
+    private val receipts = SearchReceiptState()
+    private var acceptedSnapshot: AcceptedSubscriptionReceiptV1?
+        get() = receipts.accepted
+        set(value) { receipts.accepted = value }
+    private var activeSearch: SearchLeaseReceiptV1?
+        get() = receipts.active
+        set(value) { receipts.active = value }
+    private var completedSearch: SearchLeaseReceiptV1?
+        get() = receipts.completed
+        set(value) { receipts.completed = value }
+    private var restoredCompletedSearch: SearchLeaseReceiptV1?
+        get() = receipts.restoredCompleted
+        set(value) { receipts.restoredCompleted = value }
     private val startGate = VpnStartGateV1()
     private val workerTransportLimits = SearchWorkerTransportLimits.production()
     private val rawMarker = PrivateSessionMarker(File(app.noBackupFilesDir, "session-state"), ::syncDirectory)
@@ -213,20 +241,59 @@ internal class AppComposition(context: Context) {
         selectionMutation = { ids -> activation.withOwnedSourceMutation(::acquireOwner) { commitSelection(ids) } },
     )
     val searchState = activation.controller.state
-    private val readiness = ReadinessCheckCoordinator(
-        Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "search-readiness") },
-        ::recheckSearchReadiness,
-        onComplete = { result -> addEvent(readinessEvent(result)) },
+    private val ownerBusyExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "search-owner-recovery").apply { isDaemon = true }
+    }
+    private val ownerBusyRecovery = OwnerBusyAutoRecovery(
+        schedule = { action -> ownerBusyExecutor.schedule(action, 1, TimeUnit.SECONDS); true },
+        pending = { searchState.value.ownerBusyRetry },
+        recover = { activation.controller.retryOwnerBusy() },
     )
-    val readinessState = readiness.state
-
-    fun requestReadinessCheck(): Boolean = readiness.request(synchronous = { !recoveryMode.blocked() })
+    private val supervisorExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "search-supervisor").apply { isDaemon = true }
+    }
+    private val searchResourceReaper = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "search-resource-reaper").apply { isDaemon = true }
+    }
+    private val supervisedRecovery = SupervisedStartupRecovery(
+        recoveryBackend,
+        markActive = rawMarker::markActive,
+        preparePending = intentStore::prepareSupervisorRecovery,
+        finishPending = intentStore::finishSupervisorRecovery,
+        acquire = {
+            when (val acquired = SearchOwnerLock.acquire(app)) {
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Busy -> SupervisorOwner.Busy
+                com.seraf.vpnsweep.searchworker.OwnerAcquisition.Unavailable -> SupervisorOwner.Unknown
+                is com.seraf.vpnsweep.searchworker.OwnerAcquisition.Acquired -> {
+                    val lease = acquired.lease
+                    if (!lease.mayLoadMobile()) {
+                        lease.quarantine()
+                        SupervisorOwner.Unknown
+                    } else SupervisorOwner.Acquired(object : RecoveryOwner { override fun close(): Unit = lease.close() })
+                }
+            }
+        },
+    )
+    private val supervisedCoordinator = SupervisedRecoveryCoordinator(
+        recovery = supervisedRecovery,
+        blocked = recoveryMode::blocked,
+        schedule = { delay, action -> try { supervisorExecutor.schedule(action, delay, TimeUnit.MILLISECONDS); true } catch (_: Exception) { false } },
+        newAttempt = { confirmed, retry, failed -> SearchSupervisorTermination(app, supervisorExecutor, confirmed, retry, failed) },
+        complete = { proof -> finishSupervisedRecovery(subscriptions, activation.controller, recoveryBackend, supervisedRecovery, recoveryMode, proof) },
+        report = { status -> addEvent(when (status) {
+            SupervisedRecoveryStatus.PENDING -> ScreenEvent.SUPERVISOR_RECOVERY_PENDING
+            SupervisedRecoveryStatus.COMPLETE -> ScreenEvent.SUPERVISOR_RECOVERY_COMPLETE
+            SupervisedRecoveryStatus.UNKNOWN -> ScreenEvent.SUPERVISOR_RECOVERY_UNKNOWN
+        }) },
+    )
 
     init {
         activation.controller.setPhaseListener { state ->
-            if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state.phase)?.let(::addEvent)
+            if (state.ownerBusyRetry) ownerBusyRecovery.request()
+            if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state)?.let(::addEvent)
         }
         if (!recoveryMode.blocked()) restoreSubscription()
+        else supervisedCoordinator.start()
     }
 
     fun loadSubscription(input: String): SubscriptionLoadResult =
@@ -241,52 +308,6 @@ internal class AppComposition(context: Context) {
         if (!subscriptions.canSelect()) return false
         return activation.ownerAvailable(::acquireOwner)
     }
-
-    private fun retryOwnerBusyForSelection(): SearchStartV3 = synchronized(activation.controller) {
-        val state = subscriptions.state.value
-        val receipt = synchronized(lock) { acceptedSnapshot }
-        val revision = try { activation.currentRevision() } catch (_: Exception) { null }
-        return recoverOwnerBusyForSelection(activation.controller, state, receipt, revision, workerTransportLimits.isProven)
-    }
-
-    private fun recheckSearchReadiness(): SearchReadiness {
-        if (recoveryMode.blocked()) {
-            var completed = false
-            val result = subscriptions.withRecovery {
-                synchronized(activation.controller) {
-                    val outcome = when (intentStore.read()) {
-                        RecoveryIntentState.Absent, RecoveryIntentState.Done -> upgradeRecovery.arm()
-                        is RecoveryIntentState.Armed -> upgradeRecovery.recover()
-                        RecoveryIntentState.Unknown -> UpgradeRecoveryResult.UNKNOWN
-                    }
-                    when (outcome) {
-                        UpgradeRecoveryResult.REBOOT_REQUIRED -> SearchReadiness.REBOOT_REQUIRED
-                        UpgradeRecoveryResult.UNKNOWN -> SearchReadiness.RECOVERY_UNAVAILABLE
-                        UpgradeRecoveryResult.RECOVERED -> {
-                            if (!activation.controller.completeUpgradeRecovery()) {
-                                synchronized(recoveryBackend) { recoveryBackend.quarantined = true }
-                                SearchReadiness.RECOVERY_UNAVAILABLE
-                            } else {
-                                completed = true
-                                readinessChecks()
-                            }
-                        }
-                    }
-                }
-            }
-            if (completed) recoveryMode.complete()
-            return result
-        }
-        return subscriptions.withRecovery { synchronized(activation.controller) { readinessChecks() } }
-    }
-
-    private fun readinessChecks(): SearchReadiness = recheckSearchReadinessFlow(
-            ownerBusyRetry = searchState.value.ownerBusyRetry,
-            recover = ::retryOwnerBusyForSelection,
-            selectionAvailable = ::selectionAvailableUnchecked,
-            hasCommittedSelection = { subscriptions.state.value.selectedIds.isNotEmpty() },
-            searchEnabled = ::searchEnabledUnchecked,
-        )
 
     fun subscriptionState(): StateFlow<SubscriptionUiState> = subscriptions.state
 
@@ -526,21 +547,8 @@ internal class AppComposition(context: Context) {
         else -> null
     }
 
-    private fun reconcileUpgrade(): Boolean {
-        val revision = activation.reissueForUpgrade(storage::reissueCurrent) ?: return false
-        val recovered = storage.recover(revision) ?: return false
-        val receipt = AcceptedSubscriptionReceiptV1.fromCommittedSnapshot(
-            recovered.requestGeneration, recovered.snapshot, recovered.revision,
-        ) ?: run { recovered.snapshot.close(); return false }
-        if (!subscriptions.restore(recovered.snapshot, recovered.selectedIds, revision, recovered.requestGeneration)) return false
-        synchronized(lock) {
-            acceptedSnapshot = receipt
-            activeSearch = null
-            completedSearch = null
-            restoredCompletedSearch = null
-        }
-        return true
-    }
+    private fun reconcileUpgrade(): Boolean =
+        reconcileRecoveredSubscription(activation, storage, subscriptions, lock, receipts)
 
     private fun restoreSubscription(): Unit {
         val revision = try { activation.currentRevision() } catch (_: Exception) { null } ?: return
@@ -576,8 +584,12 @@ internal class AppComposition(context: Context) {
     ) : SubscriptionPortV1 {
         override fun start(generation: Long, input: String, observer: SubscriptionObserverV1): SubscriptionStartV1 {
             if (recoveryMode.blocked() || upgradeRecovery.blocked()) return SubscriptionStartV1.BUSY
-            onGeneration(generation)
-            return delegate.start(generation, input, observer)
+            return startSubscriptionIfSafe(activation.controller) {
+                if (recoveryMode.blocked() || upgradeRecovery.blocked()) SubscriptionStartV1.BUSY else {
+                    onGeneration(generation)
+                    delegate.start(generation, input, observer)
+                }
+            }
         }
 
         override fun cancel(generation: Long): Unit = delegate.cancel(generation)
@@ -590,11 +602,12 @@ internal class AppComposition(context: Context) {
         private val producer = SearchSessionProducer(
             cleanupMillis = DEFAULT_CLEANUP_MILLIS,
             createSession = { snapshot, lease, progress -> createSession(snapshot, lease, progress) },
-            reportNetworkUnavailable = { generation ->
+            reportNetworkUnavailable = { generation, reason ->
                 synchronized(this@AppComposition.lock) {
-                    if (activeSearch?.sessionGeneration == generation) addEvent(ScreenEvent.SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE)
+                    emitWorkerDiagnostic(activeSearch?.sessionGeneration, generation, networkPolicyEvent(reason), ::addEvent)
                 }
             },
+            reportRecoveryPending = { generation -> activation.controller.recoveryPending(generation) },
         )
 
         override fun start(snapshot: SearchSnapshotV1, phaseEpoch: Long, observer: SearchSessionObserverV3): SearchStartV3 {
@@ -772,17 +785,14 @@ internal class AppComposition(context: Context) {
             val cleanupMillis = Mobile.searchManifestCleanupMillis(manifest)
             stage = ScreenEvent.SEARCH_INIT_NETWORK_UNKNOWN
             val manager = app.getSystemService(ConnectivityManager::class.java) ?: throw SearchNetworkPolicyUnavailable()
-            val network = when (val opened = openAndroidNetworkOwner(
+            val network = requireSearchNetwork(openAndroidNetworkOwner(
                 manager,
                 leaseCurrent = lease::mayLoadMobile,
                 stopRoundAndDns = { producer.ownerLost(snapshot.sessionGeneration) },
-            )) {
-                is NetworkOwnerOpen.Ready -> opened
-                NetworkOwnerOpen.Unavailable -> throw SearchNetworkPolicyUnavailable()
-                NetworkOwnerOpen.Unknown -> throw IOException("search_resolver_unknown")
-            }
+            ))
             val owner = network.owner
             val limits = workerTransportLimits
+            val localDrain = SearchWorkerLocalDrain(snapshot.sessionGeneration)
             val adapter = SearchEngineWorkerAdapter(
                 snapshot.sessionGeneration,
                 network.network,
@@ -795,6 +805,24 @@ internal class AppComposition(context: Context) {
                         owner,
                         identity,
                         network.network,
+                        localDrain,
+                        { action ->
+                            try { searchResourceReaper.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
+                        },
+                        { worker, drain ->
+                            startPreconnectRecovery(
+                                snapshot.sessionGeneration,
+                                lease,
+                                drain,
+                                worker,
+                                { delay, action ->
+                                    try { supervisorExecutor.schedule(action, delay, TimeUnit.MILLISECONDS); true }
+                                    catch (_: Exception) { false } catch (_: LinkageError) { false }
+                                },
+                                { confirmed, retry, failed -> SearchSupervisorTermination(app, supervisorExecutor, confirmed, retry, failed) },
+                                producer,
+                            )
+                        },
                         limits.frameBytes,
                         limits.replyBytes,
                         reportRetirementFailure = { reason ->
@@ -849,6 +877,10 @@ internal class AppComposition(context: Context) {
                     synchronized(this@AppComposition.lock) {
                         emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, event, ::addEvent)
                     }
+                },
+                localDrain = localDrain,
+                scheduleOpenCleanup = { action ->
+                    try { searchResourceReaper.execute(action); true } catch (_: Exception) { false } catch (_: LinkageError) { false }
                 },
             )
             stage = ScreenEvent.SEARCH_INIT_SESSION_FAILED

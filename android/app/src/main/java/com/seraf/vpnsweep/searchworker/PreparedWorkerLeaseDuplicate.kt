@@ -20,13 +20,19 @@ internal class PreparedWorkerLeaseDuplicate(
             closing = true
             (!binding) to transferDone
         }
+        var interrupted = false
         try {
-            pending?.await()
+            if (pending != null) while (true) {
+                try { pending.await(); break } catch (_: InterruptedException) { interrupted = true }
+            }
+            if (Thread.interrupted()) interrupted = true
             owner.close()
             if (unstarted) releaseUnstarted()
         } catch (t: Throwable) {
             try { quarantine() } catch (_: Throwable) { }
             throw t
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
         }
     }
 
@@ -50,5 +56,5 @@ internal class PreparedWorkerLeaseDuplicate(
         completed?.countDown()
     }
 
-    override fun close(): Unit = closeOnce.close()
+    override fun close(): Unit = closeOnce.closeUninterruptibly()
 }

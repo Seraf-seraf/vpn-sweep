@@ -95,6 +95,131 @@ internal class SearchEngineWorkerAdapterTest {
         adapter.open(42, 1, 1, generation, "profile".toByteArray(), "params".toByteArray(), 10_000, 5_000)
 
     @Test
+    fun localDrainTracksOpeningInputAndDuplicateUntilActualClose(): Unit {
+        for (closeSucceeds in listOf(true, false)) {
+            val entered = CountDownLatch(1)
+            val finish = CountDownLatch(1)
+            val done = CountDownLatch(1)
+            val delivered = CountDownLatch(1)
+            val proof = AtomicReference<SearchWorkerLocalDrain.Proof?>()
+            val drain = SearchWorkerLocalDrain(42)
+            val lease = Lease().apply {
+                fail = !closeSucceeds
+                action = { entered.countDown(); check(finish.await(2, TimeUnit.SECONDS)) }
+            }
+            val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 10_000, 1024,
+                { WorkerRoundClient(Port(), lease) }, {}, System::nanoTime, localDrain = drain)
+            val caller = Thread { try { open(adapter) } finally { done.countDown() } }
+            caller.start()
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                assertTrue(drain.seal(42) { proof.set(it); delivered.countDown() })
+                assertEquals(1L, delivered.count)
+                finish.countDown()
+                assertTrue(done.await(2, TimeUnit.SECONDS))
+                assertTrue(delivered.await(2, TimeUnit.SECONDS))
+                if (closeSucceeds) assertNotNull(proof.get()) else assertNull(proof.get())
+            } finally { finish.countDown(); caller.join(2_000) }
+        }
+    }
+
+    @Test
+    fun localDrainTracksAReplyReaderAfterTheCallHasStarted(): Unit {
+        for (closeSucceeds in listOf(true, false)) {
+            val entered = CountDownLatch(1)
+            val finish = CountDownLatch(1)
+            val done = CountDownLatch(1)
+            val delivered = CountDownLatch(1)
+            val proof = AtomicReference<SearchWorkerLocalDrain.Proof?>()
+            val drain = SearchWorkerLocalDrain(42)
+            val reply = object : PrivateInputV1 {
+                override fun open(): InputStream = object : ByteArrayInputStream("{}".toByteArray()) {
+                    override fun close(): Unit {
+                        entered.countDown()
+                        check(finish.await(2, TimeUnit.SECONDS))
+                        if (!closeSucceeds) throw IOException("synthetic")
+                        super.close()
+                    }
+                }
+                override fun close(): Unit { if (!closeSucceeds) throw IOException("synthetic") }
+            }
+            val port = Port().apply { result = WorkerReplyV1.Complete(reply) }
+            val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 10_000, 1024,
+                { WorkerRoundClient(port, Lease()) }, {}, System::nanoTime, localDrain = drain)
+            assertEquals(Mobile.SearchWorkerReady, open(adapter))
+            val caller = Thread { try { adapter.call(1, Mobile.SearchWorkerCheck, byteArrayOf(1), 0, 5_000) } finally { done.countDown() } }
+            caller.start()
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                assertTrue(drain.seal(42) { proof.set(it); delivered.countDown() })
+                assertEquals(1L, delivered.count)
+                finish.countDown()
+                assertTrue(done.await(2, TimeUnit.SECONDS))
+                assertTrue(delivered.await(2, TimeUnit.SECONDS))
+                if (closeSucceeds) assertNotNull(proof.get()) else assertNull(proof.get())
+            } finally { finish.countDown(); caller.join(2_000) }
+        }
+    }
+
+    @Test
+    fun unstartedOpeningCloserTransfersCustodyOnlyToTheAcceptedReaper(): Unit {
+        for ((reaperAccepts, closeSucceeds) in listOf(true to true, true to false, false to true)) {
+            val drain = SearchWorkerLocalDrain(42)
+            val lease = Lease().apply { fail = !closeSucceeds }
+            val primary = AtomicReference<Thread?>()
+            val reaper = AtomicReference<(() -> Unit)?>()
+            val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 10_000, 1024,
+                { WorkerRoundClient(Port(), lease) }, {}, System::nanoTime,
+                localDrain = drain,
+                startOpenCloser = { primary.set(it); throw IOException("synthetic_start_failure") },
+                scheduleOpenCleanup = { action -> if (reaperAccepts) { reaper.set(action); true } else false })
+            assertEquals(Mobile.SearchWorkerCleanupIncomplete, open(adapter))
+            var delivered = false
+            var proof: SearchWorkerLocalDrain.Proof? = null
+            assertTrue(drain.seal(42) { delivered = true; proof = it })
+            primary.get()!!.apply { start(); join(2_000); assertFalse(isAlive) }
+            assertEquals(0, lease.closes)
+            if (reaperAccepts) {
+                assertFalse(delivered)
+                reaper.get()!!.invoke()
+                assertEquals(1, lease.closes)
+                assertTrue(delivered)
+                if (closeSucceeds) assertNotNull(proof) else assertNull(proof)
+            } else {
+                assertTrue(delivered)
+                assertNull(proof)
+            }
+        }
+    }
+
+    @Test
+    fun claimedOpeningCloserIsNotDuplicatedWhenLaunchReportsFailure(): Unit {
+        val drain = SearchWorkerLocalDrain(42)
+        val entered = CountDownLatch(1)
+        val finish = CountDownLatch(1)
+        val delivered = CountDownLatch(1)
+        val lease = Lease().apply { action = { entered.countDown(); check(finish.await(2, TimeUnit.SECONDS)) } }
+        val scheduled = AtomicInteger()
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 10_000, 1024,
+            { WorkerRoundClient(Port(), lease) }, {}, System::nanoTime,
+            localDrain = drain,
+            startOpenCloser = { it.start(); check(entered.await(2, TimeUnit.SECONDS)); throw IOException("synthetic_start_failure") },
+            scheduleOpenCleanup = { scheduled.incrementAndGet(); true })
+        try {
+            assertEquals(Mobile.SearchWorkerCleanupIncomplete, open(adapter))
+            var proof: SearchWorkerLocalDrain.Proof? = null
+            assertTrue(drain.seal(42) { proof = it; delivered.countDown() })
+            assertNull(proof)
+            assertEquals(0, scheduled.get())
+            finish.countDown()
+            assertTrue(lease.closeDone.await(2, TimeUnit.SECONDS))
+            assertTrue(delivered.await(2, TimeUnit.SECONDS))
+            assertNotNull(proof)
+            assertEquals(1, lease.closes)
+        } finally { finish.countDown() }
+    }
+
+    @Test
     fun knownOpenReasonIsEmittedOnlyAfterRetirementAndAllowsNextRound(): Unit {
         val port = Port()
         val events = mutableListOf<WorkerCandidateFailureV2>()

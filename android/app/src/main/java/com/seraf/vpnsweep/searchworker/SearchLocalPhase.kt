@@ -22,6 +22,7 @@ internal sealed interface LocalPhaseOutcome {
     data object Interrupted : LocalPhaseOutcome
     data object Stopped : LocalPhaseOutcome
     data object Unknown : LocalPhaseOutcome
+    data object Recovering : LocalPhaseOutcome
     data class Handoff(val result: HandoffResult, val localFence: SearchResultFenceV3) : LocalPhaseOutcome
 }
 
@@ -39,10 +40,12 @@ internal class SearchLocalPhase internal constructor(
     private val closeSession: () -> Unit,
     private val retireWorker: () -> SearchResourceStateV2,
     private val releaseLease: () -> SearchResourceStateV2,
+    private val recoveryPending: () -> Boolean = { false },
 ) {
     private val lock = Any()
     private var started = false
     private var revoked = false
+    private var resultOpening = false
     private val fence = ResultHandoffFence(sessionGeneration, phaseEpoch, object : SearchSessionObserverV3 {
         override fun onProgress(phaseEpoch: Long, progress: SearchProgressV1): Unit = observer.onProgress(phaseEpoch, progress)
         override fun onTerminal(terminal: SearchTerminalV3): Unit = observer.onTerminal(terminal)
@@ -60,6 +63,14 @@ internal class SearchLocalPhase internal constructor(
         fence.cancel()
     }
 
+    fun fenceForRecovery(): Boolean = synchronized(lock) {
+        if (resultOpening) false else {
+            revoked = true
+            fence.cancel()
+            true
+        }
+    }
+
     fun execute(): LocalPhaseOutcome {
         synchronized(lock) {
             if (started || revoked) return LocalPhaseOutcome.NotStarted
@@ -68,10 +79,12 @@ internal class SearchLocalPhase internal constructor(
         val status = try {
             runSession()
         } catch (failure: Throwable) {
-            fence.quarantine()
             rethrowFatal(failure)
+            if (recoveryPending()) return LocalPhaseOutcome.Recovering
+            fence.quarantine()
             return LocalPhaseOutcome.Unknown
         }
+        if (recoveryPending()) return LocalPhaseOutcome.Recovering
         when (status) {
             "paused_budget" -> return LocalPhaseOutcome.Paused
             "interrupted" -> return LocalPhaseOutcome.Interrupted
@@ -92,7 +105,12 @@ internal class SearchLocalPhase internal constructor(
             closeAfterUnknown()
             return LocalPhaseOutcome.Unknown
         }
-        val localOpen = fence.reserveLocalOpen()
+        val localOpen = synchronized(lock) {
+            if (revoked) null else {
+                resultOpening = true
+                fence.reserveLocalOpen()
+            }
+        }
         val handoff = if (localOpen == null) {
             HandoffResult.Discarded
         } else {

@@ -39,5 +39,9 @@
             android:name=".searchworker.SearchWorkerService"
             android:exported="false"
             android:process=":search" />
+        <service
+            android:name=".searchworker.SearchSupervisorService"
+            android:exported="false"
+            android:process=":search" />
     </application>
 </manifest>

@@ -68,6 +68,7 @@ internal data class SearchUiState(
     val startRejection: SearchStartRejection? = null,
     val ownerBusyPending: Boolean = false,
     val ownerBusyRetry: Boolean = false,
+    val cleanupPending: Boolean = false,
 )
 
 internal enum class OwnerBusyRecovery { READY, BUSY, UNKNOWN }
@@ -135,7 +136,9 @@ internal class SearchController(
     private fun publish(next: SearchUiState): Unit {
         val previous = mutableState.value
         mutableState.value = next
-        if (previous.phase != next.phase || previous.ownerBusyPending != next.ownerBusyPending) phaseListener(next)
+        if (previous.phase != next.phase || previous.ownerBusyPending != next.ownerBusyPending ||
+            previous.ownerBusyRetry != next.ownerBusyRetry || previous.cleanupPending != next.cleanupPending
+        ) phaseListener(next)
     }
 
     @Synchronized
@@ -152,6 +155,17 @@ internal class SearchController(
         if (!clear) return false
         admissionBlocked = false
         publish(SearchUiState(phase = SearchPhase.IDLE))
+        return true
+    }
+
+    @Synchronized
+    fun recoveryPending(sessionGeneration: Long): Boolean {
+        val session = active ?: return false
+        if (session.generation != sessionGeneration || session.unknown || session.terminal != null ||
+            session.resultSeen || session.resultInFlight || session.committed || pendingDeliveries != 0 || pendingResultClose.isNotEmpty()
+        ) return false
+        if (session.dispatching) session.callbackDuringDispatch = true
+        publish(mutableState.value.copy(phase = SearchPhase.INTERRUPTED, failure = SearchFailureV1.INTERRUPTED, cleanupPending = true))
         return true
     }
 

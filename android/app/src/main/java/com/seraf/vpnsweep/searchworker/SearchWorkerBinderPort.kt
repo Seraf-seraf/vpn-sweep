@@ -31,6 +31,9 @@ internal fun createSearchWorkerRound(
     owner: NetworkEpochOwner,
     identity: WorkerIdentityV1,
     network: SearchNetworkV1,
+    localDrain: SearchWorkerLocalDrain,
+    scheduleRecoveryClose: (() -> Unit) -> Boolean,
+    onPreconnectTimeout: (PreconnectWorkerStop, SearchWorkerLocalDrain) -> Boolean,
     provenFrameBound: Int?,
     provenReplyBound: Int?,
     reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {},
@@ -39,10 +42,10 @@ internal fun createSearchWorkerRound(
     reportServiceObservation: (WorkerServiceObservation) -> Unit = {},
 ): WorkerRoundClient? {
     if (provenFrameBound == null || provenFrameBound < FRAME_HEADER_BYTES || provenReplyBound == null || provenReplyBound < 1) return null
-    val coordinator = SearchWorkerCoordinator(context, ownerLease, identity, network, owner)
+    val coordinator = SearchWorkerCoordinator(context, ownerLease, identity, network, owner, localDrain, scheduleRecoveryClose)
     val duplicate = coordinator.prepare() ?: return null
     return WorkerRoundClient(
-        SearchWorkerBinderPort(coordinator, ownerLease, duplicate, identity, network, provenFrameBound, provenReplyBound, reportRetirementFailure, reportServiceFailure, reportBindFailure, reportServiceObservation),
+        SearchWorkerBinderPort(coordinator, ownerLease, duplicate, identity, network, localDrain, { onPreconnectTimeout(coordinator, localDrain) }, provenFrameBound, provenReplyBound, reportRetirementFailure, reportServiceFailure, reportBindFailure, reportServiceObservation),
         duplicate,
     )
 }
@@ -61,6 +64,25 @@ private const val FRAME_HEADER_BYTES = 16
 private const val FRAME_BUFFER_BYTES = 8 * 1024
 private const val MAX_CLEANUP_MILLIS = 60_000L
 private const val CANCELLED_BEFORE_BIND = -1
+
+private sealed interface OpenDispatchResult {
+    class Status(val value: Int) : OpenDispatchResult
+    data object WaitExpired : OpenDispatchResult
+}
+
+private sealed interface CancelDispatchResult {
+    class Status(val confirmed: Boolean) : CancelDispatchResult
+    data object RecoveryStopped : CancelDispatchResult
+}
+
+internal interface StagedWorkerFrame : AutoCloseable {
+    fun descriptor(): ParcelFileDescriptor
+}
+
+private class AndroidStagedWorkerFrame(private val value: ParcelFileDescriptor) : StagedWorkerFrame {
+    override fun descriptor(): ParcelFileDescriptor = value
+    override fun close(): Unit = value.close()
+}
 
 internal fun candidateOpenAfterRetirement(status: Long, reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {}, retire: () -> Boolean): WorkerOpenV2? {
     val flag = Mobile.SearchWorkerRetryableFlag
@@ -86,16 +108,20 @@ internal class SearchWorkerBinderPort(
     private val duplicate: PreparedWorkerLeaseDuplicate,
     private val identity: WorkerIdentityV1,
     private val network: SearchNetworkV1,
+    private val localDrain: SearchWorkerLocalDrain,
+    private val onPreconnectTimeout: () -> Boolean,
     private val provenFrameBound: Int,
     private val provenReplyBound: Int,
     private val reportRetirementFailure: (WorkerCandidateFailureV2) -> Unit = {},
     private val reportServiceFailure: (WorkerFatalV2) -> Unit = {},
     private val reportBindFailure: () -> Unit = {},
     private val reportServiceObservation: (WorkerServiceObservation) -> Unit = {},
-    private val stageFrameOverride: ((FrameInput, Long) -> ParcelFileDescriptor)? = null,
+    private val stageFrameOverride: ((FrameInput, Long) -> StagedWorkerFrame)? = null,
     private val statusTransactionOverride: ((IBinder, Int, (Parcel) -> Unit) -> Int)? = null,
+    private val nowMillis: () -> Long = SystemClock::elapsedRealtime,
+    private val awaitBounded: (CountDownLatch, Long) -> Boolean = { done, millis -> done.await(millis, TimeUnit.MILLISECONDS) },
 ) : DeadlineWorkerPort {
-    private enum class State { NEW, OPENING, READY, CLOSING, RETIRED, QUARANTINED }
+    private enum class State { NEW, OPENING, READY, CLOSING, RECOVERY_PENDING, RETIRED, QUARANTINED }
     private enum class CallDisposition { ACCEPT, DEADLINE, CANCELLED, UNKNOWN }
     private val lock = Any()
     private var state = State.NEW
@@ -149,9 +175,12 @@ internal class SearchWorkerBinderPort(
             return if (retired) WorkerOpenV2.Interrupted(WorkerInterruptedV2.CANCELLED)
             else WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
         }
-        val status = bounded(deadline, {}) {
-            val descriptor = stageFrameOverride?.invoke(frame, deadline) ?: stageFrame(frame, deadline)
-            try {
+        val openTicket = localDrain.begin(identity.sessionGeneration)
+            ?: return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY).also { failClosed() }
+        val openResult = bounded(deadline, {}, openTicket, { timedOut -> failOpen(deadline, timedOut) }, { it == OpenDispatchResult.WaitExpired }) {
+            try { OpenDispatchResult.Status(trackedPreconnectOpen(openTicket) { resourceTicket -> trackedWorkerResource(resourceTicket, {
+                stageFrameOverride?.invoke(frame, deadline) ?: AndroidStagedWorkerFrame(stageFrame(frame, deadline))
+            }, { it.close() }, { it is WorkerFrameDeadlineBeforeAcquire }) { descriptor ->
                 val bindDecision = synchronized(lock) {
                     when {
                         state != State.OPENING -> 0
@@ -164,31 +193,44 @@ internal class SearchWorkerBinderPort(
                 }
                 if (bindDecision == 1) {
                     duplicate.close()
-                    return@bounded CANCELLED_BEFORE_BIND
+                    return@trackedWorkerResource CANCELLED_BEFORE_BIND
                 }
                 if (bindDecision != 2) throw IOException("worker_admission_unknown")
                 if (!coordinator.bind()) {
                     try { reportBindFailure() } catch (_: Exception) { } catch (_: LinkageError) { }
                     throw IOException("worker_admission_unknown")
                 }
-                val binder = coordinator.awaitConfirmed(deadline) ?: throw IOException("worker_admission_unknown")
+                val binder = when (val observation = coordinator.awaitConfirmation(deadline)) {
+                    is WorkerConfirmationWait.Confirmed -> observation.binder
+                    WorkerConfirmationWait.Deadline -> throw ExpectedPreconnectWaitStop()
+                    WorkerConfirmationWait.SupervisedStop -> {
+                        if (synchronized(lock) { state == State.RECOVERY_PENDING }) throw ExpectedPreconnectWaitStop()
+                        throw IOException("worker_admission_unknown")
+                    }
+                    WorkerConfirmationWait.Unknown -> throw IOException("worker_admission_unknown")
+                }
                 requireTime(deadline)
                 val dispatch = synchronized(lock) { state == State.OPENING && !cancelled }
                 if (!dispatch) throw IOException("worker_delivery_unknown")
-                val code = statusTransaction(binder, SearchWorkerIpcV2.OPEN_FD) { request ->
+                val code = statusTransaction(binder, SearchWorkerIpcV2.OPEN_FD, openTicket) { request ->
                     request.writeWorkerIdentity(identity, network)
                     request.writeLong(startupDeadlineElapsedMillis)
                     request.writeLong(cleanupMillis)
                     request.writeLong(frame.length)
-                    request.writeTypedObject(descriptor, 0)
+                    request.writeTypedObject(descriptor.descriptor(), 0)
                 }
                 requireTime(deadline)
                 if (coordinator.confirmedBinder() !== binder) throw IOException("worker_owner_unknown")
                 code
-            } finally {
-                descriptor.close()
-            }
+            } }) } catch (_: ExpectedPreconnectWaitStop) { OpenDispatchResult.WaitExpired }
         } ?: return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY)
+        val status = when (openResult) {
+            is OpenDispatchResult.Status -> openResult.value
+            OpenDispatchResult.WaitExpired -> {
+                failOpen(deadline, true)
+                return WorkerOpenV2.Fatal(WorkerFatalV2.UNKNOWN_DELIVERY)
+            }
+        }
         if (status == CANCELLED_BEFORE_BIND) {
             val retired = synchronized(lock) {
                 if (state != State.OPENING || !cancelled || bindingStarted) false else {
@@ -220,7 +262,7 @@ internal class SearchWorkerBinderPort(
                     }
                 }
                 if (!canRetire) return@candidateOpenAfterRetirement false
-                val now = SystemClock.elapsedRealtime()
+                val now = nowMillis()
                 val cleanupDeadline = try { minOf(deadline, Math.addExact(now, cleanupMillis)) } catch (_: ArithmeticException) { return@candidateOpenAfterRetirement false }
                 now >= 0 && cleanupDeadline > now && closeUntil(identity, cleanupDeadline) == WorkerCloseV1.CLEAN_AND_DEAD
             }
@@ -254,54 +296,53 @@ internal class SearchWorkerBinderPort(
             }
         }
         if (!reserved) return WorkerReplyV1.Quarantined.also { failClosed() }
+        val callTicket = localDrain.begin(identity.sessionGeneration)
+            ?: return WorkerReplyV1.Quarantined.also { failClosed() }
         val operationDeadline = frame.deadlineElapsedMillis
-        val reply = awaitCall(operationDeadline, ::discardReply) {
-            val descriptor = try {
-                stageFrameOverride?.invoke(frame, operationDeadline) ?: stageFrame(frame, operationDeadline)
-            } catch (_: WorkerFrameDeadline) {
-                return@awaitCall WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
-            }
+        val reply = awaitCall(operationDeadline, ::discardReply, callTicket) {
             var result: WorkerReplyV1? = null
             try {
-                val binder = coordinator.confirmedBinder() ?: throw IOException("worker_owner_unknown")
-                try {
-                    requireTime(operationDeadline)
-                } catch (_: WorkerFrameDeadline) {
-                    return@awaitCall WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
-                }
-                val dispatch = synchronized(lock) {
-                    when {
-                        state != State.READY || !inFlight -> 0
-                        cancelled -> 1
-                        else -> 2
+                trackedWorkerResource(callTicket, {
+                    stageFrameOverride?.invoke(frame, operationDeadline) ?: AndroidStagedWorkerFrame(stageFrame(frame, operationDeadline))
+                }, { it.close() }, { it is WorkerFrameDeadlineBeforeAcquire }) { descriptor ->
+                    val binder = coordinator.confirmedBinder() ?: throw IOException("worker_owner_unknown")
+                    try {
+                        requireTime(operationDeadline)
+                    } catch (_: WorkerFrameDeadline) {
+                        return@awaitCall WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
                     }
+                    val dispatch = synchronized(lock) {
+                        when {
+                            state != State.READY || !inFlight -> 0
+                            cancelled -> 1
+                            else -> 2
+                        }
+                    }
+                    if (dispatch == 0) throw IOException("worker_delivery_unknown")
+                    val produced = if (dispatch == 1) WorkerReplyV1.Interrupted(WorkerInterruptedV2.CANCELLED)
+                    else callTransaction(binder, operation, frame, descriptor.descriptor(), callTicket)
+                    result = produced
+                    if (coordinator.confirmedBinder() !== binder) {
+                        discardReply(produced)
+                        result = null
+                        throw IOException("worker_owner_unknown")
+                    }
+                    produced
                 }
-                if (dispatch == 0) throw IOException("worker_delivery_unknown")
-                val produced = if (dispatch == 1) WorkerReplyV1.Interrupted(WorkerInterruptedV2.CANCELLED)
-                else callTransaction(binder, operation, frame, descriptor)
-                result = produced
-                if (coordinator.confirmedBinder() !== binder) {
-                    discardReply(produced)
-                    result = null
-                    throw IOException("worker_owner_unknown")
-                }
-                produced
-            } finally {
-                try {
-                    descriptor.close()
-                } catch (failure: Throwable) {
-                    result?.let(::discardReply)
-                    throw failure
-                }
+            } catch (_: WorkerFrameDeadline) {
+                WorkerReplyV1.Interrupted(WorkerInterruptedV2.DEADLINE)
+            } catch (failure: Throwable) {
+                result?.let(::discardReply)
+                throw failure
             }
         } ?: return WorkerReplyV1.Quarantined
-        if (SystemClock.elapsedRealtime() < 0) {
+        if (nowMillis() < 0) {
             discardReplyAsync(reply)
             return WorkerReplyV1.Quarantined.also { failClosed() }
         }
         var disposed: WorkerReplyV1 = reply
         while (true) {
-            val finishedAt = SystemClock.elapsedRealtime()
+            val finishedAt = nowMillis()
             val disposition = synchronized(lock) {
                 val overflow = finishedAt >= operationDeadline &&
                     (cleanupBudgetMillis <= 0 || operationDeadline > Long.MAX_VALUE - cleanupBudgetMillis)
@@ -346,13 +387,17 @@ internal class SearchWorkerBinderPort(
             failClosed()
             throw IOException("worker_identity_unknown")
         }
+        if (synchronized(lock) { if (state == State.RECOVERY_PENDING) { cancelled = true; true } else false }) return
         if (remaining(cleanupDeadlineElapsedMillis) <= 0) {
             failClosed()
             throw IOException("worker_deadline")
         }
         var conflict = false
+        var unavailable = false
+        var cancelTicket: SearchWorkerLocalDrain.Ticket? = null
         var effectiveDeadline = cleanupDeadlineElapsedMillis
         val send = synchronized(lock) {
+            if (state == State.RECOVERY_PENDING) { cancelled = true; return }
             cancelled = true
             effectiveDeadline = tightenCleanupDeadline(cleanupDeadlineElapsedMillis)
             if (cancelPending) {
@@ -365,40 +410,75 @@ internal class SearchWorkerBinderPort(
                     State.NEW, State.CLOSING, State.RETIRED -> false
                     State.OPENING -> bindingStarted
                     State.READY -> true
-                    State.QUARANTINED -> throw IOException("worker_delivery_unknown")
+                    State.RECOVERY_PENDING, State.QUARANTINED -> throw IOException("worker_delivery_unknown")
                 }
-                if (needed) cancelPending = true else cancelConfirmed = true
-                needed
+                if (needed) {
+                    cancelTicket = localDrain.begin(identity.sessionGeneration)
+                    if (cancelTicket == null) unavailable = true else cancelPending = true
+                } else cancelConfirmed = true
+                needed && !unavailable
             }
         }
-        if (conflict) {
+        if (conflict || unavailable) {
             failClosed()
             throw IOException("worker_delivery_unknown")
         }
         if (!send) return
-        val confirmed = bounded(effectiveDeadline, {}) {
-            val binder = coordinator.awaitConfirmed(effectiveDeadline) ?: throw IOException("worker_owner_unknown")
-            requireTime(effectiveDeadline)
-            val status = statusTransaction(binder, SearchWorkerIpcV2.CANCEL_ROUND) { it.writeWorkerIdentity(identity, network) }
-            requireTime(effectiveDeadline)
-            status.toLong() == Mobile.SearchWorkerReady
-        }
-        if (confirmed != true) {
-            failClosed()
-            throw IOException("worker_delivery_unknown")
-        }
-        val accepted = synchronized(lock) {
-            if (state == State.QUARANTINED) false else {
-                cancelPending = false
-                cancelConfirmed = true
-                true
+        val custody = checkNotNull(cancelTicket)
+        var completed = false
+        try {
+            val task = custody.retain() ?: throw IOException("worker_drain_unknown")
+            var deferred = false
+            val result = bounded(effectiveDeadline, {}, task, onFailure = { timedOut ->
+                deferred = timedOut && synchronized(lock) { state == State.RECOVERY_PENDING }
+                if (!deferred) failClosed()
+            }, expectedTimeout = { it == CancelDispatchResult.RecoveryStopped }) {
+                try {
+                    CancelDispatchResult.Status(trackedPreconnectCancel(task) {
+                        val binder = when (val observation = coordinator.awaitConfirmation(effectiveDeadline)) {
+                            is WorkerConfirmationWait.Confirmed -> observation.binder
+                            WorkerConfirmationWait.SupervisedStop -> {
+                                if (synchronized(lock) { state == State.RECOVERY_PENDING }) throw ExpectedPreconnectWaitStop()
+                                throw IOException("worker_owner_unknown")
+                            }
+                            WorkerConfirmationWait.Deadline, WorkerConfirmationWait.Unknown -> throw IOException("worker_owner_unknown")
+                        }
+                        requireTime(effectiveDeadline)
+                        val status = statusTransaction(binder, SearchWorkerIpcV2.CANCEL_ROUND) { it.writeWorkerIdentity(identity, network) }
+                        requireTime(effectiveDeadline)
+                        if (status.toLong() != Mobile.SearchWorkerReady) throw IOException("worker_cancel_unknown")
+                        true
+                    })
+                } catch (_: ExpectedPreconnectWaitStop) { CancelDispatchResult.RecoveryStopped }
             }
+            if (result == null && deferred) { completed = true; return }
+            if (result == CancelDispatchResult.RecoveryStopped) {
+                val fenced = synchronized(lock) {
+                    if (state == State.RECOVERY_PENDING) { cancelPending = false; true } else false
+                }
+                if (fenced) { completed = true; return }
+            }
+            if (result !is CancelDispatchResult.Status || !result.confirmed) {
+                failClosed()
+                throw IOException("worker_delivery_unknown")
+            }
+            val accepted = synchronized(lock) {
+                if (state == State.QUARANTINED) false else {
+                    cancelPending = false
+                    cancelConfirmed = true
+                    true
+                }
+            }
+            if (!accepted) throw IOException("worker_delivery_unknown")
+            completed = true
+        } finally {
+            try { if (!completed) failClosed() } finally { custody.closed(completed) }
         }
-        if (!accepted) throw IOException("worker_delivery_unknown")
     }
 
     override fun closeUntil(identity: WorkerIdentityV1, cleanupDeadlineElapsedMillis: Long): WorkerCloseV1 {
         if (identity != this.identity) return WorkerCloseV1.QUARANTINED.also { failClosed() }
+        if (synchronized(lock) { state == State.RECOVERY_PENDING }) return WorkerCloseV1.QUARANTINED
         var effectiveDeadline = cleanupDeadlineElapsedMillis
         val disposition = synchronized(lock) {
             when {
@@ -442,7 +522,7 @@ internal class SearchWorkerBinderPort(
             frame.deadlineElapsedMillis > 0
 
     private fun stageFrame(frame: FrameInput, deadline: Long): ParcelFileDescriptor {
-        requireTime(deadline)
+        try { requireTime(deadline) } catch (_: WorkerFrameDeadline) { throw WorkerFrameDeadlineBeforeAcquire() }
         val raw = Os.memfd_create("search-frame", OsConstants.MFD_CLOEXEC)
         var duplicate: ParcelFileDescriptor? = null
         var failure: Throwable? = null
@@ -494,10 +574,13 @@ internal class SearchWorkerBinderPort(
         operation: WorkerOperationV1,
         frame: FrameInput,
         descriptor: ParcelFileDescriptor,
+        operationTicket: SearchWorkerLocalDrain.Ticket,
     ): WorkerReplyV1 {
+        val replyTicket = operationTicket.retain() ?: throw IOException("worker_drain_unknown")
         var received: ParcelFileDescriptor? = null
+        var transferred = false
         try {
-            val status = transaction(binder, SearchWorkerIpcV2.CALL_FD, { request ->
+            val status = transaction(binder, SearchWorkerIpcV2.CALL_FD, operationTicket, { request ->
                 request.writeWorkerIdentity(identity, network)
                 request.writeInt(operationNumber(operation))
                 request.writeLong(frame.length)
@@ -517,8 +600,11 @@ internal class SearchWorkerBinderPort(
             }
             val result = when (status.toLong()) {
                 Mobile.SearchWorkerReady -> {
-                    val input = ReceivedFdInput(received ?: throw IOException("worker_reply_invalid"), ::replyDisposed)
+                    val input = ReceivedFdInput(received ?: throw IOException("worker_reply_invalid")) { value, closed ->
+                        try { replyDisposed(value, closed) } finally { replyTicket.closed(closed) }
+                    }
                     received = null
+                    transferred = true
                     val accepted = synchronized(lock) {
                         if (state != State.READY || !inFlight || pendingReply != null) false else {
                             pendingReply = input
@@ -536,25 +622,50 @@ internal class SearchWorkerBinderPort(
             received = null
             return result
         } finally {
-            received?.close()
+            if (!transferred) {
+                var closed = false
+                try {
+                    received?.close()
+                    closed = true
+                } finally { replyTicket.closed(closed) }
+            }
         }
     }
 
-    private fun statusTransaction(binder: IBinder, code: Int, write: (Parcel) -> Unit): Int =
+    private fun statusTransaction(
+        binder: IBinder,
+        code: Int,
+        operationTicket: SearchWorkerLocalDrain.Ticket? = null,
+        write: (Parcel) -> Unit,
+    ): Int =
         statusTransactionOverride?.invoke(binder, code, write)
-            ?: transaction(binder, code, write) { response -> response.readInt().also { response.enforceNoDataAvail() } }
+            ?: transaction(binder, code, operationTicket, write) { response -> response.readInt().also { response.enforceNoDataAvail() } }
 
-    private fun <T> transaction(binder: IBinder, code: Int, write: (Parcel) -> Unit, read: (Parcel) -> T): T {
-        val request = Parcel.obtain()
-        val response = Parcel.obtain()
+    private fun <T> transaction(
+        binder: IBinder,
+        code: Int,
+        operationTicket: SearchWorkerLocalDrain.Ticket?,
+        write: (Parcel) -> Unit,
+        read: (Parcel) -> T,
+    ): T {
+        val parcelTicket = operationTicket?.retain()
+        if (operationTicket != null && parcelTicket == null) throw IOException("worker_drain_unknown")
+        var request: Parcel? = null
+        var response: Parcel? = null
+        var recycled = false
         try {
+            request = Parcel.obtain()
+            response = Parcel.obtain()
             request.writeInterfaceToken(SearchWorkerIpcV2.DESCRIPTOR)
             write(request)
             if (!binder.transact(code, request, response, 0)) throw IOException("worker_delivery_unknown")
             response.readException()
             return read(response)
         } finally {
-            try { request.recycle() } finally { response.recycle() }
+            try {
+                try { request?.recycle() } finally { response?.recycle() }
+                recycled = request != null && response != null
+            } finally { parcelTicket?.closed(recycled) }
         }
     }
 
@@ -569,7 +680,13 @@ internal class SearchWorkerBinderPort(
         return chosen
     }
 
-    private fun <T : Any> awaitCall(operationDeadline: Long, discard: (T) -> Unit, action: () -> T): T? {
+    private fun <T : Any> awaitCall(
+        operationDeadline: Long,
+        discard: (T) -> Unit,
+        ticket: SearchWorkerLocalDrain.Ticket? = null,
+        action: () -> T,
+    ): T? {
+        val dispatch = ticket?.let(::SearchWorkerDispatch)
         val resultLock = Any()
         var completed = false
         var abandoned = false
@@ -581,6 +698,7 @@ internal class SearchWorkerBinderPort(
                 abandoned = true
                 result.also { result = null }
             }
+            dispatch?.cancelBeforeClaim()
             failClosed()
             if (stale != null) {
                 try {
@@ -593,6 +711,7 @@ internal class SearchWorkerBinderPort(
 
         try {
             Thread({
+                if (dispatch != null && !dispatch.claim()) return@Thread
                 val value = try { action() } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                     null
@@ -608,14 +727,16 @@ internal class SearchWorkerBinderPort(
                 if (stale != null) try { discard(stale) } catch (_: Exception) { }
             }, "search-worker-call").apply { isDaemon = true }.start()
         } catch (_: Exception) {
+            dispatch?.cancelBeforeClaim()
             return abandon()
         } catch (_: LinkageError) {
+            dispatch?.cancelBeforeClaim()
             return abandon()
         }
 
         try {
             while (true) {
-                val now = SystemClock.elapsedRealtime()
+                val now = nowMillis()
                 if (now < 0) return abandon()
                 if (now >= operationDeadline) {
                     val budget = synchronized(lock) { cleanupBudgetMillis }
@@ -659,9 +780,18 @@ internal class SearchWorkerBinderPort(
         }
     }
 
-    private fun <T : Any> bounded(deadline: Long, discard: (T) -> Unit, action: () -> T): T? {
+    private fun <T : Any> bounded(
+        deadline: Long,
+        discard: (T) -> Unit,
+        ticket: SearchWorkerLocalDrain.Ticket? = null,
+        onFailure: (Boolean) -> Unit = { failClosed() },
+        expectedTimeout: (T) -> Boolean = { false },
+        action: () -> T,
+    ): T? {
+        val dispatch = ticket?.let(::SearchWorkerDispatch)
         if (remaining(deadline) <= 0) {
-            failClosed()
+            dispatch?.cancelBeforeClaim()
+            onFailure(false)
             return null
         }
         val done = CountDownLatch(1)
@@ -671,6 +801,7 @@ internal class SearchWorkerBinderPort(
         var result: T? = null
         try {
             Thread({
+                if (dispatch != null && !dispatch.claim()) { done.countDown(); return@Thread }
                 val value = try { action() } catch (_: Exception) { null } catch (_: LinkageError) { null }
                 val discardNow = synchronized(resultLock) {
                     if (abandoned) value else {
@@ -683,23 +814,29 @@ internal class SearchWorkerBinderPort(
                 done.countDown()
             }, "search-worker-ipc").apply { isDaemon = true }.start()
         } catch (_: Exception) {
-            failClosed()
+            dispatch?.cancelBeforeClaim()
+            onFailure(false)
             return null
         } catch (_: LinkageError) {
-            failClosed()
+            dispatch?.cancelBeforeClaim()
+            onFailure(false)
             return null
         }
+        var interrupted = false
         val waited = try {
             val remaining = remaining(deadline)
-            remaining > 0 && done.await(remaining, TimeUnit.MILLISECONDS)
+            remaining > 0 && awaitBounded(done, remaining)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+            interrupted = true
             false
         }
         val timely = waited && remaining(deadline) > 0
         var discarded: T? = null
+        var pending = false
         val accepted = synchronized(resultLock) {
             if (timely && completed && result != null) result.also { result = null } else {
+                pending = !completed || (result?.let(expectedTimeout) == true)
                 abandoned = true
                 discarded = result
                 result = null
@@ -707,7 +844,9 @@ internal class SearchWorkerBinderPort(
             }
         }
         if (accepted == null) {
-            failClosed()
+            dispatch?.cancelBeforeClaim()
+            val now = nowMillis()
+            onFailure(!interrupted && pending && now >= 0 && now >= deadline)
             discarded?.let { value ->
                 try { Thread({ try { discard(value) } catch (_: Exception) { } }, "search-worker-discard").apply { isDaemon = true }.start() }
                 catch (_: Exception) { }
@@ -747,14 +886,66 @@ internal class SearchWorkerBinderPort(
         }
         coordinator.quarantine()
     }
+
+    private fun failOpen(deadline: Long, timedOut: Boolean): Unit {
+        val now = nowMillis()
+        handlePreconnectOpenFailure(timedOut, now, deadline, reserve = {
+            synchronized(lock) {
+                if (state != State.OPENING || !bindingStarted || (cancelled && !cancelPending)) false else {
+                    state = State.RECOVERY_PENDING
+                    true
+                }
+            }
+        }, start = {
+            try { onPreconnectTimeout() } catch (_: Exception) { false } catch (_: LinkageError) { false }
+        }, fail = {
+            synchronized(lock) { if (state == State.RECOVERY_PENDING) state = State.OPENING }
+            failClosed()
+        })
+    }
+
+    private fun remaining(deadline: Long): Long {
+        val now = nowMillis()
+        return if (now < 0 || deadline <= now) 0 else deadline - now
+    }
 }
 
-private fun remaining(deadline: Long): Long {
-    val now = SystemClock.elapsedRealtime()
-    return if (now < 0 || deadline <= now) 0 else deadline - now
+internal class ExpectedPreconnectWaitStop : IOException("worker_preconnect_stopped")
+
+internal inline fun <T> trackedPreconnectOpen(
+    ticket: SearchWorkerLocalDrain.Ticket,
+    action: (SearchWorkerLocalDrain.Ticket) -> T,
+): T {
+    var confirmed = false
+    try {
+        val resource = ticket.retain() ?: throw IOException("worker_resource_unknown")
+        val result = action(resource)
+        confirmed = true
+        return result
+    } catch (failure: ExpectedPreconnectWaitStop) {
+        confirmed = true
+        throw failure
+    } finally {
+        ticket.closed(confirmed)
+    }
 }
 
-private class WorkerFrameDeadline : IOException("worker_deadline")
+internal inline fun <T> trackedPreconnectCancel(ticket: SearchWorkerLocalDrain.Ticket, action: () -> T): T {
+    var confirmed = false
+    try {
+        val result = action()
+        confirmed = true
+        return result
+    } catch (failure: ExpectedPreconnectWaitStop) {
+        confirmed = true
+        throw failure
+    } finally {
+        ticket.closed(confirmed)
+    }
+}
+
+private open class WorkerFrameDeadline : IOException("worker_deadline")
+private class WorkerFrameDeadlineBeforeAcquire : WorkerFrameDeadline()
 
 private fun requireTime(deadline: Long): Unit {
     val now = SystemClock.elapsedRealtime()

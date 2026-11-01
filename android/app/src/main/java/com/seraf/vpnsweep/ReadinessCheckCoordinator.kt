@@ -1,6 +1,8 @@
 package com.seraf.vpnsweep
 
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
+import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,4 +61,31 @@ internal class StartupRecoveryMode(initiallyBlocked: Boolean) {
     @Volatile private var blocked = initiallyBlocked
     fun blocked(): Boolean = blocked
     fun complete(): Unit { blocked = false }
+}
+
+internal class OwnerBusyAutoRecovery(
+    private val schedule: (() -> Unit) -> Boolean,
+    private val pending: () -> Boolean,
+    private val recover: () -> SearchStartV3,
+    private val beforeRelease: () -> Unit = {},
+) {
+    private val scheduled = AtomicBoolean()
+    private val requested = AtomicBoolean()
+
+    fun request(): Unit {
+        if (!pending()) return
+        requested.set(true)
+        if (!scheduled.compareAndSet(false, true)) return
+        val accepted = try {
+            schedule {
+                requested.set(false)
+                val outcome = try { if (pending()) recover() else null } catch (_: Exception) { null } catch (_: LinkageError) { null }
+                try { beforeRelease() } finally {
+                    scheduled.set(false)
+                    if (requested.get() || outcome == SearchStartV3.BUSY) request()
+                }
+            }
+        } catch (_: Exception) { false } catch (_: LinkageError) { false }
+        if (!accepted) scheduled.set(false)
+    }
 }
