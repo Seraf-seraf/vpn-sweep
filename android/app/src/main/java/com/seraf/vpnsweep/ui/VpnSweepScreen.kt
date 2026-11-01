@@ -335,7 +335,7 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
                 .fillMaxWidth()
                 .height(paneHeight)
                 .border(1.dp, Outline, ControlShape)
-                .background(ScreenBackground, ControlShape)
+                .background(if (selectedTab == 0) SweepColors.journalBackground else ScreenBackground, ControlShape)
                 .padding(if (largeText) 8.dp else 16.dp),
         ) {
             if (selectedTab == 0) EventLogHeader() else ParametersHeader()
@@ -360,7 +360,7 @@ internal fun EventLogPanel(entries: List<EventLogEntry>, showHeader: Boolean = t
         EventLogHeader()
         Spacer(Modifier.height(16.dp))
     }
-    Column(Modifier.fillMaxWidth()) {
+    Column(Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite }) {
         if (entries.isEmpty()) {
             Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
         } else {
