@@ -47,6 +47,8 @@ internal class NetworkEpochOwner private constructor(
     private var lastBlocked: Pair<Long, Boolean>? = null
     private var lastObservedIdentity: Long? = null
     private var lastEventLost = false
+    private var initialOnlyAvailable = true
+    private var initialAvailableIdentity: Long? = null
     private var revoked = false
     private var closed = false
     private var closeConfirmed = false
@@ -99,6 +101,13 @@ internal class NetworkEpochOwner private constructor(
     private fun changed(event: DefaultNetworkEvent): Unit {
         val notify = synchronized(lock) {
             if (closed || revoked) return
+            if (network == null) {
+                if (event is DefaultNetworkEvent.Available) {
+                    val previous = initialAvailableIdentity
+                    if (previous == null) initialAvailableIdentity = event.identity
+                    else if (previous != event.identity) initialOnlyAvailable = false
+                } else initialOnlyAvailable = false
+            }
             if (event is DefaultNetworkEvent.Blocked) lastBlocked = event.identity to event.blocked
             if (event == DefaultNetworkEvent.Lost) lastEventLost = true
             if (event is DefaultNetworkEvent.Available) lastEventLost = false
@@ -185,25 +194,38 @@ internal class NetworkEpochOwner private constructor(
                 owner.eventSerial
             }
             fun currentLease(): Boolean = try { leaseCurrent() } catch (_: Exception) { false } catch (_: LinkageError) { false }
-            val initialLease = currentLease()
-            var checkFailed = false
-            val observed = if (initialLease) try {
-                snapshot()
-            } catch (_: Exception) {
-                checkFailed = true
-                null
-            } catch (_: LinkageError) {
-                checkFailed = true
-                null
-            } else null
-            val finalLease = initialLease && currentLease()
+            data class Capture(val leaseValid: Boolean, val observed: DefaultNetworkSnapshot?, val checkFailed: Boolean)
+            fun capture(): Capture {
+                val initialLease = currentLease()
+                var checkFailed = false
+                val observed = if (initialLease) try {
+                    snapshot()
+                } catch (_: Exception) {
+                    checkFailed = true
+                    null
+                } catch (_: LinkageError) {
+                    checkFailed = true
+                    null
+                } else null
+                return Capture(initialLease && currentLease(), observed, checkFailed)
+            }
+            val first = capture()
+            val recaptureBefore = synchronized(owner.lock) {
+                if (first.leaseValid && !first.checkFailed && first.observed?.notVpn == true &&
+                    !owner.closed && !owner.revoked && owner.eventSerial != before && owner.initialOnlyAvailable &&
+                    owner.initialAvailableIdentity == first.observed.identity
+                ) owner.eventSerial else null
+            }
+            val final = if (recaptureBefore == null) first else capture()
+            val observed = final.observed
             val result = synchronized(owner.lock) {
                 when {
-                    !initialLease || !finalLease || owner.closed || owner.revoked -> NetworkOwnerOpen.Unknown
-                    owner.eventSerial != before || owner.lastEventLost -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT)
-                    checkFailed -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CHECK_FAILED)
+                    !final.leaseValid || owner.closed || owner.revoked -> NetworkOwnerOpen.Unknown
+                    owner.eventSerial != (recaptureBefore ?: before) || owner.lastEventLost -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT)
+                    final.checkFailed -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CHECK_FAILED)
                     observed == null -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.UNCONFIRMED)
                     !observed.notVpn -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.NON_DIRECT)
+                    recaptureBefore != null && observed.identity != first.observed?.identity -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT)
                     owner.lastObservedIdentity?.let { it != observed.identity } == true -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.CALLBACK_EVENT)
                     owner.lastBlocked == (observed.identity to true) -> NetworkOwnerOpen.Unavailable(NetworkPolicyUnavailableReason.BLOCKED)
                     else -> {
