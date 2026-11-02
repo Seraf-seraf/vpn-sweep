@@ -542,13 +542,16 @@ internal class SearchController(
     private fun completeFinalization(session: Session, finalization: Finalization): Unit {
         synchronized(this) {
             if (active !== session || session.finalization !== finalization) return
-            val accepted = try {
-                (port as? SearchSessionPortV4)?.acceptTerminal(finalization.terminal) == true
-            } catch (_: Exception) {
-                false
-            } catch (_: LinkageError) {
-                false
-            }
+        }
+        val accepted = try {
+            (port as? SearchSessionPortV4)?.acceptTerminal(finalization.terminal) == true
+        } catch (_: Exception) {
+            false
+        } catch (_: LinkageError) {
+            false
+        }
+        synchronized(this) {
+            if (active !== session || session.finalization !== finalization) return
             val terminal = finalization.terminal
             if (!accepted || session.unknown || session.terminal !== terminal ||
                 session.phase != terminal.phaseEpoch || session.resultInFlight || pendingDeliveries != 0 ||
