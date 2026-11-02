@@ -23,7 +23,7 @@ class JointFenceTest {
         val profiles = Input()
         assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, profiles, true))
         assertTrue(profiles.closed)
-        port.fence.workerState(SearchResourceStateV2.RELEASED)
+        port.fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         val operation = port.fence.reserveLocalOpen()!!
         port.fence.seal()
         val entered = CountDownLatch(1)
@@ -38,6 +38,7 @@ class JointFenceTest {
         release.countDown()
         worker.join(10_000)
         assertFalse(worker.isAlive)
+        port.fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.COMMITTED_CLOSED), handoff)
         assertTrue(result.closed)
         assertTrue(result.streamClosed)
@@ -56,7 +57,7 @@ class JointFenceTest {
         val storage = Storage()
         val controller = SearchController(port, ResultStore(storage), marker)
         controller.start(1, 2, Input(), true)
-        port.fence.workerState(SearchResourceStateV2.RELEASED)
+        port.fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         val operation = port.fence.reserveLocalOpen()!!
         port.fence.seal()
         val input = Input(failClose = true)
@@ -83,7 +84,7 @@ class JointFenceTest {
         storage.prepareAction = { entered.countDown(); check(release.await(10, TimeUnit.SECONDS)) }
         val controller = SearchController(port, ResultStore(storage), marker)
         controller.start(1, 2, Input(), true)
-        port.fence.workerState(SearchResourceStateV2.RELEASED)
+        port.fence.workerState(SearchResourceStateV2.PAUSED_LEASE_HELD)
         val operation = port.fence.reserveLocalOpen()!!
         port.fence.seal()
         val result = Input()
@@ -94,6 +95,7 @@ class JointFenceTest {
         release.countDown()
         worker.join(10_000)
         assertFalse(worker.isAlive)
+        port.fence.workerState(SearchResourceStateV2.RELEASED)
         assertEquals(HandoffResult.Delivered(SearchResultReceiptV3.CANCELLED_CLOSED), handoff)
         assertEquals(previous, storage.manifest)
         assertTrue(result.closed)

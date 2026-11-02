@@ -428,8 +428,8 @@ class SearchMobilePhaseSessionTest {
                 { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
                 { SearchResourceStateV2.PAUSED_LEASE_HELD }, { ownerQuarantined.countDown() }, owner)
             val wrapped = object : SearchPhaseSession by session {
-                override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 {
-                    val result = session.releaseResources(deadlineElapsedMillis)
+                override fun releaseForRecovery(): SearchResourceStateV2 {
+                    val result = session.releaseForRecovery()
                     releaseReturned.countDown()
                     check(continueRelease.await(3, TimeUnit.SECONDS))
                     return result
@@ -589,8 +589,8 @@ class SearchMobilePhaseSessionTest {
                 { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
                 { SearchResourceStateV2.PAUSED_LEASE_HELD }, {}, owner)
             object : SearchPhaseSession by session {
-                override fun releaseResources(deadlineElapsedMillis: Long): SearchResourceStateV2 {
-                    val result = session.releaseResources(deadlineElapsedMillis)
+                override fun releaseForRecovery(): SearchResourceStateV2 {
+                    val result = session.releaseForRecovery()
                     releaseReturned.countDown()
                     return result
                 }

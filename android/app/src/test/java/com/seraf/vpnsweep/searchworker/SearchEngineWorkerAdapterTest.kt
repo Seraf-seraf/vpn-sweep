@@ -450,30 +450,32 @@ internal class SearchEngineWorkerAdapterTest {
     }
 
     @Test
-    fun unknownCancelDuringOpenAttemptsCleanupAndRemainsQuarantined(): Unit {
+    fun unknownCancelDuringOpenReportsIncompleteCleanupAndRemainsQuarantined(): Unit {
         val entered = CountDownLatch(1)
         val releaseOpen = CountDownLatch(1)
-        val cleanupStarted = CountDownLatch(1)
+        val cleanupIncomplete = CountDownLatch(1)
         val port = Port().apply {
             openAction = { entered.countDown(); check(releaseOpen.await(2, TimeUnit.SECONDS)) }
             cancelAction = { throw IOException("synthetic") }
-            closeAction = { cleanupStarted.countDown() }
         }
-        val adapter = adapter(port, Lease())
+        val adapter = SearchEngineWorkerAdapter(42, SearchNetworkV1(11, 3), 500, 1024,
+            { WorkerRoundClient(port, Lease()) }, {}, System::nanoTime,
+            reportOperationFailure = { if (it == WorkerOperationFailure.CLOSE) cleanupIncomplete.countDown() })
         val result = AtomicReference<Long>()
         val worker = Thread { result.set(open(adapter)) }
         worker.start()
         try {
             assertTrue(entered.await(1, TimeUnit.SECONDS))
             adapter.cancel(1)
-            assertTrue(cleanupStarted.await(1, TimeUnit.SECONDS))
+            assertTrue(cleanupIncomplete.await(1, TimeUnit.SECONDS))
+            assertEquals(0, port.closeCount.get())
             assertEquals(Mobile.SearchWorkerDeliveryUnknown, adapter.failure(1))
             releaseOpen.countDown()
             worker.join(2000)
             assertFalse(worker.isAlive)
             assertEquals(Mobile.SearchWorkerDeliveryUnknown, result.get())
             assertNotEquals(Mobile.SearchWorkerReady, open(adapter, 2))
-            assertEquals(1, port.closeCount.get())
+            assertEquals(0, port.closeCount.get())
         } finally { releaseOpen.countDown() }
     }
 
