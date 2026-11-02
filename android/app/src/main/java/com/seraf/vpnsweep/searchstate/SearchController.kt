@@ -128,6 +128,12 @@ internal class SearchController(
     private var cleanupInProgress = false
 
     private var phaseListener: (SearchUiState) -> Unit = {}
+    private var progressListener: (SearchProgressV1) -> Unit = {}
+
+    @Synchronized
+    fun setProgressListener(listener: (SearchProgressV1) -> Unit): Unit {
+        progressListener = listener
+    }
 
     @Synchronized
     fun setPhaseListener(listener: (SearchUiState) -> Unit): Unit {
@@ -394,7 +400,10 @@ internal class SearchController(
             synchronized(this@SearchController) {
                 if (active !== session || progress.sessionGeneration != session.generation || phaseEpoch != session.phase || session.phasePaused || session.terminal != null || session.unknown) return
                 if (session.dispatching) session.callbackDuringDispatch = true
-                if (mutableState.value.phase != SearchPhase.CANCELLING) publish(mutableState.value.copy(progress = progress))
+                if (mutableState.value.phase != SearchPhase.CANCELLING) {
+                    publish(mutableState.value.copy(progress = progress))
+                    progressListener(progress)
+                }
             }
         }
 

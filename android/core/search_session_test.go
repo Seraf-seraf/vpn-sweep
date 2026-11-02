@@ -84,6 +84,27 @@ func (w *fakeEngineWorker) Cancel(int64) {
 }
 func (*fakeEngineWorker) Progress(int, int, int64, int, int, int, int64, int64) {}
 
+func TestSearchProgressOutcomeReportsProbeAndCleanupFailures(t *testing.T) {
+	tests := []struct {
+		event, outcome string
+		want           int
+	}{
+		{"probe_finished", "request_failed", 8},
+		{"probe_finished", "site_consent", 9},
+		{"probe_finished", "unknown_error", 3},
+		{"core_stopped", "core_wait_timeout", 3},
+		{"attempt_finished", "interrupted", 10},
+		{"attempt_finished", "attempt_timeout", 11},
+		{"core_stopped", "pass", 2},
+		{"probe_started", "", 0},
+	}
+	for _, test := range tests {
+		if got := searchProgressOutcome(test.event, test.outcome); got != test.want {
+			t.Errorf("%s/%s: got %d, want %d", test.event, test.outcome, got, test.want)
+		}
+	}
+}
+
 func searchSessionFixture(t *testing.T, worker *fakeEngineWorker) (*SearchSession, string) {
 	t.Helper()
 	input, err := importer.Parse([]byte("socks5://synthetic.invalid:1080"), "uri")

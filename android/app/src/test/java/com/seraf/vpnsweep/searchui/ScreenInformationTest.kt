@@ -20,8 +20,25 @@ import com.seraf.vpnsweep.searchstate.SearchUiState
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchprotocol.WorkerCandidateFailureV2
+import com.seraf.vpnsweep.searchprotocol.SearchProgressV1
+import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
+import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 
 class ScreenInformationTest {
+    @Test
+    fun journalShowsProgressInOrderWithAttemptAndResult(): Unit {
+        val progress = SearchProgressV1(1, SearchProgressKindV1.PROBE_FINISHED, SearchProgressOutcomeV1.FAILED, 3uL, 1, 2, 4, 0, 100)
+        val entries = presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_STARTING, SearchProgressEvent(progress), ScreenEvent.FAILED))).events
+        assertEquals(3, entries.size)
+        assertEquals("Попытка 3, раунд 2: проверка 4 — не пройдена", entries[1].message)
+        assertEquals("ERROR", entries[2].level)
+        val failedRequest = progress.copy(outcome = SearchProgressOutcomeV1.REQUEST_FAILED)
+        val consent = progress.copy(outcome = SearchProgressOutcomeV1.SITE_CONSENT)
+        val messages = presentInformation(ScreenInformation(events = listOf(SearchProgressEvent(failedRequest), SearchProgressEvent(consent)))).events.map { it.message }
+        assertTrue(messages[0].contains("request_failed"))
+        assertTrue(messages[1].contains("site_consent"))
+    }
+
     @Test
     fun readinessFlowChecksRecoveryBeforeSelectionAndNeverStartsSearch(): Unit {
         var marker = "ACTIVE"

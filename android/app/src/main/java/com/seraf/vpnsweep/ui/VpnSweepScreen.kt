@@ -32,14 +32,17 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
@@ -317,7 +320,26 @@ internal fun InformationPanel(initialTab: Int = 0, information: ScreenInformatio
     var selectedTab by rememberSaveable { mutableStateOf(initialTab) }
     val journalScroll = rememberScrollState()
     val parametersScroll = rememberScrollState()
+    var followJournal by remember { mutableStateOf(true) }
     val presentation = presentInformation(information)
+    LaunchedEffect(journalScroll) {
+        journalScroll.interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is DragInteraction.Start -> followJournal = false
+                is DragInteraction.Stop, is DragInteraction.Cancel -> followJournal = journalScroll.value >= journalScroll.maxValue
+                else -> Unit
+            }
+        }
+    }
+    LaunchedEffect(information.events, selectedTab) {
+        if (selectedTab == 0) {
+            withFrameNanos { }
+            withFrameNanos { }
+            if (followJournal && !journalScroll.isScrollInProgress) {
+                journalScroll.scrollTo(journalScroll.maxValue)
+            }
+        }
+    }
     val largeText = LocalDensity.current.fontScale >= 1.5f
     Column(
         modifier = Modifier

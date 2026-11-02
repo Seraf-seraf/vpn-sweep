@@ -80,6 +80,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.ScreenLogEvent
+import com.seraf.vpnsweep.searchui.SearchProgressEvent
+import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
 import com.seraf.vpnsweep.searchui.workerFatalEvent
 import com.seraf.vpnsweep.searchui.subscriptionEvent
 import com.seraf.vpnsweep.searchui.searchEvent
@@ -177,10 +180,15 @@ internal class AppComposition(context: Context) {
     private val app = requireNotNull(context.applicationContext)
     private val lock = Any()
     private val eventsLock = Any()
-    private val mutableEvents = MutableStateFlow<List<ScreenEvent>>(emptyList())
+    private val mutableEvents = MutableStateFlow<List<ScreenLogEvent>>(emptyList())
     val events = mutableEvents.asStateFlow()
     fun addEvent(event: ScreenEvent): Unit = synchronized(eventsLock) {
         mutableEvents.value = (mutableEvents.value + event).takeLast(100)
+    }
+    private fun addProgress(progress: SearchProgressV1): Unit = synchronized(eventsLock) {
+        if (progress.kind != SearchProgressKindV1.CANDIDATE_SKIPPED) {
+            mutableEvents.value = (mutableEvents.value + SearchProgressEvent(progress)).takeLast(100)
+        }
     }
     private val requests = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "subscription-fetch") }
     private var currentRequestGeneration: Long? = null
@@ -308,6 +316,7 @@ internal class AppComposition(context: Context) {
     )
 
     init {
+        activation.controller.setProgressListener(::addProgress)
         activation.controller.setPhaseListener { state ->
             if (state.ownerBusyRetry) ownerBusyRecovery.request()
             if (state.startRejection == null && !state.ownerBusyPending) searchEvent(state)?.let(::addEvent)
@@ -751,6 +760,7 @@ internal class AppComposition(context: Context) {
             val owner = network.owner
             val limits = workerTransportLimits
             val localDrain = SearchWorkerLocalDrain(snapshot.sessionGeneration)
+            val phaseProgress = SearchMobilePhaseProgress { epoch, value -> progress(epoch, value) }
             val adapter = SearchEngineWorkerAdapter(
                 snapshot.sessionGeneration,
                 network.network,
@@ -822,7 +832,7 @@ internal class AppComposition(context: Context) {
                         },
                     )
                 },
-                reportProgress = { progress(snapshot.sessionGeneration, it) },
+                reportProgress = phaseProgress::report,
                 reportKnownFailure = { reason ->
                     synchronized(this@AppComposition.lock) {
                         emitWorkerDiagnostic(activeSearch?.sessionGeneration, snapshot.sessionGeneration, workerOpenEvent(reason), ::addEvent)
@@ -866,7 +876,6 @@ internal class AppComposition(context: Context) {
                 paths.staging.absolutePath,
                 adapter as SearchEngineWorker,
             )
-            val phaseProgress = SearchMobilePhaseProgress { epoch, value -> progress(epoch, value) }
             return SearchMobilePhaseSession(
                 prepare = session::preparePhase,
                 run = session::runPhase,

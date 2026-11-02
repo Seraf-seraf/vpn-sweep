@@ -18,6 +18,24 @@ import org.junit.Test
 
 class SearchControllerTest {
     @Test
+    fun progressListenerReceivesOnlyCurrentRunningPhase(): Unit {
+        val runtime = FakeSession()
+        val controller = SearchController(runtime, ResultStore(FakeStorage()), FakeMarker())
+        val events = mutableListOf<SearchProgressV1>()
+        controller.setProgressListener(events::add)
+        assertEquals(SearchStartV3.ACCEPTED, controller.start(1, 2, Input("profiles"), true))
+        val observer = checkNotNull(runtime.observer)
+        val event = SearchProgressV1(1, SearchProgressKindV1.ATTEMPT_STARTED, SearchProgressOutcomeV1.RUNNING, 1uL, 1, 0, 0, 0, 0)
+        observer.onProgress(2, event)
+        assertEquals(emptyList<SearchProgressV1>(), events)
+        observer.onProgress(1, event)
+        assertEquals(listOf(event), events)
+        controller.cancel()
+        observer.onProgress(1, event)
+        assertEquals(listOf(event), events)
+    }
+
+    @Test
     fun cancellingButtonSendsRetryAndKeepsBackendExclusion(): Unit {
         var runningCancels = 0
         dispatchSearchButton(SearchPhase.RUNNING, { runningCancels++ }, { error("unexpected start") }) { error("unexpected result") }

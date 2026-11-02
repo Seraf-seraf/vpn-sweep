@@ -3,7 +3,10 @@ package com.seraf.vpnsweep.ui
 import com.seraf.vpnsweep.searchui.NumericRange
 import com.seraf.vpnsweep.searchui.ScreenInformation
 import com.seraf.vpnsweep.searchui.ScreenEvent
+import com.seraf.vpnsweep.searchui.SearchProgressEvent
 import com.seraf.vpnsweep.searchui.eventText
+import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
+import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 import com.seraf.vpnsweep.searchstate.SearchStartStage
 import com.seraf.vpnsweep.searchstate.SearchStartReason
 
@@ -20,7 +23,12 @@ internal data class ScreenPresentation(val events: List<EventLogEntry>, val appl
 
 internal fun presentInformation(information: ScreenInformation): ScreenPresentation {
     val allowedCodes = SearchStartStage.entries.flatMap { stage -> SearchStartReason.entries.map { reason -> "${stage.code}:${reason.code}" } }.toSet()
-    val events = information.events.map { EventLogEntry("", eventLevel(it), eventText(it)) } +
+    val events = information.events.map { entry ->
+        when (entry) {
+            is ScreenEvent -> EventLogEntry("", eventLevel(entry), eventText(entry))
+            is SearchProgressEvent -> progressEntry(entry)
+        }
+    } +
         listOfNotNull(information.startRejection?.takeIf { it in allowedCodes }?.let {
             EventLogEntry("", "ERROR", "Подбор не запущен ($it)")
         })
@@ -49,6 +57,40 @@ internal fun presentInformation(information: ScreenInformation): ScreenPresentat
         )
     }
     return ScreenPresentation(events, applied)
+}
+
+private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {
+    val value = entry.progress
+    val result = when (value.outcome) {
+        SearchProgressOutcomeV1.NONE -> ""
+        SearchProgressOutcomeV1.RUNNING -> "выполняется"
+        SearchProgressOutcomeV1.PASS -> "успешно"
+        SearchProgressOutcomeV1.FAILED -> "не пройдена"
+        SearchProgressOutcomeV1.INCONCLUSIVE -> "неоднозначный результат"
+        SearchProgressOutcomeV1.BLOCKED -> "недоступна"
+        SearchProgressOutcomeV1.SKIPPED -> "пропущена"
+        SearchProgressOutcomeV1.BUDGET -> "достигнут лимит"
+        SearchProgressOutcomeV1.REQUEST_FAILED -> "ошибка запроса (request_failed)"
+        SearchProgressOutcomeV1.SITE_CONSENT -> "сайт требует согласия (site_consent)"
+        SearchProgressOutcomeV1.INTERRUPTED -> "прервана"
+        SearchProgressOutcomeV1.TIMEOUT -> "истекло время ожидания"
+    }
+    val prefix = "Попытка ${value.attempt}, раунд ${value.round}"
+    val message = when (value.kind) {
+        SearchProgressKindV1.ATTEMPT_STARTED -> "Попытка ${value.attempt}: начата"
+        SearchProgressKindV1.ATTEMPT_FINISHED -> "Попытка ${value.attempt}: завершена — $result"
+        SearchProgressKindV1.CANDIDATE_SKIPPED -> "Вариант пропущен"
+        SearchProgressKindV1.CORE_STARTING -> "$prefix: запуск ядра"
+        SearchProgressKindV1.CORE_READY -> "$prefix: ядро готово"
+        SearchProgressKindV1.CORE_STOPPING -> "$prefix: остановка ядра"
+        SearchProgressKindV1.CORE_STOPPED -> if (value.outcome == SearchProgressOutcomeV1.PASS) "$prefix: ядро остановлено" else "$prefix: ошибка остановки ядра"
+        SearchProgressKindV1.PROBE_STARTED -> "$prefix: проверка ${value.probe} начата"
+        SearchProgressKindV1.PROBE_FINISHED -> if (value.probe == 0) "$prefix: ошибка ядра" else "$prefix: проверка ${value.probe} — $result"
+        SearchProgressKindV1.MEDIA_STARTED -> "$prefix: проверка видео начата"
+        SearchProgressKindV1.BUDGET_REACHED -> "Подбор приостановлен: достигнут лимит"
+        SearchProgressKindV1.SAVED_RESULT_SKIPPED -> "Сохранённый вариант пропущен; поиск продолжается"
+    }
+    return EventLogEntry("", "INFO", message)
 }
 
 private const val MISSING = "Нет данных"
