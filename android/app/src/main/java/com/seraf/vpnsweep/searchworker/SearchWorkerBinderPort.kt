@@ -367,11 +367,8 @@ internal class SearchWorkerBinderPort(
                 if (dispatch == 2) throw ExpectedConnectedRecovery()
                 if (dispatch != 1) throw IOException("worker_delivery_unknown")
                 val code = statusTransaction(binder, SearchWorkerIpcV2.OPEN_FD, openTicket) { request ->
-                    request.writeWorkerIdentity(identity, network)
-                    request.writeLong(startupDeadlineElapsedMillis)
-                    request.writeLong(cleanupMillis)
-                    request.writeLong(frame.length)
-                    request.writeTypedObject(descriptor.descriptor(), 0)
+                    request.writeWorkerOpen(identity, network, provenFrameBound, provenReplyBound,
+                        startupDeadlineElapsedMillis, cleanupMillis, frame.length, descriptor.descriptor())
                 }
                 requireTime(deadline)
                 if (!binderStillConfirmedForCall(binder)) throw IOException("worker_owner_unknown")
@@ -1388,6 +1385,25 @@ private fun Parcel.writeWorkerIdentity(identity: WorkerIdentityV1, network: Sear
     writeLong(identity.workerGeneration)
     writeLong(network.identity)
     writeLong(network.version)
+}
+
+internal fun Parcel.writeWorkerOpen(
+    identity: WorkerIdentityV1,
+    network: SearchNetworkV1,
+    frameBound: Int,
+    replyBound: Int,
+    deadline: Long,
+    cleanupMillis: Long,
+    length: Long,
+    descriptor: ParcelFileDescriptor,
+): Unit {
+    writeWorkerIdentity(identity, network)
+    writeInt(frameBound)
+    writeInt(replyBound)
+    writeLong(deadline)
+    writeLong(cleanupMillis)
+    writeLong(length)
+    writeTypedObject(descriptor, 0)
 }
 
 private class ReceivedFdInput(
