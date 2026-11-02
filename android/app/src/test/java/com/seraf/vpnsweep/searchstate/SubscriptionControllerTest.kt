@@ -1020,6 +1020,8 @@ class SubscriptionControllerTest {
         assertEquals(SubscriptionPhase.READY, controller.state.value.phase)
         assertTrue(controller.select(setOf("synthetic-record")))
         fixture.runtime.result = SearchStartV3.REJECTED
+        val activeCallsBeforeStart = fixture.marker.activeCalls
+        val clearCallsBeforeStart = fixture.marker.clearCalls
 
         assertEquals(SearchStartV3.REJECTED, controller.startSelected())
         assertEquals(
@@ -1029,8 +1031,8 @@ class SubscriptionControllerTest {
         assertEquals("port_dispatch:port_rejected", fixture.composition.controller.state.value.startRejection?.safeCode)
         assertEquals(SearchPhase.INTERRUPTED, fixture.composition.controller.state.value.phase)
         assertEquals(MarkerState.ACTIVE, fixture.marker.value)
-        assertEquals(1, fixture.marker.activeCalls)
-        assertEquals(0, fixture.marker.clearCalls)
+        assertEquals(activeCallsBeforeStart + 1, fixture.marker.activeCalls)
+        assertEquals(clearCallsBeforeStart, fixture.marker.clearCalls)
         assertEquals(lastGood, fixture.storage.manifest)
         assertEquals(setOf("synthetic-record"), controller.state.value.selectedIds)
         assertTrue(snapshot.selectedInput.closed)
