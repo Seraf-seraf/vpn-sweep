@@ -271,7 +271,7 @@ internal class SubscriptionController(
     }
 
     @Synchronized
-    fun canSelect(): Boolean = (installed != null || (independentSelection != null && installedRecords.isNotEmpty())) && request == null &&
+    fun canSelect(): Boolean = (installed != null || (independentSelection != null && installedRecords.isNotEmpty())) &&
         (independentSelection != null || (pendingClose.isEmpty() && uncertainSearchInput == null && composition.activation.withSourceMutation { true }))
 
     @Synchronized

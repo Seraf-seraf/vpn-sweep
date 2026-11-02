@@ -158,7 +158,7 @@ class SubscriptionControllerTest {
         fixture.runtime.recovery = OwnerBusyRecovery.READY
         work.removeFirst()()
         assertEquals(MarkerState.CLEAR, fixture.marker.read())
-        assertFalse(subscription.canSelect())
+        assertTrue(subscription.canSelect())
         assertEquals(setOf("a"), subscription.state.value.selectedIds)
         port.observer!!.onFailure(2, SubscriptionFailureV1.TIMEOUT)
         assertTrue(subscription.canSelect())
