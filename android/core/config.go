@@ -55,6 +55,10 @@ func runtimeConfig(source []byte, bootstrapDNS string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("invalid_bootstrap_dns")
 	}
+	// Xray's DNS address parser does not preserve IPv6 zone identifiers.
+	if ip.Zone() != "" {
+		return nil, errors.New("unsupported_scoped_bootstrap_dns")
+	}
 	prepared, err := PrepareConfig(source)
 	if err != nil {
 		return nil, err

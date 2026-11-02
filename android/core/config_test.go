@@ -1,10 +1,14 @@
 package mobile
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/infra/conf/serial"
 )
 
 func TestPreserveCompleteOutbounds(t *testing.T) {
@@ -36,6 +40,15 @@ func TestPreserveCompleteOutbounds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		config, err := serial.LoadJSONConfig(bytes.NewReader(runtime))
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := core.New(config)
+		if err != nil {
+			t.Fatalf("Xray rejected network DNS %s: %v", dns, err)
+		}
+		_ = instance.Close()
 		var final map[string]any
 		_ = json.Unmarshal(runtime, &final)
 		if !reflect.DeepEqual(before["outbounds"], final["outbounds"]) || final["dns"] == nil {
@@ -52,5 +65,12 @@ func TestRejectInvalidResults(t *testing.T) {
 	}
 	if ValidateConfig([]byte(`{"outbounds":[{"tag":"candidate","protocol":"does-not-exist"}]}`)) == nil {
 		t.Fatal("invalid Xray config accepted")
+	}
+}
+
+func TestRuntimeConfigRejectsScopedDNSAddress(t *testing.T) {
+	source := []byte(`{"outbounds":[{"tag":"candidate","protocol":"freedom"}]}`)
+	if _, err := runtimeConfig(source, "fe80::1%wlan0"); err == nil || err.Error() != "unsupported_scoped_bootstrap_dns" {
+		t.Fatalf("scoped DNS must be rejected before constructing the Xray URL: %v", err)
 	}
 }

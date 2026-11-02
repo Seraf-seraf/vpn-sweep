@@ -26,6 +26,11 @@ import kotlinx.coroutines.launch
 import com.seraf.vpnsweep.core.mobile.Mobile
 import com.seraf.vpnsweep.core.mobile.Protector
 import java.io.IOException
+import java.net.Inet6Address
+import java.net.InetAddress
+
+internal fun selectBootstrapDns(servers: List<InetAddress>): String? =
+    servers.firstOrNull { it !is Inet6Address || (!it.isLinkLocalAddress && it.scopeId == 0) }?.hostAddress
 
 class SweepVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -118,8 +123,8 @@ class SweepVpnService : VpnService() {
             check(capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) == true) {
                 "disconnect_other_vpn"
             }
-            val dns = manager.getLinkProperties(network)?.dnsServers?.firstOrNull()
-                ?.hostAddress ?: error("network_dns_unavailable")
+            val dnsServers = manager.getLinkProperties(network)?.dnsServers ?: emptyList()
+            val dns = selectBootstrapDns(dnsServers) ?: error("network_dns_unavailable")
             run.checkActive()
             check(admission.isCurrent() && integration.isCurrentVpnIdentity(admission.identity)) {
                 "vpn_start_admission_stale"
@@ -210,7 +215,7 @@ class SweepVpnService : VpnService() {
                 is VpnRunFailure.Operation -> when (failure.exception.message) {
                     "network_unavailable" -> "Нет доступной сети"
                     "disconnect_other_vpn" -> "Отключите другой VPN перед проверкой"
-                    "network_dns_unavailable" -> "Сеть не предоставила DNS для подключения к серверу"
+                    "network_dns_unavailable" -> "Сеть не предоставила поддерживаемый DNS для подключения к серверу"
                     "vpn_permission_revoked" -> "Разрешение VPN отозвано"
                     "network_lost" -> "Сеть потеряна. Подключите VPN заново"
                     "socket_protection_failed" -> "Не удалось защитить сетевой сокет; VPN остановлен"
