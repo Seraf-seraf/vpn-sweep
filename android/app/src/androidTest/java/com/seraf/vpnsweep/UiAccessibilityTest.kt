@@ -8,6 +8,10 @@ import com.seraf.vpnsweep.ui.SweepTheme
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.height
@@ -104,7 +108,7 @@ class UiAccessibilityTest {
             }
         }
         compose.onNodeWithContentDescription("Подключить VPN").assertIsNotEnabled()
-        compose.onNodeWithText("Конфигурация VPN пока недоступна").assertIsDisplayed()
+        compose.onNodeWithText("Отключено").assertIsDisplayed()
         compose.onNodeWithText("Выбрать working.json").assertDoesNotExist()
         compose.onNodeWithText("Проверить TCP, UDP и DNS").assertDoesNotExist()
     }
@@ -147,20 +151,34 @@ class UiAccessibilityTest {
     }
 
     @Test
-    fun urlKeepsAccessibleLabelAndUnavailableAction(): Unit {
-        compose.setContent { SweepTheme { SubscriptionDialog(onDismiss = {}) } }
+    fun urlKeepsAccessibleLabelAndReportsUnavailableAction(): Unit {
+        compose.setContent { SweepTheme { SubscriptionDialog(onDismiss = {}, onSubmit = { false }) } }
         compose.onNodeWithContentDescription("Ссылка").performTextInput("https://example.com/sub")
         compose.onNodeWithContentDescription("Ссылка").assertExists()
+        compose.onNodeWithText("Ок").assertIsEnabled().performClick()
         compose.onNodeWithText("Загрузка подписок пока недоступна").assertExists()
-        compose.onNodeWithText("Ок").assertIsNotEnabled()
+        compose.onNodeWithText("Ок").assertIsEnabled()
     }
 
     @Test
     fun pasteIsAvailableForEmptyAndInvalidLinks(): Unit {
         val clipboard = TestClipboard(AnnotatedString("https://example.com/sub"))
         compose.setContent {
+            var link by remember { mutableStateOf("") }
             CompositionLocalProvider(LocalClipboardManager provides clipboard) {
-                SweepTheme { SubscriptionDialog(onDismiss = {}) }
+                SweepTheme {
+                    SubscriptionDialogContent(
+                        link = link,
+                        status = when {
+                            link.isEmpty() -> SubscriptionDialogStatus.Empty
+                            link == "invalid" -> SubscriptionDialogStatus.InvalidUrl
+                            else -> SubscriptionDialogStatus.Input
+                        },
+                        onLinkChange = { link = it },
+                        onDismiss = {},
+                        onSubmit = {},
+                    )
+                }
             }
         }
         compose.onNodeWithContentDescription("Вставить ссылку").assertIsEnabled().performClick()
@@ -299,7 +317,7 @@ class UiAccessibilityTest {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
                 SweepTheme {
-                    Box(Modifier.size(width = 320.dp, height = height.dp)) {
+                    Box(Modifier.size(width = 320.dp, height = height.dp).consumeWindowInsets(WindowInsets.safeDrawing.union(WindowInsets.ime))) {
                         ServerSelectionDialogContent(emptyList(), emptySet(), {}, {})
                     }
                 }
@@ -321,7 +339,7 @@ class UiAccessibilityTest {
     fun shortServerDialogCanScrollToSearchWithoutMovingActions(): Unit {
         compose.setContent {
             SweepTheme {
-                Box(Modifier.size(width = 320.dp, height = 200.dp)) {
+                Box(Modifier.size(width = 320.dp, height = 200.dp).consumeWindowInsets(WindowInsets.safeDrawing.union(WindowInsets.ime))) {
                     ServerSelectionDialogContent(emptyList(), emptySet(), {}, {})
                 }
             }
