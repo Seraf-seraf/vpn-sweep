@@ -93,7 +93,7 @@ private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {
     return EventLogEntry("", "INFO", message)
 }
 
-private const val MISSING = "Нет данных"
+private const val MISSING = "Не задан"
 private fun boolValue(value: Boolean?): String = when (value) { true -> "Вкл"; false -> "Выкл"; null -> MISSING }
 private fun rangeValue(value: NumericRange?, unit: String): String = when (value) {
     is NumericRange.Single -> "${value.value}$unit"

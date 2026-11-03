@@ -1,7 +1,10 @@
 package mobile
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -19,22 +22,27 @@ const (
 
 var errSearchResultCleanupUnknown = model.Err("export_cleanup_unknown", "export")
 
-// SearchVerifiedResult owns the verified local file until Close succeeds.
+// SearchVerifiedResult owns its result stream until Close succeeds.
 // The consumer must verify Digest against the bytes it actually reads.
 type SearchVerifiedResult struct {
-	mu       sync.Mutex
-	file     *os.File
-	digest   string
-	read     int64
-	readErr  error
-	closed   bool
-	closeErr error
+	mu        sync.Mutex
+	file      io.ReadCloser
+	selection map[string]any
+	digest    string
+	read      int64
+	readErr   error
+	closed    bool
+	closeErr  error
 }
 
 // TakeVerifiedResult can be called once after Run returns success. The caller
 // must first confirm worker cleanup, death and release of all lease FDs.
 func (s *SearchSession) TakeVerifiedResult() (*SearchVerifiedResult, error) {
-	return s.takeVerifiedResult(export.OpenVerifiedResult)
+	result, err := s.takeVerifiedResult(export.OpenVerifiedResult)
+	if err != nil {
+		return nil, err
+	}
+	return result.withSelection()
 }
 
 func (s *SearchSession) takeVerifiedResult(open func(string, string, string) (*os.File, string, error)) (*SearchVerifiedResult, error) {
@@ -74,7 +82,42 @@ func (s *SearchSession) takeVerifiedResult(open func(string, string, string) (*o
 		}
 		return nil, errors.New("search_result_unavailable")
 	}
-	return &SearchVerifiedResult{file: file, digest: digest}, nil
+	return &SearchVerifiedResult{file: file, digest: digest, selection: winner.Candidate.Params}, nil
+}
+
+// withSelection binds the winning search parameters to the Android result.
+// The original export is verified before the private envelope is augmented.
+func (r *SearchVerifiedResult) withSelection() (*SearchVerifiedResult, error) {
+	data, err := io.ReadAll(io.LimitReader(r.file, maxConfigBytes+1))
+	closeErr := r.Close()
+	if closeErr != nil {
+		return nil, errSearchResultCleanupUnknown
+	}
+	sum := sha256.Sum256(data)
+	if err != nil || len(data) == 0 || len(data) > maxConfigBytes || hex.EncodeToString(sum[:]) != r.digest {
+		return nil, errors.New("search_result_unavailable")
+	}
+	var config map[string]json.RawMessage
+	if json.Unmarshal(data, &config) != nil || config == nil || config["vpnSweepSelection"] != nil {
+		return nil, errors.New("search_result_unavailable")
+	}
+	selection := make(map[string]any)
+	for _, name := range []string{"fragment", "packets", "length", "interval", "maxSplit", "mux", "tcpConcurrency", "xudpConcurrency", "quic", "fingerprint", "noise", "noises"} {
+		if value, ok := r.selection[name]; ok {
+			selection[name] = value
+		}
+	}
+	encoded, err := json.Marshal(selection)
+	if err != nil {
+		return nil, errors.New("search_result_unavailable")
+	}
+	config["vpnSweepSelection"] = encoded
+	augmented, err := json.Marshal(config)
+	if err != nil || len(augmented) > maxConfigBytes {
+		return nil, errors.New("search_result_unavailable")
+	}
+	augmentedSum := sha256.Sum256(augmented)
+	return &SearchVerifiedResult{file: io.NopCloser(bytes.NewReader(augmented)), digest: hex.EncodeToString(augmentedSum[:])}, nil
 }
 
 func (r *SearchVerifiedResult) Digest() string { return r.digest }

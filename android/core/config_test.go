@@ -68,6 +68,21 @@ func TestRejectInvalidResults(t *testing.T) {
 	}
 }
 
+func TestSelectionMetadataIsRemovedBeforeXray(t *testing.T) {
+	source := []byte(`{"vpnSweepSelection":{"fingerprint":"firefox"},"outbounds":[{"tag":"candidate","protocol":"freedom"}]}`)
+	prepared, err := PrepareConfig(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]json.RawMessage
+	if json.Unmarshal(prepared, &config) != nil || config["vpnSweepSelection"] != nil {
+		t.Fatal("search metadata leaked to Xray")
+	}
+	if err := ValidateConfig(source); err != nil {
+		t.Fatalf("metadata changed the Xray configuration: %v", err)
+	}
+}
+
 func TestRuntimeConfigRejectsScopedDNSAddress(t *testing.T) {
 	source := []byte(`{"outbounds":[{"tag":"candidate","protocol":"freedom"}]}`)
 	if _, err := runtimeConfig(source, "fe80::1%wlan0"); err == nil || err.Error() != "unsupported_scoped_bootstrap_dns" {

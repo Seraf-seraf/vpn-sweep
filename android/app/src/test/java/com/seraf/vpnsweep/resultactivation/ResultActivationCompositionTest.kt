@@ -138,10 +138,14 @@ class ResultActivationCompositionTest {
         f.publishResult()
         val startsBeforeRestore = f.port.starts
         assertEquals(f.searched, f.composition.loadCleanComplete(f.accepted))
+        assertTrue(f.result.contentEquals(f.composition.displayResult(f.accepted, f.searched)))
+        assertNull(f.composition.displayResult(f.accepted.copy(requestGeneration = 12L), f.searched))
+        assertNull(f.composition.displayResult(f.accepted, f.searched.copy(sessionGeneration = 99L)))
         assertTrue(f.composition.activation.ready())
         assertTrue(f.registry.available())
         val recovered = f.recovered()
         assertEquals(f.searched, recovered.loadCleanComplete(f.accepted))
+        assertTrue(f.result.contentEquals(recovered.displayResult(f.accepted, f.searched)))
         assertTrue(recovered.activation.ready())
         assertTrue(recovered.vpnRuns.available())
         assertEquals(startsBeforeRestore, f.port.starts)
@@ -172,6 +176,7 @@ class ResultActivationCompositionTest {
         f.revisionStorage.value = ResultRevision("3", "2")
         assertFalse(f.composition.activation.ready())
         assertNull(f.composition.loadCleanComplete(f.accepted))
+        assertNull(f.composition.displayResult(f.accepted, f.searched))
     }
 
     @Test

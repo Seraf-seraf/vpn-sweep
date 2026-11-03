@@ -13,6 +13,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.seraf.vpnsweep.searchprotocol.SearchFailureV1
 import com.seraf.vpnsweep.searchprotocol.SearchStartV3
@@ -24,6 +27,7 @@ import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionFailureV1
 import com.seraf.vpnsweep.subscriptionprotocol.SubscriptionStartV1
 import com.seraf.vpnsweep.searchui.ScreenEvent
 import com.seraf.vpnsweep.searchui.ScreenInformation
+import com.seraf.vpnsweep.searchui.AppliedParameters
 import com.seraf.vpnsweep.searchui.dispatchSearchButton
 import com.seraf.vpnsweep.searchui.searchButtonCancels
 import com.seraf.vpnsweep.searchui.searchOutcomeEvent
@@ -38,6 +42,10 @@ class MainActivity : ComponentActivity() {
             val subscriptionState by graph.subscriptionState().collectAsStateWithLifecycle()
             val searchState by graph.searchState.collectAsStateWithLifecycle()
             val events by graph.events.collectAsStateWithLifecycle()
+            var applied by remember(searchState, subscriptionState) { mutableStateOf<AppliedParameters?>(null) }
+            LaunchedEffect(searchState, subscriptionState) {
+                applied = withContext(Dispatchers.IO) { graph.appliedParameters() }
+            }
             var subscriptionOpen by remember { mutableStateOf(false) }
             var serversOpen by remember { mutableStateOf(false) }
             fun addEvent(event: ScreenEvent) {
@@ -88,7 +96,7 @@ class MainActivity : ComponentActivity() {
                     searchEnabled = searchRunning || graph.searchEnabled(),
                     searchRunning = searchRunning,
                     searchMessage = "",
-                    information = ScreenInformation(events = events.toList(), startRejection = searchState.startRejection?.safeCode),
+                    information = ScreenInformation(events = events.toList(), applied = applied, startRejection = searchState.startRejection?.safeCode),
                     serverSummary = committedServerSummary(subscriptionState),
                     onSearch = {
                         dispatchSearchButton(searchState.phase, graph::cancelSearch, graph::startSearch) { outcome ->

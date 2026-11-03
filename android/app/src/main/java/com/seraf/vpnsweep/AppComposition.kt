@@ -336,6 +336,14 @@ internal class AppComposition(context: Context) {
 
     fun subscriptionState(): StateFlow<SubscriptionUiState> = subscriptions.state
 
+    fun appliedParameters(): com.seraf.vpnsweep.searchui.AppliedParameters? = synchronized(activation.controller) {
+        if (recoveryMode.blocked() || upgradeRecovery.blocked()) return@synchronized null
+        val (accepted, searched) = synchronized(lock) { acceptedSnapshot to completedSearch }
+        if (accepted == null || searched == null || !hasCleanCompletion(searched)) return@synchronized null
+        val bytes = activation.displayResult(accepted, searched) ?: return@synchronized null
+        com.seraf.vpnsweep.searchui.parseAppliedParameters(bytes)
+    }
+
     fun selectedForDisplay(): Boolean = canStartVpn()
 
     fun canStartVpn(): Boolean = !recoveryMode.blocked() && canStartVpnUnchecked()

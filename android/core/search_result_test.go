@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,33 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
 	"github.com/Seraf-seraf/vpn-sweep/internal/state"
 )
+
+func TestVerifiedResultBindsSelectedParameters(t *testing.T) {
+	data := []byte(`{"outbounds":[{"tag":"candidate"}]}`)
+	sum := sha256.Sum256(data)
+	r := &SearchVerifiedResult{file: io.NopCloser(bytes.NewReader(data)), digest: hex.EncodeToString(sum[:]), selection: map[string]any{"fingerprint": "firefox", "mux": false, "ignored": "private"}}
+	result, err := r.withSelection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	augmented, err := io.ReadAll(result.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Close()
+	var config map[string]json.RawMessage
+	if json.Unmarshal(augmented, &config) != nil || string(config["vpnSweepSelection"]) != `{"fingerprint":"firefox","mux":false}` {
+		t.Fatalf("incorrect selected parameters: %s", config["vpnSweepSelection"])
+	}
+	actual := sha256.Sum256(augmented)
+	if result.Digest() != hex.EncodeToString(actual[:]) {
+		t.Fatal("selection is not covered by the result digest")
+	}
+	tampered := &SearchVerifiedResult{file: io.NopCloser(bytes.NewReader(data)), digest: strings.Repeat("0", 64)}
+	if _, err := tampered.withSelection(); err == nil {
+		t.Fatal("accepted unverified original result")
+	}
+}
 
 func TestAndroidSearchVerifiedResultRealExportWithFakeWorker(t *testing.T) {
 	worker := &fakeEngineWorker{}

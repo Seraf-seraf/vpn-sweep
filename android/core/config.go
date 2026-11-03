@@ -32,11 +32,12 @@ func PrepareConfig(source []byte) ([]byte, error) {
 	// Only the exported sweep envelope is accepted by this integration probe.
 	for key := range cfg {
 		switch key {
-		case "inbounds", "outbounds", "routing", "log":
+		case "inbounds", "outbounds", "routing", "log", "vpnSweepSelection":
 		default:
 			return nil, errors.New("unsupported_result_envelope")
 		}
 	}
+	delete(cfg, "vpnSweepSelection")
 	cfg["log"] = json.RawMessage(`{"loglevel":"none","access":"none","error":"none"}`)
 	inbounds, err := json.Marshal([]any{map[string]any{
 		"tag": "android-tun", "protocol": "tun",

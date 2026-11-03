@@ -86,6 +86,17 @@ internal class ResultActivationComposition private constructor(
         receipt.search
     }
 
+    fun displayResult(accepted: AcceptedSubscriptionReceiptV1, searched: SearchLeaseReceiptV1): ByteArray? = synchronized(controller) {
+        if (markerStateOrNull() != MarkerState.CLEAR) return@synchronized null
+        try {
+            if (completionReceipts.hasPending()) return@synchronized null
+            val revision = currentRevisionOrNull() ?: return@synchronized null
+            val receipt = completionReceipts.read() ?: return@synchronized null
+            if (!receipt.matchesAccepted(accepted) || receipt.search != searched) return@synchronized null
+            verifiedCompletionBytes(storage, receipt, revision)
+        } catch (_: Exception) { null }
+    }
+
     fun withSourceMutation(beforeClear: () -> Unit = {}, mutation: () -> ResultRevision): Boolean = activation.withSourceMutation {
         check(marker.markActive() && marker.read() == MarkerState.ACTIVE) { "marker_active_unknown" }
         val previous = revisionStorage.read()

@@ -152,7 +152,7 @@ class ScreenInformationTest {
         val presentation = presentInformation(information)
         assertEquals(listOf("Подбор начат", "Подбор приостановлен"), presentation.events.map { it.message })
         assertEquals(listOf("Вкл", "1-3", "50-100 байт", "10 мс", "1-64"), presentation.applied!!.fragment!!.fields.map { it.value })
-        assertEquals(listOf("Нет данных", "-1", "1024", "reject"), presentation.applied.mux!!.fields.map { it.value })
+        assertEquals(listOf("Не задан", "-1", "1024", "reject"), presentation.applied.mux!!.fields.map { it.value })
         assertEquals("360", presentation.applied.fingerprint!!.summary)
         assertEquals("qq", presentInformation(ScreenInformation(applied = AppliedParameters(fingerprint = Fingerprint.QQ))).applied!!.fingerprint!!.summary)
         assertNull(presentInformation(ScreenInformation()).applied)
