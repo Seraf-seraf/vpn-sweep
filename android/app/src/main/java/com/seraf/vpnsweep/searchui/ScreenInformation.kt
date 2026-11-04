@@ -10,6 +10,8 @@ import com.seraf.vpnsweep.searchprotocol.WorkerFatalV2
 import com.seraf.vpnsweep.searchprotocol.SearchProgressV1
 
 sealed interface ScreenLogEvent
+data class TimedLogEvent(val event: ScreenLogEvent, val timeMillis: Long) : ScreenLogEvent
+data class VpnConnectionEvent(val phase: String, val message: String) : ScreenLogEvent
 class SearchProgressEvent internal constructor(internal val progress: SearchProgressV1) : ScreenLogEvent
 enum class ScreenEvent : ScreenLogEvent { READINESS_READY, READINESS_SELECT_REQUIRED, READINESS_BUSY, READINESS_UNKNOWN, READINESS_REBOOT_REQUIRED, READINESS_RECOVERY_UNAVAILABLE, SUPERVISOR_RECOVERY_PENDING, SUPERVISOR_RECOVERY_COMPLETE, SUPERVISOR_RECOVERY_UNKNOWN, SUBSCRIPTION_LOADING, SUBSCRIPTION_READY, SUBSCRIPTION_FAILED, SUBSCRIPTION_BUSY, SUBSCRIPTION_CANCELLED, SELECTION_SAVED, SELECTION_FAILED, VPN_PERMISSION_DENIED, VPN_START_UNAVAILABLE, VPN_SERVICE_START_FAILED, SEARCH_STARTING, SEARCH_STARTED, SEARCH_BUSY, SEARCH_REJECTED, SEARCH_UNKNOWN, SEARCH_INTERRUPTED, SEARCH_CLEANUP_PENDING, SEARCH_CANCEL_REQUESTED, SEARCH_INIT_NETWORK_POLICY_UNAVAILABLE, SEARCH_INIT_NETWORK_CHECK_FAILED, SEARCH_INIT_NETWORK_CALLBACK_EVENT, SEARCH_INIT_NETWORK_NON_DIRECT, SEARCH_INIT_NETWORK_BLOCKED, SEARCH_INIT_PROFILES_FAILED, SEARCH_INIT_CORE_IDENTITY_FAILED, SEARCH_INIT_MANIFEST_FAILED, SEARCH_INIT_NETWORK_UNKNOWN, SEARCH_INIT_SESSION_FAILED, WORKER_ADMISSION_FAILED, WORKER_BIND_FAILED, WORKER_CALL_FAILED, WORKER_CALL_INVALID, WORKER_CALL_STATE, WORKER_CALL_DEADLINE, WORKER_CALL_CANCELLED, WORKER_CANCEL_FAILED, WORKER_CLOSE_FAILED, WORKER_SERVICE_BUSY, WORKER_SERVICE_UNAVAILABLE, WORKER_SERVICE_DEADLINE, WORKER_SERVICE_CANCELLED, WORKER_BUSY, WORKER_OWNER_LOST, WORKER_CAPABILITY_UNAVAILABLE, WORKER_DELIVERY_UNKNOWN, WORKER_DIED, WORKER_CLEANUP_INCOMPLETE, WORKER_CONFIG_REJECTED, WORKER_START_FAILED, WORKER_START_TIMEOUT, WORKER_EXITED_EARLY, ATTEMPT_STARTED, ATTEMPT_FINISHED, PAUSED, CANCELLED, COMPLETE, FAILED }
 enum class Fingerprint(val wireValue: String) {
@@ -136,7 +138,7 @@ internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.VPN_PERMISSION_DENIED -> "Подключение VPN не разрешено"
     ScreenEvent.VPN_START_UNAVAILABLE -> "Сначала завершите подбор и дождитесь сохранения результата"
     ScreenEvent.VPN_SERVICE_START_FAILED -> "Не удалось запустить VPN-сервис"
-    ScreenEvent.SEARCH_STARTING -> "Запуск подбора"
+    ScreenEvent.SEARCH_STARTING -> "Вариант — сервер и настройки; повтор — проверка того же варианта (всего 2). Запуск подбора"
     ScreenEvent.SEARCH_BUSY -> "Подбор временно занят"
     ScreenEvent.SEARCH_REJECTED -> "Не удалось начать подбор"
     ScreenEvent.SEARCH_UNKNOWN -> "Результат запуска подбора неизвестен"
@@ -176,9 +178,9 @@ internal fun eventText(event: ScreenEvent): String = when (event) {
     ScreenEvent.WORKER_START_TIMEOUT -> "worker_open:core_start_timeout — Превышено время запуска; проверьте состояние подбора."
     ScreenEvent.WORKER_EXITED_EARLY -> "worker_open:core_exited_before_ready — Ядро остановилось до готовности; проверьте конфигурацию."
     ScreenEvent.SEARCH_CANCEL_REQUESTED -> "Отмена подбора"
-    ScreenEvent.SEARCH_STARTED -> "Подбор начат"
-    ScreenEvent.ATTEMPT_STARTED -> "Попытка начата"
-    ScreenEvent.ATTEMPT_FINISHED -> "Попытка завершена"
+    ScreenEvent.SEARCH_STARTED -> "Подбор начат. Вариант — сервер и настройки; повтор — повторная проверка того же варианта (всего 2)."
+    ScreenEvent.ATTEMPT_STARTED -> "Проверка варианта начата"
+    ScreenEvent.ATTEMPT_FINISHED -> "Проверка варианта завершена"
     ScreenEvent.PAUSED -> "Подбор приостановлен"
     ScreenEvent.CANCELLED -> "Подбор отменён"
     ScreenEvent.COMPLETE -> "Подбор завершён"

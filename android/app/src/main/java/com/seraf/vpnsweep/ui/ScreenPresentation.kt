@@ -1,5 +1,10 @@
 package com.seraf.vpnsweep.ui
 
+import com.seraf.vpnsweep.searchui.TimedLogEvent
+import com.seraf.vpnsweep.searchui.VpnConnectionEvent
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import com.seraf.vpnsweep.searchui.NumericRange
 import com.seraf.vpnsweep.searchui.ScreenInformation
 import com.seraf.vpnsweep.searchui.ScreenEvent
@@ -23,12 +28,7 @@ internal data class ScreenPresentation(val events: List<EventLogEntry>, val appl
 
 internal fun presentInformation(information: ScreenInformation): ScreenPresentation {
     val allowedCodes = SearchStartStage.entries.flatMap { stage -> SearchStartReason.entries.map { reason -> "${stage.code}:${reason.code}" } }.toSet()
-    val events = information.events.map { entry ->
-        when (entry) {
-            is ScreenEvent -> EventLogEntry("", eventLevel(entry), eventText(entry))
-            is SearchProgressEvent -> progressEntry(entry)
-        }
-    } +
+    val events = information.events.map(::presentEvent).filter { it.message.isNotEmpty() } +
         listOfNotNull(information.startRejection?.takeIf { it in allowedCodes }?.let {
             EventLogEntry("", "ERROR", "Подбор не запущен ($it)")
         })
@@ -93,23 +93,37 @@ private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {
         SearchProgressOutcomeV1.SITE_CONSENT -> "сайт требует согласия (site_consent)"
         SearchProgressOutcomeV1.INTERRUPTED -> "прервана"
         SearchProgressOutcomeV1.TIMEOUT -> "истекло время ожидания"
+        SearchProgressOutcomeV1.TLS_FAILURE -> "ошибка проверки TLS-сертификата"
     }
-    val prefix = "Попытка ${value.attempt}, раунд ${value.round}"
+    val server = value.serverName.ifEmpty { "сервер ${value.profile}" }
+    val prefix = "Вариант ${value.attempt} · $server · повтор ${value.round} из 2"
+    val site = when (value.probe) { 1 -> "Google"; 2 -> "YouTube"; 3 -> "GitHub"; 4 -> "UDP/DNS"; else -> "Соединение" }
+    val response = when {
+        value.httpStatus == 0 -> result
+        value.outcome == SearchProgressOutcomeV1.PASS -> "HTTPS доступен, HTTP ${value.httpStatus}"
+        else -> "HTTP ${value.httpStatus}, $result"
+    }
     val message = when (value.kind) {
-        SearchProgressKindV1.ATTEMPT_STARTED -> "Попытка ${value.attempt}: начата"
-        SearchProgressKindV1.ATTEMPT_FINISHED -> "Попытка ${value.attempt}: завершена — $result"
-        SearchProgressKindV1.CANDIDATE_SKIPPED -> "Вариант пропущен"
-        SearchProgressKindV1.CORE_STARTING -> "$prefix: запуск ядра"
-        SearchProgressKindV1.CORE_READY -> "$prefix: ядро готово"
-        SearchProgressKindV1.CORE_STOPPING -> "$prefix: остановка ядра"
-        SearchProgressKindV1.CORE_STOPPED -> if (value.outcome == SearchProgressOutcomeV1.PASS) "$prefix: ядро остановлено" else "$prefix: ошибка остановки ядра"
-        SearchProgressKindV1.PROBE_STARTED -> "$prefix: проверка ${value.probe} начата"
-        SearchProgressKindV1.PROBE_FINISHED -> if (value.probe == 0) "$prefix: ошибка ядра" else "$prefix: проверка ${value.probe} — $result"
-        SearchProgressKindV1.MEDIA_STARTED -> "$prefix: проверка видео начата"
+        SearchProgressKindV1.ATTEMPT_STARTED -> "Вариант ${value.attempt} · $server — проверка начата"
+        SearchProgressKindV1.ATTEMPT_FINISHED -> "Вариант ${value.attempt} — $result"
+        SearchProgressKindV1.PROBE_STARTED -> "$prefix · $site — соединение устанавливается"
+        SearchProgressKindV1.PROBE_FINISHED -> "$prefix · $site — $response, ${value.durationMillis} мс"
+        SearchProgressKindV1.CORE_STOPPED -> if (value.outcome == SearchProgressOutcomeV1.PASS) "" else "Вариант ${value.attempt} — ошибка завершения соединения"
         SearchProgressKindV1.BUDGET_REACHED -> "Подбор приостановлен: достигнут лимит"
         SearchProgressKindV1.SAVED_RESULT_SKIPPED -> "Сохранённый вариант пропущен; поиск продолжается"
+        SearchProgressKindV1.MEDIA_STARTED -> "$prefix — проверка видео"
+        else -> ""
     }
-    return EventLogEntry("", "INFO", message)
+    val level = if (value.kind in setOf(SearchProgressKindV1.PROBE_FINISHED, SearchProgressKindV1.ATTEMPT_FINISHED, SearchProgressKindV1.CORE_STOPPED) && value.outcome !in setOf(SearchProgressOutcomeV1.PASS, SearchProgressOutcomeV1.NONE)) "ERROR" else "INFO"
+    return EventLogEntry("", level, message)
+}
+
+private val journalTime = DateTimeFormatter.ofPattern("HH:mm:ss")
+private fun presentEvent(event: com.seraf.vpnsweep.searchui.ScreenLogEvent): EventLogEntry = when (event) {
+    is TimedLogEvent -> presentEvent(event.event).copy(time = journalTime.format(Instant.ofEpochMilli(event.timeMillis).atZone(ZoneId.systemDefault())))
+    is ScreenEvent -> EventLogEntry("", eventLevel(event), eventText(event))
+    is SearchProgressEvent -> progressEntry(event)
+    is VpnConnectionEvent -> EventLogEntry("", if (event.phase == "ERROR") "ERROR" else "INFO", event.message)
 }
 
 private const val MISSING = "Не задан"

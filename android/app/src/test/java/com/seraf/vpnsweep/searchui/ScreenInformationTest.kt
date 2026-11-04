@@ -39,12 +39,25 @@ class ScreenInformationTest {
         assertEquals("Не применяется", rendered.fragment!!.fields[1].value)
     }
 
+    @Test fun connectivityJournalShowsTimestampServerHttpAndSuppressesCoreLifecycle(): Unit {
+        val response = SearchProgressV1(1, SearchProgressKindV1.PROBE_FINISHED, SearchProgressOutcomeV1.PASS, 3uL, 1, 2, 3, 0, 125, 403, "Test server")
+        val information = ScreenInformation(events = listOf(
+            TimedLogEvent(SearchProgressEvent(response), 1700000000000),
+            SearchProgressEvent(response.copy(kind = SearchProgressKindV1.CORE_READY)),
+        ))
+        val entries = presentInformation(information).events
+        assertEquals(1, entries.size)
+        assertTrue(entries.single().time.matches(Regex("[0-9]{2}:[0-9]{2}:[0-9]{2}")))
+        assertEquals("INFO", entries.single().level)
+        assertEquals("Вариант 3 · Test server · повтор 2 из 2 · GitHub — HTTPS доступен, HTTP 403, 125 мс", entries.single().message)
+    }
+
     @Test
     fun journalShowsProgressInOrderWithAttemptAndResult(): Unit {
         val progress = SearchProgressV1(1, SearchProgressKindV1.PROBE_FINISHED, SearchProgressOutcomeV1.FAILED, 3uL, 1, 2, 4, 0, 100)
         val entries = presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_STARTING, SearchProgressEvent(progress), ScreenEvent.FAILED))).events
         assertEquals(3, entries.size)
-        assertEquals("Попытка 3, раунд 2: проверка 4 — не пройдена", entries[1].message)
+        assertEquals("Вариант 3 · сервер 1 · повтор 2 из 2 · UDP/DNS — не пройдена, 100 мс", entries[1].message)
         assertEquals("ERROR", entries[2].level)
         val failedRequest = progress.copy(outcome = SearchProgressOutcomeV1.REQUEST_FAILED)
         val consent = progress.copy(outcome = SearchProgressOutcomeV1.SITE_CONSENT)
@@ -164,7 +177,7 @@ class ScreenInformationTest {
             ),
         )
         val presentation = presentInformation(information)
-        assertEquals(listOf("Подбор начат", "Подбор приостановлен"), presentation.events.map { it.message })
+        assertEquals(listOf(eventText(ScreenEvent.SEARCH_STARTED), "Подбор приостановлен"), presentation.events.map { it.message })
         assertEquals(listOf("Вкл", "1-3", "50-100 байт", "10 мс", "1-64"), presentation.applied!!.fragment!!.fields.map { it.value })
         assertEquals(listOf("Не задан", "-1", "1024", "reject"), presentation.applied.mux!!.fields.map { it.value })
         assertEquals("360", presentation.applied.fingerprint!!.summary)

@@ -62,7 +62,7 @@ type SearchEngineWorker interface {
 	Failure(generation int64) int
 	Close(generation int64, cleanupMillis int64) int
 	Cancel(generation int64)
-	Progress(kind int, outcome int, attempt int64, profile, round, probe int, bytes, durationMillis int64)
+	Progress(kind int, outcome int, attempt int64, profile, round, probe int, bytes, durationMillis int64, httpStatus int)
 }
 
 type SearchSession struct {
@@ -587,13 +587,13 @@ func emitSearchProgress(worker SearchEngineWorker, progress search.Progress) {
 	if kind == 0 {
 		return
 	}
-	worker.Progress(kind, searchProgressOutcome(progress.Event, progress.Outcome), int64(progress.Attempt), progress.Profile, progress.Round, progress.Probe, progress.Bytes, progress.DurationMS)
+	worker.Progress(kind, searchProgressOutcome(progress.Event, progress.Outcome), int64(progress.Attempt), progress.Profile, progress.Round, progress.Probe, progress.Bytes, progress.DurationMS, progress.HTTPStatus)
 }
 
 func searchProgressOutcome(event, outcome string) int {
 	outcomes := map[string]int{"": 0, "running": 1, "pass": 2, "success": 2, "failed": 3, "inconclusive": 4,
 		"capability_blocked": 5, "duplicate": 6, "session_budget": 7, "payload_budget": 7, "attempt_budget": 7, "journal_budget": 7,
-		"request_failed": 8, "site_consent": 9, "interrupted": 10, "timeout": 11, "attempt_timeout": 11,
+		"tls_failure": 12, "tls_unverified": 12, "request_failed": 8, "site_consent": 9, "interrupted": 10, "timeout": 11, "attempt_timeout": 11,
 		"site_forbidden": 4, "site_rate_limited": 4, "site_restricted": 4, "site_challenge": 4, "unexpected_http_status": 4, "unsupported": 4}
 	if code, ok := outcomes[outcome]; ok {
 		return code
@@ -603,3 +603,6 @@ func searchProgressOutcome(event, outcome string) int {
 	}
 	return 0
 }
+
+// SearchProgressSchemaVersion identifies the local gomobile progress callback ABI.
+func SearchProgressSchemaVersion() int { return 2 }

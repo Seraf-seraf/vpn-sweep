@@ -97,7 +97,7 @@ class SearchMobilePhaseSessionTest {
         val progress = SearchMobilePhaseProgress({ TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }) { epoch, value -> events.add(epoch to value) }
         val worker = SearchEngineWorkerAdapter(7, SearchNetworkV1(11, 12), 5_000, 1_024, { null }, progress::report)
         val session = SearchMobilePhaseSession({}, {
-            worker.progress(1, 1, 4, 1, 1, 0, 0, 0)
+            worker.progress(9, 2, 4, 1, 1, 3, 0, 125, 403)
             "interrupted"
         }, { false }, { LocalOpenedResult("a".repeat(64), Input()) }, {}, progress,
             { SearchResourceStateV2.PAUSED_LEASE_HELD }, {})
@@ -105,7 +105,8 @@ class SearchMobilePhaseSessionTest {
         assertEquals(1, events.size)
         assertEquals(8L, events.single().first)
         assertEquals(7L, events.single().second.sessionGeneration)
-        assertEquals(SearchProgressKindV1.ATTEMPT_STARTED, events.single().second.kind)
+        assertEquals(SearchProgressKindV1.PROBE_FINISHED, events.single().second.kind)
+        assertEquals(403, events.single().second.httpStatus)
     }
 
     @Test fun ownerLossStopsProgressAndCannotReturnLateSuccess(): Unit {

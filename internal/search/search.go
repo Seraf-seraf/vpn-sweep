@@ -38,6 +38,7 @@ type Progress struct {
 	Outcome    string
 	Bytes      int64
 	DurationMS int64
+	HTTPStatus int
 }
 
 func (e Engine) notify(s *state.Store, p Progress) {
@@ -60,7 +61,7 @@ func (e Engine) recordProbe(s *state.Store, r model.ProbeResult, index int) erro
 	if r.Transport == "core" {
 		event = "core_failed"
 	}
-	e.notify(s, Progress{Event: event, Round: r.Round + 1, Probe: index, Outcome: r.Outcome, Bytes: r.Bytes, DurationMS: r.DurationMS})
+	e.notify(s, Progress{Event: event, Round: r.Round + 1, Probe: index, Outcome: r.Outcome, Bytes: r.Bytes, DurationMS: r.DurationMS, HTTPStatus: r.HTTPStatus})
 	return nil
 }
 

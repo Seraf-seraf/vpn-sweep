@@ -15,6 +15,7 @@ import (
 	"github.com/Seraf-seraf/vpn-sweep/internal/export"
 	"github.com/Seraf-seraf/vpn-sweep/internal/importer"
 	"github.com/Seraf-seraf/vpn-sweep/internal/model"
+	"github.com/Seraf-seraf/vpn-sweep/internal/search"
 	"github.com/Seraf-seraf/vpn-sweep/internal/space"
 )
 
@@ -82,7 +83,7 @@ func (w *fakeEngineWorker) Cancel(int64) {
 		}
 	})
 }
-func (*fakeEngineWorker) Progress(int, int, int64, int, int, int, int64, int64) {}
+func (*fakeEngineWorker) Progress(int, int, int64, int, int, int, int64, int64, int) {}
 
 func TestSearchProgressOutcomeReportsProbeAndCleanupFailures(t *testing.T) {
 	tests := []struct {
@@ -283,5 +284,24 @@ func TestAndroidSearchOpenStartupTimeoutDoesNotHideUnknownCleanup(t *testing.T) 
 	_, err := backend.Open(attempt, searchbridge.Identity{WorkerGeneration: 1}, model.Profile{}, nil)
 	if !errors.Is(err, searchbridge.ErrCleanupIncomplete) {
 		t.Fatalf("unknown cleanup was hidden: %v", err)
+	}
+}
+
+type progressCapture struct {
+	fakeEngineWorker
+	httpStatus int
+}
+
+func (w *progressCapture) Progress(_, _ int, _ int64, _, _, _ int, _, _ int64, status int) {
+	w.httpStatus = status
+}
+func TestSearchProgressPreservesHTTPStatus(t *testing.T) {
+	worker := &progressCapture{}
+	emitSearchProgress(worker, search.Progress{Event: "probe_finished", Outcome: "pass", HTTPStatus: 403})
+	if worker.httpStatus != 403 || SearchProgressSchemaVersion() != 2 {
+		t.Fatal("progress callback lost version/status")
+	}
+	if searchProgressOutcome("probe_finished", "tls_failure") != 12 {
+		t.Fatal("TLS reason lost")
 	}
 }

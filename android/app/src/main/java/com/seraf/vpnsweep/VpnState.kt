@@ -19,7 +19,12 @@ object VpnStatus {
     private val mutableState = MutableStateFlow(VpnState())
     val state = mutableState.asStateFlow()
 
+    internal var onPhaseChanged: ((VpnState) -> Unit)? = null
+
+    @Synchronized
     fun update(value: VpnState): Unit {
+        val changed = mutableState.value.phase != value.phase
         mutableState.value = value
+        if (changed) onPhaseChanged?.invoke(value)
     }
 }

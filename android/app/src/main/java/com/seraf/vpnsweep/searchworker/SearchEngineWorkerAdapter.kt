@@ -466,15 +466,15 @@ internal class SearchEngineWorkerAdapter(
         } catch (_: Exception) { } catch (_: LinkageError) { }
     }
 
-    override fun progress(kind: Long, outcome: Long, attempt: Long, profile: Long, round: Long, probe: Long, bytes: Long, durationMillis: Long): Unit {
+    override fun progress(kind: Long, outcome: Long, attempt: Long, profile: Long, round: Long, probe: Long, bytes: Long, durationMillis: Long, httpStatus: Long): Unit {
         if (kind !in 1..SearchProgressKindV1.entries.size.toLong() || outcome !in 0 until SearchProgressOutcomeV1.entries.size.toLong()) return
         val kindValue = SearchProgressKindV1.entries.getOrNull((kind - 1).toInt()) ?: return
         val outcomeValue = SearchProgressOutcomeV1.entries.getOrNull(outcome.toInt()) ?: return
         if (profile !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() || round !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() ||
-            probe !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() || bytes < 0 || durationMillis < 0
+            probe !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() || bytes < 0 || durationMillis < 0 || (httpStatus != 0L && httpStatus !in 200L..599L)
         ) return
         try {
-            reportProgress(SearchProgressV1(sessionGeneration, kindValue, outcomeValue, attempt.toULong(), profile.toInt(), round.toInt(), probe.toInt(), bytes, durationMillis))
+            reportProgress(SearchProgressV1(sessionGeneration, kindValue, outcomeValue, attempt.toULong(), profile.toInt(), round.toInt(), probe.toInt(), bytes, durationMillis, httpStatus.toInt()))
         } catch (_: Exception) {
             // Progress carries no resource and is not a worker acknowledgement.
         }

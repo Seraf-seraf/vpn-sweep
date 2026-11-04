@@ -82,6 +82,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import com.seraf.vpnsweep.searchui.ScreenEvent
 import com.seraf.vpnsweep.searchui.ScreenLogEvent
 import com.seraf.vpnsweep.searchui.SearchProgressEvent
+import com.seraf.vpnsweep.searchui.TimedLogEvent
+import com.seraf.vpnsweep.searchui.VpnConnectionEvent
+import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
 import com.seraf.vpnsweep.searchui.workerFatalEvent
 import com.seraf.vpnsweep.searchui.subscriptionEvent
@@ -90,6 +93,10 @@ import com.seraf.vpnsweep.searchui.workerOpenEvent
 
 internal class SweepApplication : Application() {
     val integration: AppComposition by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppComposition(this) }
+    override fun onCreate(): Unit {
+        super.onCreate()
+        VpnStatus.onPhaseChanged = { value -> integration.recordVpnConnection(value.phase, value.message) }
+    }
 }
 
 internal enum class SearchReadiness { READY, SELECT_REQUIRED, BUSY, UNKNOWN, REBOOT_REQUIRED, RECOVERY_UNAVAILABLE }
@@ -176,19 +183,25 @@ internal fun recoverOwnerBusyForSelection(
     controller.retryOwnerBusy()
 }
 
-internal class AppComposition(context: Context) {
+internal class AppComposition(context: Context, private val nowMillis: () -> Long = System::currentTimeMillis) {
     private val app = requireNotNull(context.applicationContext)
     private val lock = Any()
     private val eventsLock = Any()
     private val mutableEvents = MutableStateFlow<List<ScreenLogEvent>>(emptyList())
     val events = mutableEvents.asStateFlow()
     fun addEvent(event: ScreenEvent): Unit = synchronized(eventsLock) {
-        mutableEvents.value = (mutableEvents.value + event).takeLast(100)
+        mutableEvents.value = (mutableEvents.value + TimedLogEvent(event, nowMillis())).takeLast(MAX_JOURNAL_ENTRIES)
     }
     private fun addProgress(progress: SearchProgressV1): Unit = synchronized(eventsLock) {
-        if (progress.kind != SearchProgressKindV1.CANDIDATE_SKIPPED) {
-            mutableEvents.value = (mutableEvents.value + SearchProgressEvent(progress)).takeLast(100)
+        if (progress.kind !in setOf(SearchProgressKindV1.CANDIDATE_SKIPPED, SearchProgressKindV1.CORE_STARTING, SearchProgressKindV1.CORE_READY, SearchProgressKindV1.CORE_STOPPING) &&
+            (progress.kind != SearchProgressKindV1.CORE_STOPPED || progress.outcome != SearchProgressOutcomeV1.PASS)) {
+            mutableEvents.value = (mutableEvents.value + TimedLogEvent(SearchProgressEvent(progress), nowMillis())).takeLast(MAX_JOURNAL_ENTRIES)
         }
+    }
+    fun recordVpnConnection(phase: VpnPhase, message: String): Unit = synchronized(eventsLock) {
+        mutableEvents.value = (mutableEvents.value + TimedLogEvent(
+            VpnConnectionEvent(phase.name, message), nowMillis(),
+        )).takeLast(MAX_JOURNAL_ENTRIES)
     }
     private val requests = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "subscription-fetch") }
     private var currentRequestGeneration: Long? = null
@@ -751,6 +764,7 @@ internal class AppComposition(context: Context) {
         ): SearchMobilePhaseSession {
             var stage = ScreenEvent.SEARCH_INIT_PROFILES_FAILED
             try {
+            check(Mobile.searchProgressSchemaVersion() == 2L) { "progress_schema_mismatch" }
             val profiles = snapshot.profiles.open().use { input -> input.readNBytes(MAX_SEARCH_PROFILES_BYTES + 1) }
             if (profiles.isEmpty() || profiles.size > MAX_SEARCH_PROFILES_BYTES) throw IOException("search_profile_size")
             stage = ScreenEvent.SEARCH_INIT_CORE_IDENTITY_FAILED
@@ -770,7 +784,12 @@ internal class AppComposition(context: Context) {
             val owner = network.owner
             val limits = workerTransportLimits
             val localDrain = SearchWorkerLocalDrain(snapshot.sessionGeneration)
-            val phaseProgress = SearchMobilePhaseProgress { epoch, value -> progress(epoch, value) }
+            val selection = subscriptions.state.value
+            val serverNames = selection.records.filter { it.supported && it.id in selection.selectedIds }.map { it.title }
+            val phaseProgress = SearchMobilePhaseProgress { epoch, value ->
+                val name = serverNames.getOrNull(value.profile - 1).orEmpty().filterNot { it.isISOControl() }.take(128)
+                progress(epoch, value.copy(serverName = name))
+            }
             val adapter = SearchEngineWorkerAdapter(
                 snapshot.sessionGeneration,
                 network.network,
@@ -930,6 +949,7 @@ internal class AppComposition(context: Context) {
     }
 
     private companion object {
+        const val MAX_JOURNAL_ENTRIES = 100
         const val SUBSCRIPTION_TIMEOUT_MS = 30_000L
         const val MAX_SEARCH_PROFILES_BYTES = 8 * 1024 * 1024
         const val DEFAULT_CLEANUP_MILLIS = 10_000L
