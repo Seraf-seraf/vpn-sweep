@@ -387,7 +387,7 @@ internal fun EventLogPanel(entries: List<EventLogEntry>, showHeader: Boolean = t
             Text("Событий пока нет", color = SecondaryText, fontFamily = SweepMono, fontSize = 14.sp)
         } else {
             for (entry in entries) {
-                Text("${entry.time}  [${entry.level}] ${entry.message}", color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
+                Text(entry.message, color = PrimaryText, fontFamily = SweepMono, fontSize = 14.sp)
             }
         }
     }
