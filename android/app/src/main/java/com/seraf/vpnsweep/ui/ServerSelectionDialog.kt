@@ -206,9 +206,6 @@ internal fun ServerSelectionDialogContent(
                     footerLeading = {
                         Column(Modifier.fillMaxWidth()) {
                             ServerSelectionSummary(selectedCount = selected.size, noServers = servers.isEmpty())
-                            if (!canConfirm) {
-                                Text("Изменения пока нельзя сохранить.", color = ServerDialogColors.text)
-                            }
                         }
                     },
                     footer = {
