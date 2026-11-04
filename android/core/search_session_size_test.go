@@ -28,7 +28,7 @@ func (w *profileSizeWorker) Open(session, attempt int64, round int, generation i
 
 func profileInputWithSerializedSize(t *testing.T, size int, precedingProfile bool) []byte {
 	t.Helper()
-	const prefix = `{"outbound":{"protocol":"trojan","settings":{"servers":[{"address":"a.invalid","port":443,"password":"`
+	const prefix = `{"outbound":{"protocol":"trojan","settings":{"servers":[{"address":"a.invalid","port":443,"password":"synthetic-`
 	const suffix = `"}]}}}`
 	valueSize := size - len(prefix) - len(suffix)
 	if valueSize < 6 {
