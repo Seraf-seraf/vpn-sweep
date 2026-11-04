@@ -837,7 +837,8 @@ func TestMuxCandidateIdentityMatchesRenderedSettings(t *testing.T) {
 func TestAttemptTimeoutContinuesAndIsDurable(t *testing.T) {
 	for _, phase := range []string{"open", "probe", "confirmation"} {
 		t.Run(phase, func(t *testing.T) {
-			m, p, g, s := setup(t)
+			controlledClock := &testClock{now: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)}
+			m, p, g, s := clockStore(t, controlledClock)
 			m.Budgets.AttemptSeconds = 1
 			m.Budgets.SessionSeconds = 10
 			p = append(p, importer.Clone(p[0]))
@@ -848,6 +849,7 @@ func TestAttemptTimeoutContinuesAndIsDurable(t *testing.T) {
 				opens++
 				if (phase == "open" && opens == 1) || (phase == "confirmation" && opens == 2) {
 					expiredID = s.View().Pending.Candidate.ID
+					controlledClock.advance(time.Second)
 					<-ctx.Done()
 					return nil, ctx.Err()
 				}
@@ -855,6 +857,7 @@ func TestAttemptTimeoutContinuesAndIsDurable(t *testing.T) {
 			}, Check: func(ctx context.Context, x socks.Endpoint, pr model.Probe, r int) model.ProbeResult {
 				if phase == "probe" && opens == 1 {
 					expiredID = s.View().Pending.Candidate.ID
+					controlledClock.advance(time.Second)
 					<-ctx.Done()
 					return model.ProbeResult{ID: model.ID(), Probe: pr.ID, Round: r, Outcome: "timeout"}
 				}
