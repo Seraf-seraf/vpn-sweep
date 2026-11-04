@@ -56,7 +56,26 @@ internal fun presentInformation(information: ScreenInformation): ScreenPresentat
             )),
         )
     }
-    return ScreenPresentation(events, applied)
+    val effective = information.applied?.effectiveFields?.let { fields ->
+        fun field(key: String, unit: String = ""): String {
+            val entry = fields[key] ?: return "Не удалось прочитать"
+            if (entry.state == "not_applicable") return "Не применяется"
+            val value = when (entry.value) { "true" -> "Включён"; "false" -> "Выключен"; "all" -> "Все пакеты"; else -> entry.value }
+            if (entry.state == "default") return if (value.isEmpty()) "По умолчанию" else "$value$unit (по умолчанию)"
+            return value + unit
+        }
+        fun group(summary: String, vararg keys: Pair<String, String>): ParameterGroupValues = ParameterGroupValues(field(summary), keys.map { (label, key) ->
+            val unit = when (key) { "length" -> " байт"; "interval" -> " мс"; else -> "" }
+            val inactive = (summary == "mux" && fields["mux"]?.value == "false" && key != "mux")
+            ParameterValue(label, field(key, unit) + if (inactive && fields[key]?.state != "not_applicable") " (не используется)" else "")
+        })
+        AppliedParameterValues(
+            group("fragment", "Фрагментация" to "fragment", "Пакеты" to "packets", "Длина" to "length", "Интервал" to "interval", "Макс. частей" to "maxSplit"),
+            group("mux", "Mux" to "mux", "TCP concurrency" to "tcpConcurrency", "XUDP concurrency" to "xudpConcurrency", "UDP 443" to "quic"),
+            group("fingerprint", "Fingerprint" to "fingerprint"), group("noise", "Шум" to "noise", "Записи" to "noises"),
+        )
+    }
+    return ScreenPresentation(events, effective ?: applied)
 }
 
 private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {

@@ -25,6 +25,20 @@ import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 
 class ScreenInformationTest {
+    @Test fun effectiveParametersDistinguishDefaultsDisabledAndNotApplicable(): Unit {
+        val values = AppliedParameters(effectiveFields = mapOf(
+            "mux" to EffectiveParameter("false", "value"),
+            "tcpConcurrency" to EffectiveParameter("8", "default"),
+            "fingerprint" to EffectiveParameter("chrome", "default"),
+            "packets" to EffectiveParameter("", "not_applicable"),
+        ))
+        val rendered = presentInformation(ScreenInformation(applied = values)).applied!!
+        assertEquals("Выключен", rendered.mux!!.summary)
+        assertEquals("8 (по умолчанию) (не используется)", rendered.mux.fields[1].value)
+        assertEquals("chrome (по умолчанию)", rendered.fingerprint!!.summary)
+        assertEquals("Не применяется", rendered.fragment!!.fields[1].value)
+    }
+
     @Test
     fun journalShowsProgressInOrderWithAttemptAndResult(): Unit {
         val progress = SearchProgressV1(1, SearchProgressKindV1.PROBE_FINISHED, SearchProgressOutcomeV1.FAILED, 3uL, 1, 2, 4, 0, 100)

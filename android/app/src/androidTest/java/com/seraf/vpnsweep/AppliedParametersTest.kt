@@ -7,11 +7,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import com.seraf.vpnsweep.searchui.Fingerprint
-import com.seraf.vpnsweep.searchui.FragmentPackets
-import com.seraf.vpnsweep.searchui.NumericRange
+import com.seraf.vpnsweep.core.mobile.Mobile
 import com.seraf.vpnsweep.searchui.ScreenInformation
-import com.seraf.vpnsweep.searchui.Udp443
 import com.seraf.vpnsweep.searchui.parseAppliedParameters
 import com.seraf.vpnsweep.ui.InformationPanel
 import com.seraf.vpnsweep.ui.SweepTheme
@@ -25,45 +22,30 @@ import org.junit.runner.RunWith
 class AppliedParametersTest {
     @get:Rule val compose = createComposeRule()
 
-    private val config = """{"vpnSweepSelection":{"fragment":true,"packets":"tlshello","length":"50-100","interval":"10","maxSplit":"1-5","mux":true,"tcpConcurrency":8,"xudpConcurrency":0,"quic":"reject","fingerprint":"firefox","noise":true,"noises":[{},{}]},"outbounds":[
-        {"tag":"candidate","streamSettings":{"security":"reality","realitySettings":{"fingerprint":"firefox"},"sockopt":{"dialerProxy":"endpoint-fragment"}},
-         "mux":{"enabled":true,"concurrency":8,"xudpConcurrency":0,"xudpProxyUDP443":"reject"}},
-        {"tag":"endpoint-fragment","settings":{"fragment":{"packets":"tlshello","length":"50-100","interval":"10","maxSplit":"1-5"},"noises":[{},{}]}}
-    ]}""".toByteArray()
+    private val config = """{"version":1,"values":{
+        "fragment":{"value":"true","state":"value"},"packets":{"value":"tlshello","state":"value"},
+        "length":{"value":"50-100","state":"value"},"interval":{"value":"10","state":"value"},"maxSplit":{"value":"1-5","state":"value"},
+        "mux":{"value":"true","state":"value"},"tcpConcurrency":{"value":"8","state":"default"},"xudpConcurrency":{"value":"0","state":"value"},"quic":{"value":"reject","state":"value"},
+        "fingerprint":{"value":"firefox","state":"value"},"noise":{"value":"true","state":"value"},"noises":{"value":"2","state":"value"}
+    }}""".toByteArray()
 
-    @Test fun readsEffectiveRenderedValues(): Unit {
-        val values = checkNotNull(parseAppliedParameters(config))
-        assertEquals(true, values.fragmentEnabled)
-        assertEquals(FragmentPackets.TLS_HELLO, values.fragmentPackets)
-        assertEquals(NumericRange.Pair(50, 100), values.fragmentLengthBytes)
-        assertEquals(NumericRange.Single(10), values.fragmentIntervalMillis)
-        assertEquals(NumericRange.Pair(1, 5), values.fragmentMaxSplit)
-        assertEquals(true, values.muxEnabled)
-        assertEquals(8, values.tcpConcurrency)
-        assertEquals(0, values.xudpConcurrency)
-        assertEquals(Udp443.REJECT, values.udp443)
-        assertEquals(Fingerprint.FIREFOX, values.fingerprint)
-        assertEquals(true, values.udpNoiseEnabled)
-        assertEquals(2, values.udpNoiseCount)
+    @Test fun nativeProjectionIncludesInheritedSettings(): Unit {
+        val saved = """{"vpnSweepSelection":{},"outbounds":[{"tag":"candidate","protocol":"freedom","streamSettings":{"security":"tls","tlsSettings":{"fingerprint":"firefox"}},"mux":{"enabled":false}}]}""".toByteArray()
+        val values = checkNotNull(parseAppliedParameters(Mobile.appliedParametersJSON(saved))).effectiveFields!!
+        assertEquals("firefox", values["fingerprint"]!!.value)
+        assertEquals("false", values["mux"]!!.value)
+        assertEquals("not_applicable", values["packets"]!!.state)
     }
 
-    @Test fun missingValuesAndInvalidResultsAreDistinct(): Unit {
-        val minimal = """{"vpnSweepSelection":{"mux":false,"fingerprint":"chrome"},"outbounds":[{"tag":"candidate","mux":{"enabled":false},"streamSettings":{"security":"tls","tlsSettings":{"fingerprint":"chrome"}}}]}""".toByteArray()
-        val values = checkNotNull(parseAppliedParameters(minimal))
-        assertEquals(false, values.muxEnabled)
-        assertEquals(Fingerprint.CHROME, values.fingerprint)
-        assertNull(values.fragmentEnabled)
-        assertNull(values.udpNoiseCount)
-        val emptyFingerprint = """{"vpnSweepSelection":{"mux":false,"fingerprint":""},"outbounds":[{"tag":"candidate"}]}""".toByteArray()
-        val emptyFingerprintValues = checkNotNull(parseAppliedParameters(emptyFingerprint))
-        assertNull(emptyFingerprintValues.fingerprint)
-        assertEquals(false, emptyFingerprintValues.muxEnabled)
-        assertNull(parseAppliedParameters("""{"vpnSweepSelection":{"mux":"yes"},"outbounds":[{"tag":"candidate"}]}""".toByteArray()))
-        assertNull(parseAppliedParameters("""{"vpnSweepSelection":{"unexpected":true},"outbounds":[{"tag":"candidate"}]}""".toByteArray()))
-        val inherited = """{"vpnSweepSelection":{},"outbounds":[{"tag":"candidate","streamSettings":{"security":"tls","tlsSettings":{"fingerprint":"firefox"}}}]}""".toByteArray()
-        assertNull(checkNotNull(parseAppliedParameters(inherited)).fingerprint)
-        val legacy = """{"outbounds":[{"tag":"candidate","streamSettings":{"security":"tls","tlsSettings":{"fingerprint":"firefox"}}}]}""".toByteArray()
-        assertNull(checkNotNull(parseAppliedParameters(legacy)).fingerprint)
+    @Test fun readsOnlyVersionedNativeProjection(): Unit {
+        val values = checkNotNull(parseAppliedParameters(config)).effectiveFields!!
+        assertEquals("firefox", values["fingerprint"]!!.value)
+        assertEquals("default", values["tcpConcurrency"]!!.state)
+        assertEquals("2", values["noises"]!!.value)
+        assertNull(parseAppliedParameters("{}".toByteArray()))
+        assertNull(parseAppliedParameters(config.toString(Charsets.UTF_8).replace("\"version\":1", "\"version\":2").toByteArray()))
+        assertNull(parseAppliedParameters(config.toString(Charsets.UTF_8).replace("\"state\":\"value\"", "\"state\":\"invalid\"").toByteArray()))
+        assertNull(parseAppliedParameters(config.toString(Charsets.UTF_8).replace("\"noises\":", "\"secret\":").toByteArray()))
     }
 
     @Test fun parametersAreVisibleInScrollablePanel(): Unit {

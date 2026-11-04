@@ -341,7 +341,9 @@ internal class AppComposition(context: Context) {
         val (accepted, searched) = synchronized(lock) { acceptedSnapshot to completedSearch }
         if (accepted == null || searched == null || !hasCleanCompletion(searched)) return@synchronized null
         val bytes = activation.displayResult(accepted, searched) ?: return@synchronized null
-        com.seraf.vpnsweep.searchui.parseAppliedParameters(bytes)
+        try {
+            com.seraf.vpnsweep.searchui.parseAppliedParameters(Mobile.appliedParametersJSON(bytes))
+        } catch (_: Exception) { null }
     }
 
     fun selectedForDisplay(): Boolean = canStartVpn()

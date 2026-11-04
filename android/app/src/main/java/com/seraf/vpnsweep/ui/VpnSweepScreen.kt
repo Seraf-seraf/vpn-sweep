@@ -404,7 +404,7 @@ private fun EventLogHeader() {
 
 @Composable
 private fun ParametersHeader() {
-    Text("Параметры подбора", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+    Text("Параметры сохранённой конфигурации", color = PrimaryText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
 }
 
 @Composable
@@ -437,7 +437,7 @@ internal fun ParametersPanel(initialFragmentExpanded: Boolean = false, applied: 
         Spacer(Modifier.height(8.dp))
     }
     if (applied == null) {
-        Text("Применённые параметры пока недоступны", color = SecondaryText, fontSize = 14.sp)
+        Text("Не удалось прочитать параметры сохранённой конфигурации", color = SecondaryText, fontSize = 14.sp)
         Spacer(Modifier.height(12.dp))
     }
     ParameterGroup("Fragment", SweepIcon.Fragment, listOf("Фрагментация", "Пакеты", "Длина", "Интервал", "Макс. частей"), initialFragmentExpanded || initialAllExpanded, applied?.fragment)

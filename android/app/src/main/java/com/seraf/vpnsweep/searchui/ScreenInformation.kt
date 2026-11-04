@@ -25,7 +25,10 @@ sealed interface NumericRange {
     data class Pair(val first: Int, val last: Int) : NumericRange
 }
 
+data class EffectiveParameter(val value: String, val state: String)
+
 data class AppliedParameters(
+    val effectiveFields: Map<String, EffectiveParameter>? = null,
     val fragmentEnabled: Boolean? = null,
     val fragmentPackets: FragmentPackets? = null,
     val fragmentLengthBytes: NumericRange? = null,
