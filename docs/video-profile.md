@@ -1,9 +1,12 @@
 # Compatibility of saved video series
 
-New searches use `google-youtube-web-noise-v1` and check the Google and YouTube HTML
-pages in two fresh-core rounds. For a candidate with `noise=true`, a UDP/DNS probe
-through SOCKS must also pass in both rounds; it is not run for `noise=false`. New searches
-do not check video delivery or downloads and do not need YouTube resolver dependencies.
+New searches use `web-connectivity-v1`: GET requests to `https://www.google.com/`,
+`https://www.youtube.com/` and `https://github.com/` without query parameters.
+Each target must return an HTTP status 200–599 over verified TLS in both fresh-core
+rounds. Redirects are not followed; 302, 403, 429 and 500 count as HTTPS connectivity.
+Page content, downloads and video delivery are not checked. Candidates with `noise=true`
+also require UDP/DNS through SOCKS in both rounds. Saved policies retain their original
+semantics; the preset remains live-unverified.
 
 Saved series whose policy includes YouTube video cannot resume; start a new series.
 Their status and report remain readable, and already verified results can be exported

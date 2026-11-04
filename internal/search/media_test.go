@@ -46,11 +46,11 @@ func TestBuiltinPagesRunTwiceWithoutVideo(t *testing.T) {
 				t.Fatal(status, err, opens, closed)
 			}
 			if outcome == "pass" {
-				if status != "success" || opens != 2 || pages != 4 || exports != 1 {
+				if status != "success" || opens != 2 || pages != 6 || exports != 1 {
 					t.Fatal(status, opens, pages, exports)
 				}
 				report, err := export.ReadReport(result)
-				if err != nil || report.VerificationScope != "google_youtube_web_pages_and_udp_dns_for_noise_only" || len(report.Capabilities) != 0 {
+				if err != nil || report.VerificationScope != "google_youtube_github_https_connectivity_only" || len(report.Capabilities) != 0 {
 					t.Fatal(report, err)
 				}
 			} else if status != "paused_budget" || exports != 0 {

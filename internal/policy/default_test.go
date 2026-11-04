@@ -25,7 +25,7 @@ func builtinAttempt(p model.Policy) model.Attempt {
 }
 
 func legacyCombinedPolicy() model.Policy {
-	p := Default()
+	p := legacyWebDefault()
 	p.Version = GoogleYouTube
 	p.UDP = nil
 	p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "BaW_jenozKc", Permission: "synthetic", MinHeight: 1080}}
@@ -34,7 +34,7 @@ func legacyCombinedPolicy() model.Policy {
 
 func TestDefaultRequiresPagesAndFreshRoundsWithoutVideo(t *testing.T) {
 	p := Default()
-	if p.Version != GoogleYouTubeWebNoise || p.Video != nil || len(p.Probes) != 2 || p.Rounds != 2 {
+	if p.Version != WebConnectivity || p.Video != nil || len(p.Probes) != 3 || p.Rounds != 2 {
 		t.Fatalf("unexpected default policy: %+v", p)
 	}
 	if err := Validate(p); err != nil {

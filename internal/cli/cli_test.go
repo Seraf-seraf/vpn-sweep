@@ -193,7 +193,7 @@ func TestBuiltinPolicyAndLegacyResumeWithoutOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, stderr bytes.Buffer
-	if Run(context.Background(), []string{"policy"}, nil, &out, &stderr) != 0 || !strings.Contains(out.String(), `"policy":"`+policy.GoogleYouTubeWebNoise+`"`) || !strings.Contains(out.String(), `"network_requests":false`) {
+	if Run(context.Background(), []string{"policy"}, nil, &out, &stderr) != 0 || !strings.Contains(out.String(), `"policy":"`+policy.WebConnectivity+`"`) || !strings.Contains(out.String(), `"network_requests":false`) {
 		t.Fatal(out.String(), stderr.String())
 	}
 	binary, id := testkit.FakeCore(t)
@@ -262,7 +262,7 @@ func TestLegacyYouTubeResumeRequiresNewSeries(t *testing.T) {
 			base := t.TempDir()
 			dir := filepath.Join(base, "series")
 			key := make([]byte, 32)
-			p := policy.Default()
+			p := legacyPagePolicy(t)
 			p.Version = version
 			p.UDP = nil
 			p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "abcdefghijk", Permission: "synthetic", MinHeight: 1080}}
@@ -328,7 +328,7 @@ func TestExportSavedLegacyYouTubeWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := policy.Default()
+	p := legacyPagePolicy(t)
 	p.Version = policy.GoogleYouTube
 	p.UDP = nil
 	p.Video = &model.VideoPolicy{Required: []string{media.YouTube}, Samples: 3, MinMbps: 10, MaxReadGapMS: 3000, SampleBytes: 4 << 20, TimeoutSeconds: 30, YouTube: &model.YouTubeReference{VideoID: "abcdefghijk", Permission: "synthetic", MinHeight: 1080}}
@@ -381,4 +381,17 @@ func TestExportSavedLegacyYouTubeWinner(t *testing.T) {
 	if err != nil || report.Capabilities[media.YouTube] != "pass" {
 		t.Fatal(report, err)
 	}
+}
+
+func legacyPagePolicy(t *testing.T) model.Policy {
+	t.Helper()
+	data, err := os.ReadFile("../../examples/google-youtube-web-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p model.Policy
+	if err := model.Decode(data, &p); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

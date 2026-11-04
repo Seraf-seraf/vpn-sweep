@@ -183,6 +183,9 @@ func Save(dir string, m model.Manifest, profiles []model.Profile, a model.Attemp
 		return nil
 	}
 	report := Report{VerificationScope: policy.Scope(m.Policy), PresetStatus: policy.PresetStatus(m.Policy), Version: 1, SeriesID: m.SeriesID, CandidateID: a.Candidate.ID, AttemptID: a.ID, Status: "policy_satisfied", Policy: m.Policy.Version, Core: m.Core, Environment: m.Environment, Results: a.Results, Limitations: []string{"time_and_network_specific", "no_system_android_vpn_claim", "happ_unverified", "android_device_unverified", "quic_unsupported", "media_not_tested"}}
+	if m.Policy.Version == policy.WebConnectivity {
+		report.Limitations = append(report.Limitations, "https_connectivity_only", "http_200_to_599_accepted", "page_content_not_checked", "udp_dns_only_when_noise_enabled", "not_general_internet", "no_bulk_download_test", "preset_live_unverified")
+	}
 	if m.Policy.Version == policy.GoogleYouTubeWeb {
 		report.Limitations = append(report.Limitations, "google_and_youtube_pages_only", "single_operator_google", "not_general_internet", "no_bulk_download_test", "preset_live_unverified")
 	}

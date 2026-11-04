@@ -28,6 +28,12 @@ func Validate(p model.Probe) error {
 	if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || p.ID == "" || p.Operator == "" {
 		return model.Err("invalid_probe", "policy")
 	}
+	if p.Kind == "connectivity" {
+		if u.Path != "/" || u.RawQuery != "" || u.ForceQuery || len(p.RedirectHosts) != 0 || p.Status != 0 || p.Contains != "" || len(p.ContainsAll) != 0 || p.SHA256 != "" || p.MIME != "" || p.MinBytes != 0 || p.Bytes != 0 || p.TimeoutSeconds < 1 || p.TimeoutSeconds > 300 {
+			return model.Err("invalid_connectivity_probe", "policy")
+		}
+		return nil
+	}
 	if p.Kind != "page" && p.Kind != "download" {
 		return model.Err("unsupported_probe_kind", "policy")
 	}
@@ -76,6 +82,9 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	tr := &http.Transport{Proxy: nil, DialContext: proxy.DialContext, DisableKeepAlives: true, ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: c.Roots, MinVersion: tls.VersionTLS12}, MaxResponseHeaderBytes: 64 << 10}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if p.Kind == "connectivity" {
+			return http.ErrUseLastResponse
+		}
 		r.Redirects = len(via)
 		if len(p.ContainsAll) > 0 && (req.URL.Hostname() == "consent.google.com" || req.URL.Hostname() == "consent.youtube.com") {
 			return model.Err("site_consent", "site")
@@ -117,6 +126,12 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	r.TLSVerified = resp.TLS != nil && len(resp.TLS.VerifiedChains) > 0
 	if !r.TLSVerified {
 		return finish("tls_unverified", "tls")
+	}
+	if p.Kind == "connectivity" {
+		if resp.StatusCode < 200 || resp.StatusCode > 599 {
+			return finish("unexpected_http_status", "site")
+		}
+		return finish("pass", "response")
 	}
 	if resp.StatusCode != p.Status {
 		switch resp.StatusCode {

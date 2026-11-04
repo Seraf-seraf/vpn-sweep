@@ -1,10 +1,12 @@
 # Google and YouTube pages: Termux ARM64
 
-The built-in `google-youtube-web-noise-v1` checks the Google and YouTube HTML pages in
-two fresh-core rounds. For a candidate with `noise=true`, UDP/DNS through SOCKS must also
-pass in both rounds; it is not run for `noise=false`. The policy does not require video
-or downloads. It remains live-unverified; desktop tests and cross-build do not establish
-Android device acceptance.
+New searches use `web-connectivity-v1`: GET requests to `https://www.google.com/`,
+`https://www.youtube.com/` and `https://github.com/` without query parameters.
+Each target must return an HTTP status 200–599 over verified TLS in both fresh-core
+rounds. Redirects are not followed; 302, 403, 429 and 500 count as HTTPS connectivity.
+Page content, downloads and video delivery are not checked. Candidates with `noise=true`
+also require UDP/DNS through SOCKS in both rounds. Saved policies retain their original
+semantics; the preset remains live-unverified.
 
 ```sh
 pkg install git golang make ca-certificates

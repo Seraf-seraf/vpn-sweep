@@ -13,7 +13,7 @@ const NoiseDNSProbeID = "noise-dns"
 const NoiseDNSProbeAddress = "8.8.8.8:53"
 const NoiseDNSProbeTimeoutSeconds = 5
 
-func Default() model.Policy {
+func legacyWebDefault() model.Policy {
 	return model.Policy{
 		Version: GoogleYouTubeWebNoise, Rounds: 2, MinOperators: 1,
 		Probes: []model.Probe{

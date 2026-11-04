@@ -20,10 +20,13 @@ The public report contains opaque profile/candidate/attempt/series IDs, typed er
 payload byte counts and validator outcomes. It never contains source URLs, endpoint names,
 credentials, raw external error messages or response bodies.
 
-New CLI series use `google-youtube-web-noise-v1`: the Google and YouTube HTML pages
-must pass in both fresh-core rounds. For a candidate with `noise=true`, a UDP/DNS probe
-through SOCKS must also pass in both rounds; it is not run for `noise=false`. The default
-policy does not require a download or a video check.
+New searches use `web-connectivity-v1`: GET requests to `https://www.google.com/`,
+`https://www.youtube.com/` and `https://github.com/` without query parameters.
+Each target must return an HTTP status 200–599 over verified TLS in both fresh-core
+rounds. Redirects are not followed; 302, 403, 429 and 500 count as HTTPS connectivity.
+Page content, downloads and video delivery are not checked. Candidates with `noise=true`
+also require UDP/DNS through SOCKS in both rounds. Saved policies retain their original
+semantics; the preset remains live-unverified.
 
 Status success requires all checks applicable to the series policy, successful child
 cleanup and durable private export. Saved series retain their original policy; resume

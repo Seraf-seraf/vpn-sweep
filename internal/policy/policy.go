@@ -10,6 +10,9 @@ import (
 )
 
 func Validate(p model.Policy) error {
+	if p.Version == WebConnectivity {
+		return validateWebConnectivity(p)
+	}
 	if p.Version == GoogleYouTube {
 		if err := validateBuiltinWeb(pagePolicy(p)); err != nil {
 			return err
@@ -122,7 +125,7 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 		valid := false
 		for _, s := range p.Probes {
 			if r.Probe == s.ID {
-				if !r.TLSVerified || r.Transport != "https-tcp" || r.HTTPStatus != s.Status {
+				if !r.TLSVerified || r.Transport != "https-tcp" || (s.Kind != "connectivity" && r.HTTPStatus != s.Status) || (s.Kind == "connectivity" && (r.HTTPStatus < 200 || r.HTTPStatus > 599)) {
 					return "failed"
 				}
 				if (p.Version == GoogleYouTubeWeb || p.Version == GoogleYouTubeWebNoise || p.Version == builtinWeb) && (!r.ContentVerified || r.MIME != "text/html" || r.Bytes < s.MinBytes || r.Bytes > probe.MaxPageBodyBytes) {

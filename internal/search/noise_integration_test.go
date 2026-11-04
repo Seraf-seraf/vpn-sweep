@@ -149,7 +149,7 @@ func TestNoiseCandidateRunsDNSOverSOCKSInBothRounds(t *testing.T) {
 	}
 	defer restored.Close()
 	loaded, profiles, loadedKey, err := restored.LoadManifest()
-	if err != nil || loaded.Policy.Version != policy.GoogleYouTubeWebNoise || len(loaded.Policy.UDP) != 1 || !loaded.Policy.UDP[0].NoiseOnly || loaded.Policy.UDP[0].Kind != "dns-a" {
+	if err != nil || loaded.Policy.Version != policy.WebConnectivity || len(loaded.Policy.UDP) != 1 || !loaded.Policy.UDP[0].NoiseOnly || loaded.Policy.UDP[0].Kind != "dns-a" {
 		t.Fatal("noise policy was not restored", err)
 	}
 	if restored.View().Winner == nil || policy.Evaluate(loaded.Policy, *restored.View().Winner) != "pass" {

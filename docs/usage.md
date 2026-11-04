@@ -29,8 +29,8 @@ candidate-identity.key. Keep that key for stable candidate identity across serie
 The external Xray must report commit ac5d8a8 or its full SHA; its hash is frozen.
 Imported server addresses, credentials and transport/security contracts are preserved.
 
-Search parameters are built in. New searches require the Google and YouTube HTML
-pages in two fresh-core rounds; video delivery is not checked. The command policy
+Search parameters are built in. New searches require verified TLS and HTTP 200–599 from the Google, YouTube and GitHub root URLs
+in two fresh-core rounds. Redirects are not followed; page content and video are not checked. The command policy
 validates the built-in rules offline; it does not fetch the sites. The public preset
 remains live-unverified and does not establish general Internet or QUIC access.
 

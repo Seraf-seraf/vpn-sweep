@@ -464,9 +464,9 @@ func TestNoiseDNSRespectsPayloadBudgetBeforeSending(t *testing.T) {
 				Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) { return tunnel{&closed}, nil },
 				Check: func(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
 					pages++
-					bytes := int64(2 << 20)
-					if pages == 2 {
-						bytes -= remaining
+					bytes := int64(1 << 20)
+					if pages == 3 {
+						bytes = (2 << 20) - remaining
 					}
 					return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, ContentVerified: true, MIME: "text/html", Bytes: bytes}
 				},
@@ -480,7 +480,7 @@ func TestNoiseDNSRespectsPayloadBudgetBeforeSending(t *testing.T) {
 			if remaining >= 512 {
 				wantUDP, wantClosed = 1, 2
 			}
-			if err != nil || outcome != "interrupted" || pages != 2 || udpCalls != wantUDP || closed != wantClosed {
+			if err != nil || outcome != "interrupted" || pages != 3 || udpCalls != wantUDP || closed != wantClosed {
 				t.Fatalf("outcome %s, pages %d, UDP %d, closed %d, err %v", outcome, pages, udpCalls, closed, err)
 			}
 			if got := s.View().PayloadBytes; got > m.Budgets.PayloadBytes {
@@ -517,9 +517,9 @@ func TestFailedNoiseProbeCountsTowardPayloadBudget(t *testing.T) {
 		},
 		Check: func(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.ProbeResult {
 			pages++
-			bytes := int64(2 << 20)
-			if pages == 2 {
-				bytes -= 512
+			bytes := int64(1 << 20)
+			if pages == 3 {
+				bytes = (2 << 20) - 512
 			}
 			return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", Bytes: bytes}
 		},
@@ -529,7 +529,7 @@ func TestFailedNoiseProbeCountsTowardPayloadBudget(t *testing.T) {
 		},
 	}
 	status, err := e.Run(context.Background(), m, profile.Profiles, make([]byte, 32), g, s)
-	if err != nil || status != "paused_budget" || pages != 2 || udpCalls != 1 || closed != 1 || s.View().PayloadBytes != m.Budgets.PayloadBytes+1 {
+	if err != nil || status != "paused_budget" || pages != 3 || udpCalls != 1 || closed != 1 || s.View().PayloadBytes != m.Budgets.PayloadBytes+1 {
 		t.Fatalf("failed UDP accounting: status=%s err=%v pages=%d udp=%d closed=%d bytes=%d", status, err, pages, udpCalls, closed, s.View().PayloadBytes)
 	}
 }
