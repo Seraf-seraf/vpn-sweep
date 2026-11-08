@@ -84,6 +84,7 @@ import com.seraf.vpnsweep.searchui.ScreenLogEvent
 import com.seraf.vpnsweep.searchui.SearchProgressEvent
 import com.seraf.vpnsweep.searchui.TimedLogEvent
 import com.seraf.vpnsweep.searchui.VpnConnectionEvent
+import com.seraf.vpnsweep.searchui.XrayLogEvent
 import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
 import com.seraf.vpnsweep.searchui.workerFatalEvent
@@ -202,6 +203,10 @@ internal class AppComposition(context: Context, private val nowMillis: () -> Lon
         mutableEvents.value = (mutableEvents.value + TimedLogEvent(
             VpnConnectionEvent(phase.name, message), nowMillis(),
         )).takeLast(MAX_JOURNAL_ENTRIES)
+    }
+    fun recordXrayLog(code: Long, starting: Boolean): Unit = synchronized(eventsLock) {
+        mutableEvents.value = (mutableEvents.value + TimedLogEvent(XrayLogEvent(code, starting), nowMillis()))
+            .takeLast(MAX_JOURNAL_ENTRIES)
     }
     private val requests = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "subscription-fetch") }
     private var currentRequestGeneration: Long? = null

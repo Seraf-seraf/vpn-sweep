@@ -2,6 +2,7 @@ package com.seraf.vpnsweep.ui
 
 import com.seraf.vpnsweep.searchui.TimedLogEvent
 import com.seraf.vpnsweep.searchui.VpnConnectionEvent
+import com.seraf.vpnsweep.searchui.XrayLogEvent
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -124,6 +125,20 @@ private fun presentEvent(event: com.seraf.vpnsweep.searchui.ScreenLogEvent): Eve
     is ScreenEvent -> EventLogEntry("", eventLevel(event), eventText(event))
     is SearchProgressEvent -> progressEntry(event)
     is VpnConnectionEvent -> EventLogEntry("", if (event.phase == "ERROR") "ERROR" else "INFO", event.message)
+    is XrayLogEvent -> {
+        val reason = when (event.code) {
+            1L -> "Не удалось обработать соединение"
+            2L -> "Истекло время ожидания соединения"
+            3L -> "Соединение было сброшено"
+            4L -> "Соединение было отклонено"
+            5L -> "Не удалось разрешить доменное имя"
+            6L -> "Ошибка проверки защищённого соединения"
+            7L -> "Предупреждение при работе ядра"
+            else -> "Ошибка соединения"
+        }
+        val hint = if (event.starting && event.code != 7L) " После запуска сервер может ответить не сразу." else ""
+        EventLogEntry("", "WARN", "Xray: $reason.$hint")
+    }
 }
 
 private const val MISSING = "Не задан"

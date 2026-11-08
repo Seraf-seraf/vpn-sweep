@@ -7,6 +7,7 @@ import com.seraf.vpnsweep.vpn.VpnRun
 import com.seraf.vpnsweep.vpn.VpnRunFailure
 import com.seraf.vpnsweep.vpn.VpnRunOperations
 import com.seraf.vpnsweep.vpn.VpnServiceLifecycle
+import com.seraf.vpnsweep.vpn.XrayLogWindow
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -18,6 +19,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -161,6 +163,7 @@ class SweepVpnService : VpnService() {
         }
 
         override suspend fun monitor(prepared: Preparation, run: VpnRun): Unit {
+            val logWindow = XrayLogWindow(SystemClock.elapsedRealtime())
             while (true) {
                 check(prepared.manager.getNetworkCapabilities(prepared.network) != null) { "network_lost" }
                 check(Mobile.protectionFailures() == 0L) { "socket_protection_failed" }
@@ -176,6 +179,16 @@ class SweepVpnService : VpnService() {
                 run.publishIfActive {
                     DiagnosticsStatus.running(diagnosticsSession)
                     VpnStatus.update(state)
+                }
+                val nowMillis = SystemClock.elapsedRealtime()
+                repeat(MAX_XRAY_EVENTS_PER_POLL) {
+                    val code = Mobile.nextVpnLogCode()
+                    if (code == 0L) return@repeat
+                    if (logWindow.shouldReport(code, nowMillis)) {
+                        run.publishIfActive {
+                            integration.recordXrayLog(code, logWindow.starting(nowMillis))
+                        }
+                    }
                 }
                 delay(STATUS_INTERVAL_MS)
             }
@@ -272,5 +285,6 @@ class SweepVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1
         private const val MTU_BYTES = 1500
         private const val STATUS_INTERVAL_MS = 1000L
+        private const val MAX_XRAY_EVENTS_PER_POLL = 32
     }
 }

@@ -176,12 +176,14 @@ func Start(source []byte, tunFD int, bootstrapDNS string, protector Protector) e
 	}
 	instance, err := core.New(pb)
 	if err == nil {
+		beginVPNLog()
 		err = instance.Start()
 	}
 	if err != nil {
 		if instance != nil {
 			_ = instance.Close()
 		}
+		endVPNLog()
 		activeProtection.Store(nil)
 		_ = os.Unsetenv(platform.TunFdKey)
 		return errors.New("core_start_failed")
@@ -197,6 +199,7 @@ func Stop() error {
 		return nil
 	}
 	err := runtimeState.instance.Close()
+	endVPNLog()
 	// Keep the guard installed while the core is closing its connections.
 	activeProtection.Store(nil)
 	runtimeState.instance, runtimeState.guard = nil, nil

@@ -11,6 +11,7 @@ import com.seraf.vpnsweep.ui.SweepColors
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -25,6 +26,17 @@ import com.seraf.vpnsweep.searchprotocol.SearchProgressKindV1
 import com.seraf.vpnsweep.searchprotocol.SearchProgressOutcomeV1
 
 class ScreenInformationTest {
+    @Test
+    fun xrayEventsAreReadableAndDistinguishInitialConnection(): Unit {
+        val entries = presentInformation(ScreenInformation(events = listOf(
+            XrayLogEvent(2L, true), XrayLogEvent(2L, false), XrayLogEvent(999L, false),
+        ))).events
+        assertTrue(entries[0].message.contains("Истекло время ожидания"))
+        assertTrue(entries[0].message.contains("может ответить не сразу"))
+        assertFalse(entries[1].message.contains("может ответить не сразу"))
+        assertEquals("Xray: Ошибка соединения.", entries[2].message)
+        assertTrue(entries.all { it.level == "WARN" })
+    }
     @Test fun effectiveParametersDistinguishDefaultsDisabledAndNotApplicable(): Unit {
         val values = AppliedParameters(effectiveFields = mapOf(
             "mux" to EffectiveParameter("false", "value"),
