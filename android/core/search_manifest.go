@@ -32,8 +32,9 @@ func BuildDefaultSearchManifest(profileBytes []byte, coreDigest string) (result 
 			return nil, errors.New("invalid_search_input")
 		}
 	}
+	searchPolicy := policy.GoogleWebDefault()
 	generator, buildErr := space.New(space.Default())
-	if buildErr != nil || policy.Validate(policy.Default()) != nil {
+	if buildErr != nil || policy.Validate(searchPolicy) != nil {
 		return nil, errors.New("search_manifest_unavailable")
 	}
 	spec, buildErr := json.Marshal(generator.Spec)
@@ -54,7 +55,7 @@ func BuildDefaultSearchManifest(profileBytes []byte, coreDigest string) (result 
 		Environment:   "unverified",
 		Core:          model.CoreIdentity{Commit: CoreCommit, SHA256: hex.EncodeToString(digest)},
 		Space:         spec,
-		Policy:        policy.Default(),
+		Policy:        searchPolicy,
 		Budgets:       model.DefaultBudgets(),
 		TrustID:       "system",
 	}

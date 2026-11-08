@@ -36,6 +36,9 @@ func validateGoogleYouTube(p model.Policy) error {
 }
 
 func Scope(p model.Policy) string {
+	if p.Version == GoogleWeb {
+		return "google_homepage_only_not_general_internet"
+	}
 	if p.Version == WebConnectivity {
 		return "google_youtube_github_https_connectivity_only"
 	}
@@ -54,6 +57,9 @@ func Scope(p model.Policy) string {
 	return "declared_policy_resources_only"
 }
 func PresetStatus(p model.Policy) string {
+	if p.Version == GoogleWeb {
+		return "live_unverified"
+	}
 	if p.Version == WebConnectivity || p.Version == GoogleYouTubeWebNoise {
 		return "live_unverified"
 	}

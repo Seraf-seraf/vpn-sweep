@@ -16,7 +16,7 @@ import (
 
 var manifestProfile = []byte(`[{"outbound":{"protocol":"socks","settings":{"servers":[{"address":"synthetic.invalid","port":1080}]}}}]`)
 
-func TestAndroidDefaultSearchManifestUsesExistingCLIDefaults(t *testing.T) {
+func TestAndroidDefaultSearchManifestUsesGoogleOnlyPolicy(t *testing.T) {
 	digest := strings.Repeat("A", 64)
 	result, err := BuildDefaultSearchManifest(manifestProfile, digest)
 	if err != nil {
@@ -45,9 +45,15 @@ func TestAndroidDefaultSearchManifestUsesExistingCLIDefaults(t *testing.T) {
 	if _, err := hex.DecodeString(got.SeriesID); err != nil {
 		t.Fatal("invalid series identity")
 	}
-	if !bytes.Equal(got.Space, wantSpace) || model.Digest(got.Policy) != model.Digest(policy.Default()) ||
+	wantPolicy := policy.GoogleWebDefault()
+	if !bytes.Equal(got.Space, wantSpace) || model.Digest(got.Policy) != model.Digest(wantPolicy) ||
 		got.Budgets != model.DefaultBudgets() {
-		t.Fatal("space, policy or budgets differ from the CLI defaults")
+		t.Fatal("space, policy or budgets differ from the Android search defaults")
+	}
+	if got.Policy.Version != policy.GoogleWeb || len(got.Policy.Probes) != 1 ||
+		got.Policy.Probes[0].URL != "https://www.google.com/?hl=en" ||
+		got.Policy.Probes[0].Operator != "google" || len(got.Policy.UDP) != 0 {
+		t.Fatal("Android search policy must check only Google's homepage")
 	}
 }
 
