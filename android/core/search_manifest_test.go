@@ -16,7 +16,7 @@ import (
 
 var manifestProfile = []byte(`[{"outbound":{"protocol":"socks","settings":{"servers":[{"address":"synthetic.invalid","port":1080}]}}}]`)
 
-func TestAndroidDefaultSearchManifestUsesGoogleOnlyPolicy(t *testing.T) {
+func TestAndroidDefaultSearchManifestUsesGoogleAndYouTubeWebOnlyPolicy(t *testing.T) {
 	digest := strings.Repeat("A", 64)
 	result, err := BuildDefaultSearchManifest(manifestProfile, digest)
 	if err != nil {
@@ -45,15 +45,17 @@ func TestAndroidDefaultSearchManifestUsesGoogleOnlyPolicy(t *testing.T) {
 	if _, err := hex.DecodeString(got.SeriesID); err != nil {
 		t.Fatal("invalid series identity")
 	}
-	wantPolicy := policy.GoogleWebDefault()
+	wantPolicy := policy.GoogleYouTubeWebDefault()
 	if !bytes.Equal(got.Space, wantSpace) || model.Digest(got.Policy) != model.Digest(wantPolicy) ||
 		got.Budgets != model.DefaultBudgets() {
 		t.Fatal("space, policy or budgets differ from the Android search defaults")
 	}
-	if got.Policy.Version != policy.GoogleWeb || len(got.Policy.Probes) != 1 ||
-		got.Policy.Probes[0].URL != "https://www.google.com/?hl=en" ||
-		got.Policy.Probes[0].Operator != "google" || len(got.Policy.UDP) != 0 {
-		t.Fatal("Android search policy must check only Google's homepage")
+	if got.Policy.Version != policy.GoogleYouTubeWeb || len(got.Policy.Probes) != 2 ||
+		got.Policy.Probes[0].ID != "google-home" || got.Policy.Probes[0].URL != "https://www.google.com/?hl=en" ||
+		got.Policy.Probes[1].ID != "youtube-home" || got.Policy.Probes[1].URL != "https://www.youtube.com/?hl=en&gl=US" ||
+		got.Policy.Probes[0].Operator != "google" || got.Policy.Probes[1].Operator != "google" ||
+		got.Policy.Rounds != 2 || got.Policy.Downloads != 0 || got.Policy.RequireUDP || got.Policy.RequireQUIC || len(got.Policy.UDP) != 0 {
+		t.Fatal("Android search policy must check Google and YouTube pages only")
 	}
 }
 

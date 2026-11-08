@@ -32,7 +32,7 @@ func BuildDefaultSearchManifest(profileBytes []byte, coreDigest string) (result 
 			return nil, errors.New("invalid_search_input")
 		}
 	}
-	searchPolicy := policy.GoogleWebDefault()
+	searchPolicy := policy.GoogleYouTubeWebDefault()
 	generator, buildErr := space.New(space.Default())
 	if buildErr != nil || policy.Validate(searchPolicy) != nil {
 		return nil, errors.New("search_manifest_unavailable")

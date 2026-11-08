@@ -9,6 +9,30 @@ import (
 const GoogleYouTubeWeb = "google-youtube-web-v1"
 const MinWebBodyBytes int64 = 1024
 
+const googleYouTubeWebTimeoutSeconds = 45
+const googleYouTubeWebMinBytes int64 = 4096
+
+// GoogleYouTubeWebDefault checks only the Google and YouTube home pages.
+func GoogleYouTubeWebDefault() model.Policy {
+	return model.Policy{
+		Version:      GoogleYouTubeWeb,
+		Rounds:       2,
+		MinOperators: 1,
+		Probes: []model.Probe{
+			{
+				ID: "google-home", Operator: "google", URL: "https://www.google.com/?hl=en", Kind: "page",
+				ContainsAll: []string{"<title>Google</title>", "name=\"q\"", "action=\"/search\""},
+				MinBytes:    googleYouTubeWebMinBytes, MIME: "text/html", Status: 200, TimeoutSeconds: googleYouTubeWebTimeoutSeconds,
+			},
+			{
+				ID: "youtube-home", Operator: "google", URL: "https://www.youtube.com/?hl=en&gl=US", Kind: "page",
+				ContainsAll: []string{"ytInitialData", "ytcfg.set", "\"richGridRenderer\""},
+				MinBytes:    googleYouTubeWebMinBytes, MIME: "text/html", Status: 200, TimeoutSeconds: googleYouTubeWebTimeoutSeconds,
+			},
+		},
+	}
+}
+
 // This profile measures two pages owned by Google, never independent Internet access.
 func validateGoogleYouTube(p model.Policy) error {
 	if p.Rounds != 2 || p.MinOperators != 1 || p.Downloads != 0 || p.MinDownloadBytes != 0 || p.RequireUDP || p.RequireQUIC || len(p.UDP) != 0 || len(p.Probes) != 2 {
