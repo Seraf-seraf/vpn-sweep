@@ -156,15 +156,22 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 		}
 		return finish("transfer_failed", "transfer")
 	}
+	m, _, mimeErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mimeErr == nil {
+		r.MIME = m
+	}
+	lower := strings.ToLower(string(b))
+	earlyInterstitial := p.Kind == "page" && resp.StatusCode == http.StatusOK
+	if earlyInterstitial {
+		if outcome := pageInterstitialOutcome(p, resp.Request.URL.Path, lower); outcome != "" {
+			return finish(outcome, "site")
+		}
+	}
 	if r.Bytes > max {
 		return finish("body_too_large", "content")
 	}
 	if p.Bytes > 0 && r.Bytes != p.Bytes {
 		return finish("wrong_body_size", "content")
-	}
-	m, _, mimeErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if mimeErr == nil {
-		r.MIME = m
 	}
 	if p.MIME != "" {
 		if mimeErr != nil || m != p.MIME {
@@ -174,25 +181,9 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	if r.Bytes < p.MinBytes {
 		return finish("body_too_small", "content")
 	}
-	lower := strings.ToLower(string(b))
-	if len(p.ContainsAll) > 0 {
-		for _, marker := range []string{"before you continue to google", "before you continue to youtube", `<form action="https://consent.google.com/`, `<form action="https://consent.youtube.com/`} {
-			if strings.Contains(lower, marker) {
-				return finish("site_consent", "site")
-			}
-		}
-		for _, marker := range []string{"sign in to confirm", "our systems have detected unusual traffic"} {
-			if strings.Contains(lower, marker) {
-				return finish("site_challenge", "site")
-			}
-		}
-		if strings.HasPrefix(resp.Request.URL.Path, "/sorry/") {
-			return finish("site_challenge", "site")
-		}
-	}
-	for _, marker := range []string{"cf-chl-", "g-recaptcha", "verify you are human"} {
-		if strings.Contains(lower, marker) {
-			return finish("site_challenge", "site")
+	if !earlyInterstitial {
+		if outcome := pageInterstitialOutcome(p, resp.Request.URL.Path, lower); outcome != "" {
+			return finish(outcome, "site")
 		}
 	}
 	if p.Contains != "" && !strings.Contains(string(b), p.Contains) {
@@ -211,4 +202,28 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 	}
 	r.ContentVerified = true
 	return finish("pass", "complete")
+}
+
+func pageInterstitialOutcome(p model.Probe, path, lowerBody string) string {
+	if len(p.ContainsAll) > 0 {
+		for _, marker := range []string{"before you continue to google", "before you continue to youtube", `<form action="https://consent.google.com/`, `<form action="https://consent.youtube.com/`} {
+			if strings.Contains(lowerBody, marker) {
+				return "site_consent"
+			}
+		}
+		for _, marker := range []string{"sign in to confirm", "our systems have detected unusual traffic"} {
+			if strings.Contains(lowerBody, marker) {
+				return "site_challenge"
+			}
+		}
+		if strings.HasPrefix(path, "/sorry/") {
+			return "site_challenge"
+		}
+	}
+	for _, marker := range []string{"cf-chl-", "g-recaptcha", "verify you are human"} {
+		if strings.Contains(lowerBody, marker) {
+			return "site_challenge"
+		}
+	}
+	return ""
 }

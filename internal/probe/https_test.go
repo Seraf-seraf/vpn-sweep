@@ -104,8 +104,13 @@ func TestCompositeHTMLContracts(t *testing.T) {
 		switch r.URL.Path {
 		case "/consent":
 			w.Write([]byte("Before you continue to Google" + good))
+		case "/consent-short":
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("Before you continue to Google"))
 		case "/challenge":
 			w.Write([]byte("Sign in to confirm you’re not a bot" + good))
+		case "/challenge-short":
+			w.Write([]byte("g-recaptcha"))
 		case "/small":
 			w.Write([]byte("<title>Google</title> name=\"q\" action=\"/search\""))
 		case "/wrong":
@@ -152,7 +157,7 @@ func TestCompositeHTMLContracts(t *testing.T) {
 	defer h.Close()
 	p := model.Probe{ID: "google-home", Operator: "google", URL: s.URL, Kind: "page", ContainsAll: []string{"<title>Google</title>", "name=\"q\"", "action=\"/search\""}, MinBytes: 1024, MIME: "text/html", Status: 200, TimeoutSeconds: 3}
 	c := Client{Roots: roots}
-	for path, want := range map[string]string{"/": "pass", "/consent": "site_consent", "/challenge": "site_challenge", "/small": "body_too_small", "/wrong": "composite_marker_missing", "/mime": "unexpected_mime", "/partial": "transfer_failed", "/oversize": "body_too_large", "/consentredirect": "site_consent"} {
+	for path, want := range map[string]string{"/": "pass", "/consent": "site_consent", "/consent-short": "site_consent", "/challenge": "site_challenge", "/challenge-short": "site_challenge", "/small": "body_too_small", "/wrong": "composite_marker_missing", "/mime": "unexpected_mime", "/partial": "transfer_failed", "/oversize": "body_too_large", "/consentredirect": "site_consent"} {
 		p.URL = s.URL + path
 		r := c.Check(context.Background(), proxy, p, 0)
 		if r.Outcome != want {
@@ -160,6 +165,10 @@ func TestCompositeHTMLContracts(t *testing.T) {
 		}
 		if r.ContentVerified != (want == "pass") {
 			t.Fatal("incorrect content evidence", r)
+		}
+		if path != "/consentredirect" && (want == "site_consent" || want == "site_challenge") &&
+			(r.HTTPStatus != http.StatusOK || !r.TLSVerified || r.Transport != "https-tcp") {
+			t.Fatal("interstitial lost successful HTTP connection evidence", path, r)
 		}
 	}
 	p.URL = s.URL
