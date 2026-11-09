@@ -66,16 +66,27 @@ class ScreenInformationTest {
 
     @Test
     fun journalShowsProgressInOrderWithAttemptAndResult(): Unit {
+        assertEquals(12, SearchProgressOutcomeV1.TLS_FAILURE.ordinal)
+        assertEquals(13, SearchProgressOutcomeV1.SITE_CHALLENGE.ordinal)
         val progress = SearchProgressV1(1, SearchProgressKindV1.PROBE_FINISHED, SearchProgressOutcomeV1.FAILED, 3uL, 1, 2, 4, 0, 100)
         val entries = presentInformation(ScreenInformation(events = listOf(ScreenEvent.SEARCH_STARTING, SearchProgressEvent(progress), ScreenEvent.FAILED))).events
         assertEquals(3, entries.size)
         assertEquals("Вариант 3 · сервер 1 · повтор 2 из 2 · UDP/DNS — не пройдена, 100 мс", entries[1].message)
         assertEquals("ERROR", entries[2].level)
         val failedRequest = progress.copy(outcome = SearchProgressOutcomeV1.REQUEST_FAILED)
-        val consent = progress.copy(outcome = SearchProgressOutcomeV1.SITE_CONSENT)
-        val messages = presentInformation(ScreenInformation(events = listOf(SearchProgressEvent(failedRequest), SearchProgressEvent(consent)))).events.map { it.message }
-        assertTrue(messages[0].contains("request_failed"))
-        assertTrue(messages[1].contains("site_consent"))
+        val consent = progress.copy(outcome = SearchProgressOutcomeV1.SITE_CONSENT, probe = 1, httpStatus = 200)
+        val challenge = progress.copy(outcome = SearchProgressOutcomeV1.SITE_CHALLENGE, probe = 1, httpStatus = 200)
+        val userInterstitialEntries = presentInformation(ScreenInformation(events = listOf(
+            SearchProgressEvent(failedRequest), SearchProgressEvent(consent), SearchProgressEvent(challenge),
+        ))).events
+        assertTrue(userInterstitialEntries[0].message.contains("request_failed"))
+        assertTrue(userInterstitialEntries[1].message.contains("site_consent"))
+        assertTrue(userInterstitialEntries[2].message.contains("вручную пройти CAPTCHA"))
+        assertEquals("INFO", userInterstitialEntries[1].level)
+        assertEquals("INFO", userInterstitialEntries[2].level)
+        assertEquals("ERROR", presentInformation(ScreenInformation(events = listOf(
+            SearchProgressEvent(consent.copy(httpStatus = 403)),
+        ))).events.single().level)
     }
 
     @Test

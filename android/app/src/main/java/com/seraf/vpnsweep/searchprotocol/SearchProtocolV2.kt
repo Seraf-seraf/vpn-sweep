@@ -36,7 +36,22 @@ internal enum class SearchProgressKindV1 {
     SAVED_RESULT_SKIPPED,
 }
 
-internal enum class SearchProgressOutcomeV1 { NONE, RUNNING, PASS, FAILED, INCONCLUSIVE, BLOCKED, SKIPPED, BUDGET, REQUEST_FAILED, SITE_CONSENT, INTERRUPTED, TIMEOUT, TLS_FAILURE }
+internal enum class SearchProgressOutcomeV1 {
+    NONE,
+    RUNNING,
+    PASS,
+    FAILED,
+    INCONCLUSIVE,
+    BLOCKED,
+    SKIPPED,
+    BUDGET,
+    REQUEST_FAILED,
+    SITE_CONSENT,
+    INTERRUPTED,
+    TIMEOUT,
+    TLS_FAILURE,
+    SITE_CHALLENGE,
+}
 
 internal data class SearchProgressV1(
     val sessionGeneration: Long,

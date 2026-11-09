@@ -91,10 +91,11 @@ private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {
         SearchProgressOutcomeV1.SKIPPED -> "пропущена"
         SearchProgressOutcomeV1.BUDGET -> "достигнут лимит"
         SearchProgressOutcomeV1.REQUEST_FAILED -> "ошибка запроса (request_failed)"
-        SearchProgressOutcomeV1.SITE_CONSENT -> "сайт требует согласия (site_consent)"
+        SearchProgressOutcomeV1.SITE_CONSENT -> "сайт требует согласия пользователя (site_consent)"
         SearchProgressOutcomeV1.INTERRUPTED -> "прервана"
         SearchProgressOutcomeV1.TIMEOUT -> "истекло время ожидания"
         SearchProgressOutcomeV1.TLS_FAILURE -> "ошибка проверки TLS-сертификата"
+        SearchProgressOutcomeV1.SITE_CHALLENGE -> "нужно вручную пройти CAPTCHA (site_challenge)"
     }
     val server = value.serverName.ifEmpty { "сервер ${value.profile}" }
     val prefix = "Вариант ${value.attempt} · $server · повтор ${value.round} из 2"
@@ -115,7 +116,10 @@ private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {
         SearchProgressKindV1.MEDIA_STARTED -> "$prefix — проверка видео"
         else -> ""
     }
-    val level = if (value.kind in setOf(SearchProgressKindV1.PROBE_FINISHED, SearchProgressKindV1.ATTEMPT_FINISHED, SearchProgressKindV1.CORE_STOPPED) && value.outcome !in setOf(SearchProgressOutcomeV1.PASS, SearchProgressOutcomeV1.NONE)) "ERROR" else "INFO"
+    val userInterstitial = value.httpStatus == 200 && value.outcome in setOf(SearchProgressOutcomeV1.SITE_CONSENT, SearchProgressOutcomeV1.SITE_CHALLENGE)
+    val level = if (value.kind in setOf(SearchProgressKindV1.PROBE_FINISHED, SearchProgressKindV1.ATTEMPT_FINISHED, SearchProgressKindV1.CORE_STOPPED) &&
+        value.outcome !in setOf(SearchProgressOutcomeV1.PASS, SearchProgressOutcomeV1.NONE) && !userInterstitial
+    ) "ERROR" else "INFO"
     return EventLogEntry("", level, message)
 }
 

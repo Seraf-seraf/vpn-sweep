@@ -594,7 +594,7 @@ func searchProgressOutcome(event, outcome string) int {
 	outcomes := map[string]int{"": 0, "running": 1, "pass": 2, "success": 2, "failed": 3, "inconclusive": 4,
 		"capability_blocked": 5, "duplicate": 6, "session_budget": 7, "payload_budget": 7, "attempt_budget": 7, "journal_budget": 7,
 		"tls_failure": 12, "tls_unverified": 12, "request_failed": 8, "site_consent": 9, "interrupted": 10, "timeout": 11, "attempt_timeout": 11,
-		"site_forbidden": 4, "site_rate_limited": 4, "site_restricted": 4, "site_challenge": 4, "unexpected_http_status": 4, "unsupported": 4}
+		"site_challenge": 13, "site_forbidden": 4, "site_rate_limited": 4, "site_restricted": 4, "unexpected_http_status": 4, "unsupported": 4}
 	if code, ok := outcomes[outcome]; ok {
 		return code
 	}

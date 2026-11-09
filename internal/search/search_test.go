@@ -75,6 +75,39 @@ func pass(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.P
 	return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, Bytes: p.Bytes}
 }
 
+func TestHTTP200UserInterstitialCompletesSearch(t *testing.T) {
+	m, profiles, generator, store := setup(t)
+	m.Policy = policy.GoogleYouTubeWebDefault()
+	checked, closed, exported := 0, 0, 0
+	engine := Engine{
+		Open: func(context.Context, model.Profile, map[string]any) (Tunnel, error) {
+			return tunnel{&closed}, nil
+		},
+		Check: func(_ context.Context, _ socks.Endpoint, spec model.Probe, round int) model.ProbeResult {
+			checked++
+			outcome := "site_consent"
+			if spec.ID == "youtube-home" {
+				outcome = "site_challenge"
+			}
+			return model.ProbeResult{
+				ID: model.ID(), Probe: spec.ID, Round: round, Outcome: outcome,
+				Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true,
+			}
+		},
+		Export: func(attempt model.Attempt) error {
+			exported++
+			if got := policy.Evaluate(m.Policy, attempt); got != "pass" {
+				t.Errorf("exported attempt evaluation = %s, want pass", got)
+			}
+			return nil
+		},
+	}
+	status, err := engine.Run(context.Background(), m, profiles, make([]byte, 32), generator, store)
+	if err != nil || status != "success" || checked != 4 || closed != 2 || exported != 1 || store.View().Winner == nil {
+		t.Fatalf("status=%s err=%v checked=%d closed=%d exported=%d view=%+v", status, err, checked, closed, exported, store.View())
+	}
+}
+
 func syntheticSS(host string) string {
 	return "ss://" + "YWVzLTEyOC1nY206c3ludGhldGlj" + "@" + net.JoinHostPort(host, "8388")
 }

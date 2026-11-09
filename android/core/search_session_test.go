@@ -92,6 +92,7 @@ func TestSearchProgressOutcomeReportsProbeAndCleanupFailures(t *testing.T) {
 	}{
 		{"probe_finished", "request_failed", 8},
 		{"probe_finished", "site_consent", 9},
+		{"probe_finished", "site_challenge", 13},
 		{"probe_finished", "unknown_error", 3},
 		{"core_stopped", "core_wait_timeout", 3},
 		{"attempt_finished", "interrupted", 10},

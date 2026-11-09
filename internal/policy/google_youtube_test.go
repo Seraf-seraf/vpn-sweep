@@ -41,8 +41,31 @@ func TestGoogleYouTubePolicyScopeAndEvidence(t *testing.T) {
 		}
 	}
 	a.Results[0].Outcome = "site_consent"
-	if Evaluate(p, a) != "inconclusive" {
-		t.Fatal("consent accepted or blamed on tunnel")
+	a.Results[0].ContentVerified = false
+	if Evaluate(p, a) != "pass" {
+		t.Fatal("verified HTTP 200 consent response must count as a successful connection")
+	}
+	challenge := a
+	challenge.Results = append([]model.ProbeResult(nil), a.Results...)
+	challenge.Results[0].Outcome = "site_challenge"
+	if Evaluate(p, challenge) != "pass" {
+		t.Fatal("verified HTTP 200 challenge response must count as a successful connection")
+	}
+	for name, mutate := range map[string]func(*model.ProbeResult){
+		"non-200":       func(result *model.ProbeResult) { result.HTTPStatus = 302 },
+		"untrusted TLS": func(result *model.ProbeResult) { result.TLSVerified = false },
+		"wrong transport": func(result *model.ProbeResult) {
+			result.Transport = "udp-socks5"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := a
+			invalid.Results = append([]model.ProbeResult(nil), a.Results...)
+			mutate(&invalid.Results[0])
+			if Evaluate(p, invalid) == "pass" {
+				t.Fatal("unverified consent response was accepted")
+			}
+		})
 	}
 	for _, mutate := range []func(*model.Policy){func(p *model.Policy) { p.MinOperators = 3 }, func(p *model.Policy) { p.Rounds = 1 }, func(p *model.Policy) { p.Probes[0].Operator = "other" }, func(p *model.Policy) { p.Probes[0].URL = "https://other.invalid" }, func(p *model.Policy) { p.Probes[0].ContainsAll = []string{"only"} }, func(p *model.Policy) { p.Probes[0].ContainsAll = []string{"same", "same"} }, func(p *model.Policy) { p.Probes[0].MinBytes = 1023 }, func(p *model.Policy) { p.RequireQUIC = true }, func(p *model.Policy) { p.Probes[0].RedirectHosts = []string{"consent.google.com"} }} {
 		p = webPolicy(t)

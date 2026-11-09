@@ -205,7 +205,7 @@ func (c Client) Check(ctx context.Context, proxy socks.Endpoint, p model.Probe, 
 }
 
 func pageInterstitialOutcome(p model.Probe, path, lowerBody string) string {
-	if len(p.ContainsAll) > 0 {
+	if p.Kind == "page" {
 		for _, marker := range []string{"before you continue to google", "before you continue to youtube", `<form action="https://consent.google.com/`, `<form action="https://consent.youtube.com/`} {
 			if strings.Contains(lowerBody, marker) {
 				return "site_consent"

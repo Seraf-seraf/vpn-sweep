@@ -116,7 +116,20 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 			return "partial"
 		}
 		seen[key] = true
+		if r.Round < 0 || r.Round >= p.Rounds {
+			return "failed"
+		}
 		if r.Outcome != "pass" {
+			reachedUserInterstitial := false
+			for _, s := range p.Probes {
+				if probe.IsSuccessfulUserInterstitial(s, r) {
+					reachedUserInterstitial = true
+					break
+				}
+			}
+			if reachedUserInterstitial {
+				continue
+			}
 			switch r.Outcome {
 			case "site_consent", "site_forbidden", "site_rate_limited", "site_restricted", "site_challenge", "unexpected_http_status", "unsupported":
 				inconclusive = true
@@ -151,7 +164,7 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 				valid = true
 			}
 		}
-		if !valid || r.Round < 0 || r.Round >= p.Rounds {
+		if !valid {
 			return "failed"
 		}
 	}

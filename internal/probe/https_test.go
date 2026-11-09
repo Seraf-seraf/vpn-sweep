@@ -171,6 +171,14 @@ func TestCompositeHTMLContracts(t *testing.T) {
 			t.Fatal("interstitial lost successful HTTP connection evidence", path, r)
 		}
 	}
+	singleMarkerProbe := p
+	singleMarkerProbe.ContainsAll = nil
+	singleMarkerProbe.Contains = "expected"
+	singleMarkerProbe.URL = s.URL + "/consent-short"
+	if result := c.Check(context.Background(), proxy, singleMarkerProbe, 0); result.Outcome != "site_consent" ||
+		result.HTTPStatus != http.StatusOK || !result.TLSVerified || result.ContentVerified {
+		t.Fatal("consent response was missed for a single-marker page probe", result)
+	}
 	p.URL = s.URL
 	if r := (Client{}).Check(context.Background(), proxy, p, 0); r.Outcome != "tls_failure" {
 		t.Fatal(r)
