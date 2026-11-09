@@ -31,6 +31,13 @@ semantics; the preset remains live-unverified.
 Status success requires all checks applicable to the series policy, successful child
 cleanup and durable private export. Saved series retain their original policy; resume
 and export compatibility for video series is described in [video-profile.md](video-profile.md).
+For the built-in `google-youtube-web-v1` and `google-youtube-web-noise-v1` policies, a
+detected consent or challenge page from their Google/YouTube targets with HTTP 200 over
+verified TLS counts as successful HTTPS reachability, even though the page markers were
+not checked. The result retains `site_consent` or `site_challenge` and
+`ContentVerified=false`; it does not claim that the consent or challenge was completed.
+This exception does not apply to other page policies.
+Consent and site challenges require manual user action.
 Partial is never success.
 Budget exhaustion pauses the series. Finite exhaustive traversal reports only the researched space.
 

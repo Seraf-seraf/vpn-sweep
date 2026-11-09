@@ -120,14 +120,7 @@ func Evaluate(p model.Policy, a model.Attempt) string {
 			return "failed"
 		}
 		if r.Outcome != "pass" {
-			reachedUserInterstitial := false
-			for _, s := range p.Probes {
-				if probe.IsSuccessfulUserInterstitial(s, r) {
-					reachedUserInterstitial = true
-					break
-				}
-			}
-			if reachedUserInterstitial {
+			if IsSuccessfulGoogleYouTubeInterstitial(p, r) {
 				continue
 			}
 			switch r.Outcome {

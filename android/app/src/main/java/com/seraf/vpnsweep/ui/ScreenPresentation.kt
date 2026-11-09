@@ -95,7 +95,7 @@ private fun progressEntry(entry: SearchProgressEvent): EventLogEntry {
         SearchProgressOutcomeV1.INTERRUPTED -> "прервана"
         SearchProgressOutcomeV1.TIMEOUT -> "истекло время ожидания"
         SearchProgressOutcomeV1.TLS_FAILURE -> "ошибка проверки TLS-сертификата"
-        SearchProgressOutcomeV1.SITE_CHALLENGE -> "нужно вручную пройти CAPTCHA (site_challenge)"
+        SearchProgressOutcomeV1.SITE_CHALLENGE -> "сайт требует подтверждения или ручной проверки (site_challenge)"
     }
     val server = value.serverName.ifEmpty { "сервер ${value.profile}" }
     val prefix = "Вариант ${value.attempt} · $server · повтор ${value.round} из 2"

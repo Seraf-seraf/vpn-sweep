@@ -81,7 +81,7 @@ class ScreenInformationTest {
         ))).events
         assertTrue(userInterstitialEntries[0].message.contains("request_failed"))
         assertTrue(userInterstitialEntries[1].message.contains("site_consent"))
-        assertTrue(userInterstitialEntries[2].message.contains("вручную пройти CAPTCHA"))
+        assertTrue(userInterstitialEntries[2].message.contains("подтверждения или ручной проверки"))
         assertEquals("INFO", userInterstitialEntries[1].level)
         assertEquals("INFO", userInterstitialEntries[2].level)
         assertEquals("ERROR", presentInformation(ScreenInformation(events = listOf(

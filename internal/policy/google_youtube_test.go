@@ -43,13 +43,13 @@ func TestGoogleYouTubePolicyScopeAndEvidence(t *testing.T) {
 	a.Results[0].Outcome = "site_consent"
 	a.Results[0].ContentVerified = false
 	if Evaluate(p, a) != "pass" {
-		t.Fatal("verified HTTP 200 consent response must count as a successful connection")
+		t.Fatal("verified HTTP 200 consent response must establish a successful Google/YouTube connection")
 	}
 	challenge := a
 	challenge.Results = append([]model.ProbeResult(nil), a.Results...)
 	challenge.Results[0].Outcome = "site_challenge"
 	if Evaluate(p, challenge) != "pass" {
-		t.Fatal("verified HTTP 200 challenge response must count as a successful connection")
+		t.Fatal("verified HTTP 200 challenge response must establish a successful Google/YouTube connection")
 	}
 	for name, mutate := range map[string]func(*model.ProbeResult){
 		"non-200":       func(result *model.ProbeResult) { result.HTTPStatus = 302 },
@@ -82,6 +82,42 @@ func TestGoogleYouTubePolicyScopeAndEvidence(t *testing.T) {
 	p.Version = "custom-v1"
 	if Validate(p) == nil {
 		t.Fatal("legacy custom transfer requirement weakened")
+	}
+}
+
+func TestGoogleYouTubeInterstitialSuccessIsPolicyScoped(t *testing.T) {
+	p := GoogleYouTubeWebDefault()
+	result := model.ProbeResult{
+		Probe: "google-home", Outcome: "site_challenge", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true,
+	}
+	if !IsSuccessfulGoogleYouTubeInterstitial(p, result) {
+		t.Fatal("built-in Google/YouTube policy must accept verified HTTP 200 interstitial reachability")
+	}
+
+	other := p
+	other.Version = "custom-v1"
+	if IsSuccessfulGoogleYouTubeInterstitial(other, result) {
+		t.Fatal("custom page policies must not inherit the Google/YouTube interstitial exception")
+	}
+
+	other = p
+	other.Version = builtinWeb
+	if err := Validate(other); err != nil {
+		t.Fatalf("generic built-in web policy fixture is invalid: %v", err)
+	}
+	a := model.Attempt{Restarts: 1}
+	for round := 0; round < other.Rounds; round++ {
+		for _, spec := range other.Probes {
+			a.Results = append(a.Results, model.ProbeResult{
+				Probe: spec.ID, Round: round, Outcome: "pass", TLSVerified: true, ContentVerified: true,
+				MIME: "text/html", HTTPStatus: 200, Transport: "https-tcp", Bytes: spec.MinBytes,
+			})
+		}
+	}
+	a.Results[0].Outcome = "site_challenge"
+	a.Results[0].ContentVerified = false
+	if got := Evaluate(other, a); got != "inconclusive" {
+		t.Fatalf("generic web policy with an interstitial = %s, want inconclusive", got)
 	}
 }
 func TestCompositeFieldBounds(t *testing.T) {

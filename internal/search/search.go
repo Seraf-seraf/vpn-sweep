@@ -396,7 +396,7 @@ func (e Engine) attempt(ctx context.Context, m model.Manifest, p model.Profile, 
 				return "", err
 			}
 			if r.Outcome != "pass" {
-				if probe.IsSuccessfulUserInterstitial(pr, r) {
+				if policy.IsSuccessfulGoogleYouTubeInterstitial(m.Policy, r) {
 					continue
 				}
 				switch r.Outcome {

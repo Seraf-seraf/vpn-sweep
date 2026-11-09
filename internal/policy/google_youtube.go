@@ -33,6 +33,21 @@ func GoogleYouTubeWebDefault() model.Policy {
 	}
 }
 
+// IsSuccessfulGoogleYouTubeInterstitial applies the built-in Google/YouTube
+// web policy's explicit user-interstitial success condition. It confirms
+// HTTPS reachability but does not claim that page content was verified.
+func IsSuccessfulGoogleYouTubeInterstitial(p model.Policy, result model.ProbeResult) bool {
+	if (p.Version != GoogleYouTubeWeb && p.Version != GoogleYouTubeWebNoise) || Validate(p) != nil {
+		return false
+	}
+	for _, spec := range p.Probes {
+		if probe.IsVerifiedUserInterstitialConnection(spec, result) {
+			return true
+		}
+	}
+	return false
+}
+
 // This profile measures two pages owned by Google, never independent Internet access.
 func validateGoogleYouTube(p model.Policy) error {
 	if p.Rounds != 2 || p.MinOperators != 1 || p.Downloads != 0 || p.MinDownloadBytes != 0 || p.RequireUDP || p.RequireQUIC || len(p.UDP) != 0 || len(p.Probes) != 2 {

@@ -75,7 +75,7 @@ func pass(_ context.Context, _ socks.Endpoint, p model.Probe, round int) model.P
 	return model.ProbeResult{ID: model.ID(), Probe: p.ID, Round: round, Outcome: "pass", Transport: "https-tcp", HTTPStatus: 200, TLSVerified: true, Bytes: p.Bytes}
 }
 
-func TestHTTP200UserInterstitialCompletesSearch(t *testing.T) {
+func TestGoogleYouTubeHTTP200UserInterstitialCompletesSearch(t *testing.T) {
 	m, profiles, generator, store := setup(t)
 	m.Policy = policy.GoogleYouTubeWebDefault()
 	checked, closed, exported := 0, 0, 0
@@ -105,6 +105,13 @@ func TestHTTP200UserInterstitialCompletesSearch(t *testing.T) {
 	status, err := engine.Run(context.Background(), m, profiles, make([]byte, 32), generator, store)
 	if err != nil || status != "success" || checked != 4 || closed != 2 || exported != 1 || store.View().Winner == nil {
 		t.Fatalf("status=%s err=%v checked=%d closed=%d exported=%d view=%+v", status, err, checked, closed, exported, store.View())
+	}
+	for _, result := range store.View().Winner.Results {
+		if result.Outcome == "site_consent" || result.Outcome == "site_challenge" {
+			if result.HTTPStatus != 200 || !result.TLSVerified || result.ContentVerified {
+				t.Fatalf("interstitial evidence was not retained accurately: %+v", result)
+			}
+		}
 	}
 }
 
